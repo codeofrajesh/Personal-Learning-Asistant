@@ -37,9 +37,12 @@ interface Props {
   /** Where the player was launched from — carried forward on lesson-to-lesson jumps
    *  so the Courses/Library breadcrumb + sidebar context is never lost. */
   source: NavSource;
+  /** When true, the panel is rendered inside the player's tabbed right column, so it
+   *  drops its own card chrome (width / margins / header) and just fills its container. */
+  embedded?: boolean;
 }
 
-function LessonOverviewView({ siblings, currentId, source }: Props) {
+function LessonOverviewView({ siblings, currentId, source, embedded = false }: Props) {
   const containerRef = useRef<HTMLElement>(null);
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -84,13 +87,26 @@ function LessonOverviewView({ siblings, currentId, source }: Props) {
   }, { scope: containerRef, dependencies: [currentId] });
 
   return (
-    <aside 
+    <aside
       ref={containerRef}
-      className="flex h-full w-[480px] flex-col rounded-[32px] bg-[#F4F4F6] p-7 shadow-2xl font-sans mx-6 mb-6 overflow-hidden mt-6"
+      className={cn(
+        "flex h-full flex-col overflow-hidden font-sans",
+        embedded
+          ? // Inside the tabbed right column: fill the container, glass to match the app.
+            "rounded-[24px] border border-white/[0.06] bg-white/[0.02] p-5"
+          : // Standalone (non-video materials): the original light floating card.
+            "w-[480px] rounded-[32px] bg-[#F4F4F6] p-7 shadow-2xl mx-6 mb-6 mt-6",
+      )}
     >
       {/* Header */}
       <div className="shrink-0 pb-6 pl-2 pt-2">
-        <h2 className="text-[24px] font-medium tracking-tight text-[#1A1A24]" title="Lesson Overview">
+        <h2
+          className={cn(
+            "text-[24px] font-medium tracking-tight",
+            embedded ? "text-content-primary" : "text-[#1A1A24]",
+          )}
+          title="Lesson Overview"
+        >
           Lesson Overview
         </h2>
       </div>

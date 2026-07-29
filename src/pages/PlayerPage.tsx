@@ -17,6 +17,7 @@ import { listen } from "@tauri-apps/api/event";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
 import LessonOverview from "../components/player/LessonOverview";
+import NotesPanel from "../components/player/NotesPanel";
 import VideoPlayer from "../components/player/VideoPlayer";
 import AudioPlayer from "../components/player/AudioPlayer";
 import PdfViewer from "../components/player/PdfViewer";
@@ -56,6 +57,8 @@ export default function PlayerPage() {
   // Mirror the Tauri OS-window fullscreen state so the page can hide its chrome
   // (header, right panel, description) and fix the video anchor to fill the screen.
   const [isFullscreen, setIsFullscreen] = useState(false);
+  // Right-panel tab: the lesson list, or timestamped notes (video only).
+  const [rightTab, setRightTab] = useState<"lessons" | "notes">("lessons");
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -345,10 +348,41 @@ export default function PlayerPage() {
             )}
           </div>
 
-          {/* Right column — Lesson Overview (new floating card design) */}
+          {/* Right column — Lesson Overview + (video) timestamped Notes, tabbed. */}
           {state.kind === "ready" && material && (
-            <div className="bg-ink-900 border-t-4 border-ink-900 shrink-0">
-              <LessonOverview siblings={siblings} currentId={material.id} source={source} />
+            <div className="flex shrink-0 flex-col border-t-4 border-ink-900 bg-ink-900">
+              {material.file_type === "video" ? (
+                <div className="flex min-h-0 w-[480px] flex-1 flex-col px-6 pb-6 pt-6">
+                  {/* Tab switch */}
+                  <div className="mb-4 flex shrink-0 items-center gap-1 self-start rounded-full border border-white/[0.06] bg-white/[0.02] p-1">
+                    {(["lessons", "notes"] as const).map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => setRightTab(t)}
+                        aria-pressed={rightTab === t}
+                        className={
+                          "rounded-full px-4 py-1.5 text-xs font-semibold capitalize transition-colors " +
+                          (rightTab === t
+                            ? "bg-white/[0.08] text-content-primary shadow-[inset_0_1px_1px_rgba(255,255,255,0.1)]"
+                            : "text-content-secondary hover:bg-white/[0.04]")
+                        }
+                      >
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="min-h-0 flex-1">
+                    {rightTab === "lessons" ? (
+                      <LessonOverview siblings={siblings} currentId={material.id} source={source} embedded />
+                    ) : (
+                      <NotesPanel materialId={material.id} />
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <LessonOverview siblings={siblings} currentId={material.id} source={source} />
+              )}
             </div>
           )}
         </div>

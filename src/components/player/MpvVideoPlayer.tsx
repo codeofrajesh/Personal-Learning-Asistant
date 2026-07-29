@@ -29,6 +29,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { gsap } from "gsap";
 import { useGSAP } from "@gsap/react";
 import { ipc, isTauri } from "../../lib/ipc";
+import { playerBridge } from "../../lib/playerBridge";
 import { formatDuration } from "../../lib/utils";
 import {
   PlayIcon,
@@ -664,6 +665,22 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [ready, saveProgress]);
+
+  // Expose current time + seek to player-adjacent UI (timestamped Notes) via the bridge.
+  useEffect(() => {
+    playerBridge.register(
+      materialId,
+      () => timePosRef.current,
+      (secs: number) => {
+        const d = durationRef.current;
+        const t = Math.max(0, d > 0 ? Math.min(d, secs) : secs);
+        void command("seek", [t, "absolute"]).catch(() => {});
+        timePosRef.current = t;
+        if (seekFillRef.current && d > 0) seekFillRef.current.style.width = `${(t / d) * 100}%`;
+      },
+    );
+    return () => playerBridge.unregister(materialId);
+  }, [materialId]);
 
   // Periodic safety flush of progress (every 15 s while watching). Coalesced: only writes
   // if the position actually advanced ≥ 5s since the last save (no redundant SSD writes).
