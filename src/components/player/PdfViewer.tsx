@@ -1,11 +1,12 @@
 /**
  * PDF viewer (Section 8 Page 6) — renders pages to `<canvas>` via PDF.js (`react-pdf`).
  *
- * This is the stable, known-working version. It uses base64 byte transfer
- * (`read_file_base64`) and a fixed virtualization buffer. The earlier "v3" experiment
- * (thumbnails sidebar + outline + raw-bytes + progressive buffer) introduced a render
- * loop that froze the app on a PDF route — those features are re-added one at a time,
- * carefully, only after this baseline is confirmed working.
+ * Low-RAM streaming (4GB target): the PDF is NOT read fully into memory. We hand PDF.js
+ * the file's `asset:` URL and let it RANGE-fetch only the pages it needs (the asset
+ * protocol supports HTTP range requests, and the CSP allows `connect-src asset:`). This
+ * avoids the old base64 path that inflated a 300MB scanned lecture to ~400MB+ in RAM.
+ * Combined with the ±BUFFER page virtualization, only a handful of pages are ever
+ * rendered to canvas at once.
  *
  * Features:
  *  - Fit Width (default) / Fit Page / Actual size + zoom (− % +).
@@ -22,7 +23,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ipc, isTauri } from "../../lib/ipc";
+import { assetUrl, isTauri } from "../../lib/ipc";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -36,17 +37,10 @@ const GAP = 10; // gap between pages
 const BUFFER = 3; // pages rendered above/below the current one (virtualization)
 const DEFAULT_ASPECT = 0.707; // A4 portrait w/h fallback before the first page loads
 
-/** Decode a base64 string (from `read_file_base64`) into a Uint8Array. */
-function base64ToUint8Array(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
 export default function PdfViewer({ path }: { path: string }) {
-  // ── PDF data ───────────────────────────────────────────────────────────────
-  const [bytes, setBytes] = useState<Uint8Array | null>(null);
+  // ── PDF source ─────────────────────────────────────────────────────────────
+  // The asset: URL — PDF.js range-fetches from it (no full-file load into RAM).
+  const [src, setSrc] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
   const [aspect, setAspect] = useState(DEFAULT_ASPECT);
   const [nativeW, setNativeW] = useState(0);
@@ -72,10 +66,9 @@ export default function PdfViewer({ path }: { path: string }) {
   const pageInputFocusedRef = useRef(false);
   const rafRef = useRef(0);
 
-  // ── Load file bytes via IPC (base64) ───────────────────────────────────────
+  // ── Resolve the asset: URL (no full-file read) ─────────────────────────────
   useEffect(() => {
-    let cancelled = false;
-    setBytes(null);
+    setSrc(null);
     setNumPages(0);
     setAspect(DEFAULT_ASPECT);
     setNativeW(0);
@@ -92,25 +85,13 @@ export default function PdfViewer({ path }: { path: string }) {
       setLoading(false);
       return;
     }
-
-    ipc
-      .readFileBase64(path)
-      .then((b64) => {
-        if (!cancelled) setBytes(base64ToUint8Array(b64));
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setLoadError(err instanceof Error ? err.message : String(err));
-          setLoading(false);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
+    // convertFileSrc → an asset: URL PDF.js can range-fetch page-by-page.
+    setSrc(assetUrl(path));
   }, [path]);
 
-  const file = useMemo(() => (bytes ? { data: bytes } : undefined), [bytes]);
+  // Stable file descriptor for <Document>. `withCredentials:false` keeps it a plain
+  // ranged GET; PDF.js enables range requests by default when given a URL.
+  const file = useMemo(() => (src ? { url: src } : undefined), [src]);
 
   const onDocumentLoadSuccess = useCallback(async (pdf: pdfjs.PDFDocumentProxy) => {
     setNumPages(pdf.numPages);
@@ -388,7 +369,7 @@ export default function PdfViewer({ path }: { path: string }) {
             Couldn't load this PDF.
             <span className="mt-1 block text-xs text-content-faint">{loadError}</span>
           </div>
-        ) : !bytes ? (
+        ) : !src ? (
           <div className="grid h-full place-items-center text-sm text-content-muted">
             {loading ? "Loading PDF…" : "No document"}
           </div>
