@@ -165,6 +165,21 @@ export interface Task {
   created_at: string;
 }
 
+/** A suggested lecture below the video (backend `Recommendation`). */
+export interface Recommendation {
+  id: number;
+  file_name: string;
+  file_type: string;
+  thumbnail_path: string | null;
+  duration_secs: number | null;
+  progress_pct: number;
+  is_completed: boolean;
+  subject_id: number;
+  subject_name: string;
+  /** Why suggested: "next" | "course" | "goal". */
+  reason: string;
+}
+
 /** A timestamped note tied to a material's playback (backend `Note`, v5). */
 export interface Note {
   id: number;

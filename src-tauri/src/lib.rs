@@ -77,6 +77,7 @@ pub fn run() {
             commands::player::create_note,
             commands::player::update_note,
             commands::player::delete_note,
+            commands::player::recommended_materials,
             commands::player::read_file_base64,
             commands::player::read_file_bytes,
             commands::player::open_in_system_player,

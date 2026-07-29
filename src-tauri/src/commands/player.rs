@@ -15,7 +15,7 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::db::queries::{self, MaterialRow, Note, PlayerMaterial};
+use crate::db::queries::{self, MaterialRow, Note, PlayerMaterial, Recommendation};
 use crate::db::Db;
 use crate::utils::errors::AppResult;
 
@@ -111,6 +111,17 @@ pub fn update_note(db: State<'_, Db>, id: i64, body: String) -> AppResult<()> {
 #[tauri::command]
 pub fn delete_note(db: State<'_, Db>, id: i64) -> AppResult<()> {
     db.with(|conn| queries::delete_note(conn, id))
+}
+
+/// Suggested lectures below the current video (next-in-series → same course → same goal).
+#[tauri::command]
+pub fn recommended_materials(
+    db: State<'_, Db>,
+    material_id: i64,
+    limit: Option<i64>,
+) -> AppResult<Vec<Recommendation>> {
+    let limit = limit.unwrap_or(8).clamp(1, 24);
+    db.with(|conn| queries::recommended_materials(conn, material_id, limit))
 }
 
 /// Read a local file and return its contents as a base64-encoded string.

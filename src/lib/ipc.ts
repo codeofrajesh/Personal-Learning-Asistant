@@ -21,6 +21,7 @@ import type {
   ImportSummary,
   Note,
   PlayerView,
+  Recommendation,
   RegisteredDir,
   RescanCounts,
   ScanProgress,
@@ -166,6 +167,11 @@ export const ipc = {
   /** Delete a note. */
   deleteNote(id: number): Promise<void> {
     return call<void>("delete_note", { id });
+  },
+
+  /** Suggested lectures below the current video (next → course → goal). */
+  recommendedMaterials(materialId: number, limit?: number): Promise<Recommendation[]> {
+    return call<Recommendation[]>("recommended_materials", { materialId, limit });
   },
 
   // ── Tasks (dashboard to-do list) ────────────────────────────────────────────

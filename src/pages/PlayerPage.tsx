@@ -18,6 +18,7 @@ import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
 import LessonOverview from "../components/player/LessonOverview";
 import NotesPanel from "../components/player/NotesPanel";
+import Recommendations from "../components/player/Recommendations";
 import VideoPlayer from "../components/player/VideoPlayer";
 import AudioPlayer from "../components/player/AudioPlayer";
 import PdfViewer from "../components/player/PdfViewer";
@@ -344,6 +345,9 @@ export default function PlayerPage() {
                 <p className="mt-2 text-xs text-content-faint">
                   File: {material.file_name} · Type: {material.file_type.toUpperCase()}
                 </p>
+
+                {/* Suggested lectures (next-in-series → same course → same goal). */}
+                <Recommendations materialId={material.id} source={source} />
               </div>
             )}
           </div>

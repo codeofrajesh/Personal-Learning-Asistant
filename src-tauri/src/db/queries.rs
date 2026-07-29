@@ -897,6 +897,94 @@ pub fn course_lessons(conn: &Connection, subject_id: i64) -> AppResult<Vec<Cours
     Ok(out)
 }
 
+/// One "Suggested lecture" below the video, with a human reason for the recommendation.
+#[derive(Debug, serde::Serialize)]
+pub struct Recommendation {
+    pub id: i64,
+    pub file_name: String,
+    pub file_type: String,
+    pub thumbnail_path: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub progress_pct: i64,
+    pub is_completed: bool,
+    pub subject_id: i64,
+    pub subject_name: String,
+    /// Why this was suggested: "next" | "course" | "goal".
+    pub reason: String,
+}
+
+/// Suggested lectures to show below the current video, ranked:
+///   1. "next"   — the next lessons in the SAME chapter (by sort order), i.e. next-in-series.
+///   2. "course" — other not-completed lessons in the same subject.
+///   3. "goal"   — lessons from sibling subjects under the same goal (prefer unstarted).
+/// The current material and duplicates are excluded; capped at `limit`. A stable rank
+/// keeps ordering deterministic across calls.
+pub fn recommended_materials(
+    conn: &Connection,
+    material_id: i64,
+    limit: i64,
+) -> AppResult<Vec<Recommendation>> {
+    let mut stmt = conn.prepare(
+        "WITH cur AS (
+            SELECT m.id AS mid, m.chapter_id, m.sort_order, c.subject_id, s.goal_id
+            FROM materials m
+            JOIN chapters c ON c.id = m.chapter_id
+            JOIN subjects s ON s.id = c.subject_id
+            WHERE m.id = ?1
+         )
+         SELECT
+            m.id, m.file_name, m.file_type, m.thumbnail_path, m.duration_secs,
+            COALESCE(CAST(wp.completion_pct AS INTEGER), 0) AS progress_pct,
+            m.is_completed,
+            s.id AS subject_id, s.name AS subject_name,
+            CASE
+                WHEN m.chapter_id = cur.chapter_id THEN 'next'
+                WHEN c.subject_id = cur.subject_id THEN 'course'
+                ELSE 'goal'
+            END AS reason,
+            CASE
+                WHEN m.chapter_id = cur.chapter_id THEN 0
+                WHEN c.subject_id = cur.subject_id THEN 1
+                ELSE 2
+            END AS rank_bucket
+         FROM materials m
+         JOIN chapters c ON c.id = m.chapter_id
+         JOIN subjects s ON s.id = c.subject_id
+         JOIN cur
+         LEFT JOIN watch_progress wp ON wp.material_id = m.id
+         WHERE m.status = 'active'
+           AND m.id <> cur.mid
+           AND s.goal_id = cur.goal_id
+           AND m.is_completed = 0
+           -- 'next' bucket only counts lessons AFTER the current one in the chapter
+           AND NOT (m.chapter_id = cur.chapter_id AND m.sort_order < cur.sort_order)
+         ORDER BY rank_bucket,
+                  CASE WHEN m.chapter_id = cur.chapter_id THEN m.sort_order ELSE 0 END,
+                  m.last_opened_at IS NOT NULL,   -- prefer unstarted within a bucket
+                  m.sort_order, m.file_name
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![material_id, limit], |r| {
+        Ok(Recommendation {
+            id: r.get(0)?,
+            file_name: r.get(1)?,
+            file_type: r.get(2)?,
+            thumbnail_path: r.get(3)?,
+            duration_secs: r.get(4)?,
+            progress_pct: r.get(5)?,
+            is_completed: r.get::<_, i64>(6)? != 0,
+            subject_id: r.get(7)?,
+            subject_name: r.get(8)?,
+            reason: r.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// The goal id of the most recently watched material (by `materials.last_opened_at`),
 /// or `None` if nothing has been opened yet. Used by the Courses page to default the
 /// goal pill tab to the learner's currently active goal.
