@@ -1001,6 +1001,14 @@ pub fn material_for_player(conn: &Connection, material_id: i64) -> AppResult<Pla
         [material_id],
     )?;
 
+    // Count a genuine *view* here (on open) — NOT on every progress save. If a
+    // watch_progress row already exists, bump its watch_count once; otherwise the row
+    // is created by the first save_progress with watch_count = 1.
+    conn.execute(
+        "UPDATE watch_progress SET watch_count = watch_count + 1 WHERE material_id = ?1",
+        [material_id],
+    )?;
+
     Ok(material)
 }
 
@@ -1010,8 +1018,9 @@ const COMPLETION_THRESHOLD: f64 = 0.95;
 /// Upsert watch progress for a material and mirror completion onto `materials`.
 ///
 /// Runs in one transaction (`with_mut`): writes position/duration into `watch_progress`
-/// (bumping `watch_count` + `last_watched_at`), flips `completed` when watched past the
-/// threshold, and mirrors `is_completed` + `last_opened_at` onto the `materials` row.
+/// (refreshing `last_watched_at`), flips `completed` when watched past the threshold, and
+/// mirrors `is_completed` onto the `materials` row. `watch_count` is NOT touched here — a
+/// genuine view is counted once on open (`material_for_player`), not on every save.
 pub fn save_progress(
     conn: &mut Connection,
     material_id: i64,
@@ -1029,8 +1038,7 @@ pub fn save_progress(
              position_secs   = excluded.position_secs,
              duration_secs   = MAX(watch_progress.duration_secs, excluded.duration_secs),
              completed       = MAX(watch_progress.completed, excluded.completed),
-             last_watched_at = datetime('now'),
-             watch_count     = watch_progress.watch_count + 1",
+             last_watched_at = datetime('now')",
         rusqlite::params![material_id, position_secs, duration_secs, completed_i],
     )?;
 

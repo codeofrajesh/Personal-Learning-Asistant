@@ -134,14 +134,25 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
     [onFail],
   );
 
-  /** Save current watch progress to the DB. */
-  const saveProgress = useCallback(() => {
-    const pos = timePosRef.current;
-    const dur = durationRef.current;
-    if (dur > 0 && pos > 0) {
+  // Last position (secs) actually persisted to the DB — used to coalesce writes so we
+  // don't hammer a cheap SSD with near-identical rows on rapid pause/seek/flush.
+  const lastSavedPosRef = useRef(-1);
+  const SAVE_COALESCE_SECS = 5;
+
+  /** Save current watch progress to the DB.
+   *  Coalesced by default (skips if the position moved < 5s since the last write);
+   *  pass `force` on pause / seek / EOF / unmount so those always persist exactly. */
+  const saveProgress = useCallback(
+    (force = false) => {
+      const pos = timePosRef.current;
+      const dur = durationRef.current;
+      if (dur <= 0 || pos <= 0) return;
+      if (!force && Math.abs(pos - lastSavedPosRef.current) < SAVE_COALESCE_SECS) return;
+      lastSavedPosRef.current = pos;
       void ipc.saveProgress(materialId, pos, dur).catch(() => {});
-    }
-  }, [materialId]);
+    },
+    [materialId],
+  );
 
   // ── Init mpv once (init FIRST, then observe) ───────────────────────────────
   useEffect(() => {
@@ -196,7 +207,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
               isPlayingRef.current = !data;
               setIsPlaying(!data);
               isPausedRef.current = !!data;
-              if (data) saveProgress(); // save on pause
+              if (data) saveProgress(true); // save on pause (forced)
               break;
             case "time-pos": {
               const t = (data as number | null) ?? 0;
@@ -229,7 +240,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
               setRate(data as number);
               break;
             case "eof-reached":
-              if (data) saveProgress(); // save on end
+              if (data) saveProgress(true); // save on end (forced)
               break;
           }
         };
@@ -255,8 +266,8 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
 
     return () => {
       disposedRef.current = true;
-      // Final progress save + session log on unmount.
-      saveProgress();
+      // Final progress save + session log on unmount (forced — always persist exactly).
+      saveProgress(true);
       if (watchedSecondsRef.current > 0) {
         void ipc.logSession(materialId, watchedSecondsRef.current).catch(() => {});
       }
@@ -556,7 +567,8 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
     const t = Math.max(0, Math.min(d, frac * d));
     if (seekFillRef.current) seekFillRef.current.style.width = `${(t / d) * 100}%`;
     void command("seek", [t, "absolute"]).catch(() => {});
-    saveProgress();
+    timePosRef.current = t; // reflect the new position so the save persists where we sought
+    saveProgress(true);
   };
   const onTrackPointerDown = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -590,7 +602,8 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
   const skip = (secs: number) => {
     const t = Math.max(0, Math.min(durationRef.current, timePosRef.current + secs));
     void command("seek", [t, "absolute"]).catch(() => {});
-    saveProgress();
+    timePosRef.current = t; // reflect the new position so the save persists where we sought
+    saveProgress(true);
   };
   const openInSystemPlayer = () => void ipc.openInSystemPlayer(path);
 
@@ -636,10 +649,27 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Periodic safety flush of progress (every 15 s while watching).
+  // Forced flush when the window is hidden/closed (minimize, tab-switch, quit) so we never
+  // lose the resume point on a hard close that skips React unmount.
   useEffect(() => {
     if (!ready) return;
-    const id = window.setInterval(saveProgress, 15000);
+    const onHide = () => saveProgress(true);
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") saveProgress(true);
+    };
+    window.addEventListener("beforeunload", onHide);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("beforeunload", onHide);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [ready, saveProgress]);
+
+  // Periodic safety flush of progress (every 15 s while watching). Coalesced: only writes
+  // if the position actually advanced ≥ 5s since the last save (no redundant SSD writes).
+  useEffect(() => {
+    if (!ready) return;
+    const id = window.setInterval(() => saveProgress(false), 15000);
     return () => window.clearInterval(id);
   }, [ready, saveProgress]);
 

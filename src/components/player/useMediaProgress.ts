@@ -41,39 +41,56 @@ export function useMediaProgress(
   getMedia: () => HTMLMediaElement | null,
 ): UseMediaProgress {
   const accumulatedRef = useRef(0);
+  // Last position (secs) actually persisted — coalesces periodic writes so we don't
+  // hammer a cheap SSD with near-identical rows. `force` (pause/seek/ended/unmount)
+  // bypasses the coalesce so those always persist exactly.
+  const lastSavedPosRef = useRef(-1);
+  const COALESCE_SECS = 5;
 
-  const flush = useCallback(() => {
-    const media = getMedia();
-    if (!media) return;
-    const duration = media.duration;
-    const position = media.currentTime;
-    // Save position whenever we have a real duration; for audio without metadata we
-    // still log the session below.
-    const saveP = Number.isFinite(duration) && duration > 0
-      ? ipc.saveProgress(materialId, position, duration)
-      : Promise.resolve();
-    const acc = accumulatedRef.current;
-    const logP = acc > 0 ? ipc.logSession(materialId, acc) : Promise.resolve();
-    if (acc > 0) accumulatedRef.current = 0;
-    void Promise.all([saveP, logP]).catch(() => {
-      /* best-effort persistence; swallow IPC errors so playback never breaks */
-    });
-  }, [materialId, getMedia]);
+  const flush = useCallback(
+    (force = false) => {
+      const media = getMedia();
+      if (!media) return;
+      const duration = media.duration;
+      const position = media.currentTime;
+      const hasDur = Number.isFinite(duration) && duration > 0;
+      // Coalesce position writes; always drain accumulated session seconds regardless.
+      const shouldSaveP =
+        hasDur && (force || Math.abs(position - lastSavedPosRef.current) >= COALESCE_SECS);
+      if (shouldSaveP) lastSavedPosRef.current = position;
+      const saveP = shouldSaveP ? ipc.saveProgress(materialId, position, duration) : Promise.resolve();
+      const acc = accumulatedRef.current;
+      const logP = acc > 0 ? ipc.logSession(materialId, acc) : Promise.resolve();
+      if (acc > 0) accumulatedRef.current = 0;
+      void Promise.all([saveP, logP]).catch(() => {
+        /* best-effort persistence; swallow IPC errors so playback never breaks */
+      });
+    },
+    [materialId, getMedia],
+  );
 
-  // Periodic flush + final flush on unmount / material switch.
+  // Periodic (coalesced) flush + final forced flush on unmount / material switch.
   useEffect(() => {
-    const id = window.setInterval(flush, FLUSH_INTERVAL_MS);
+    const id = window.setInterval(() => flush(false), FLUSH_INTERVAL_MS);
     return () => {
       window.clearInterval(id);
-      flush();
+      flush(true);
     };
   }, [flush]);
 
-  // Best-effort flush when the window closes (design: "save on window close").
+  // Best-effort forced flush when the window closes or is hidden (design: "save on
+  // window close"). visibilitychange catches minimize / tab-switch on desktop WebView2.
   useEffect(() => {
-    const handler = () => flush();
+    const handler = () => flush(true);
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush(true);
+    };
     window.addEventListener("beforeunload", handler);
-    return () => window.removeEventListener("beforeunload", handler);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("beforeunload", handler);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [flush]);
 
   return { accumulatedRef, flush };
