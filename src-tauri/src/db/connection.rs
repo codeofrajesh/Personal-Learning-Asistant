@@ -80,6 +80,21 @@ fn configure_pragmas(conn: &Connection) -> AppResult<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     // Wait up to 5s for a lock before erroring — backstops the WAL guarantee.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
+    // ── Low-RAM tuning (4GB-laptop target) ──────────────────────────────────────────
+    // Cap the page cache so SQLite can't balloon RAM on a big library. A negative
+    // cache_size is a size in KiB — -2000 ≈ 2 MB, plenty for our small, index-backed
+    // queries and far below SQLite's ~2MB-per-connection default growth under load.
+    conn.pragma_update(None, "cache_size", -2000)?;
+    // Keep temp b-trees (ORDER BY / GROUP BY spills) in RAM rather than writing temp
+    // files to the (possibly nearly-full, 10-15GB) SSD.
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    // A modest memory-mapped I/O window (32 MB) speeds reads without committing the
+    // whole DB to RAM. Bounded so it can't grow unbounded on a huge database file.
+    conn.pragma_update(None, "mmap_size", 32 * 1024 * 1024)?;
+    // Cap the WAL file so it can't grow without bound on a low-disk machine; SQLite
+    // checkpoints back into the main DB when it exceeds this many pages (~4 MB).
+    conn.pragma_update(None, "wal_autocheckpoint", 1000)?;
     Ok(())
 }
 
