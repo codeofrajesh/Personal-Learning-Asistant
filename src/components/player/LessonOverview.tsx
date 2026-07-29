@@ -136,7 +136,7 @@ function LessonOverviewView({ siblings, currentId, source }: Props) {
             }
 
             return (
-              <li key={m.id} className="lesson-card relative group">
+              <li key={m.id} className="lesson-card cv-row-lg relative group">
                 <div
                   onClick={() => navigate(`/library/material/${m.id}`, withSource(source))}
                   className={cn(

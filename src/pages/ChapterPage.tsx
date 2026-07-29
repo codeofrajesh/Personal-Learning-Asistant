@@ -103,7 +103,9 @@ export default function ChapterPage() {
       {state.kind === "ready" && count > 0 && (
         <div className="flex flex-col gap-2.5">
           {state.view.materials.map((m) => (
-            <MaterialRow key={m.id} material={m} />
+            <div key={m.id} className="cv-row-lg">
+              <MaterialRow material={m} />
+            </div>
           ))}
         </div>
       )}

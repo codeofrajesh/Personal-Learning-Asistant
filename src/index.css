@@ -119,6 +119,19 @@
     letter-spacing: -0.02em;
   }
 
+  /* Low-RAM/CPU list rows (4GB target): skip layout + paint for off-screen rows.
+     `contain-intrinsic-size` reserves an estimated height so the scrollbar stays stable
+     and there's no jump when a row scrolls into view. Applied to long material/lesson
+     lists — a near-zero-risk win versus full virtualization (no DOM restructuring). */
+  .cv-row {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 64px;
+  }
+  .cv-row-lg {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 88px;
+  }
+
   /* Thin, styled scrollbars that match the dark theme. */
   .scroll-thin {
     scrollbar-width: thin;

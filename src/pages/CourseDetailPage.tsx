@@ -244,7 +244,7 @@ export default function CourseDetailPage() {
                       const idxLabel = String(globalIdx).padStart(2, "0");
                       const missing = lesson.status === "missing";
                       return (
-                        <li key={lesson.id}>
+                        <li key={lesson.id} className="cv-row">
                           <LessonRow
                             lesson={lesson}
                             idxLabel={idxLabel}
