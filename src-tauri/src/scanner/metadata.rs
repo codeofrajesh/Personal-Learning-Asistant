@@ -40,6 +40,39 @@ static EXTRACTING: AtomicBool = AtomicBool::new(false);
 const MAX_CONCURRENT: usize = 2;
 /// Thumbnail width in px; height auto (`-2` keeps aspect + even dimension).
 const THUMB_WIDTH: u32 = 640;
+/// LRU cap on the thumbnail cache (4GB / 10-15GB-free-SSD target). At ~40KB per
+/// downscaled JPEG, 4000 files ≈ 160MB — a hard bound so a huge library can never fill
+/// the disk with covers. Beyond this we evict the least-recently-modified thumbnails.
+const MAX_THUMBNAILS: usize = 4000;
+
+/// Enforce the thumbnail-cache cap: if the dir holds more than `MAX_THUMBNAILS` JPEGs,
+/// delete the oldest (by modified time) down to the cap. Best-effort; never fails the
+/// extraction pass. Rows whose thumbnail is evicted simply regenerate on next demand.
+fn enforce_thumbnail_cap(dir: &std::path::Path) {
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("jpg") {
+                    return None;
+                }
+                let modified = e.metadata().ok()?.modified().ok()?;
+                Some((modified, p))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if entries.len() <= MAX_THUMBNAILS {
+        return;
+    }
+    // Oldest first; remove until we're back under the cap.
+    entries.sort_by_key(|(t, _)| *t);
+    let excess = entries.len() - MAX_THUMBNAILS;
+    for (_, path) in entries.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 /// Resets the single-flight flag on drop, even on early return / error.
 struct FlightGuard;
@@ -121,6 +154,9 @@ pub async fn extract_missing_metadata(app: AppHandle) -> AppResult<()> {
     for h in handles {
         let _ = h.await;
     }
+
+    // Keep the thumbnail cache bounded so a huge library can't fill a small SSD.
+    enforce_thumbnail_cap(&thumbnails_dir);
 
     Ok(())
 }
