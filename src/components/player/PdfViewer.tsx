@@ -21,6 +21,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ipc, isTauri } from "../../lib/ipc";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
@@ -217,17 +218,46 @@ export default function PdfViewer({ path }: { path: string }) {
   const goPrev = useCallback(() => jumpToPage(currentPage - 1), [jumpToPage, currentPage]);
   const goNext = useCallback(() => jumpToPage(currentPage + 1), [jumpToPage, currentPage]);
 
-  const toggleFullscreen = () => {
-    const el = rootRef.current;
-    if (!el) return;
-    if (document.fullscreenElement) void document.exitFullscreen();
-    else void el.requestFullscreen();
-  };
+  // Fullscreen is unified on the Tauri OS-window (same model as the video player), NOT the
+  // HTML5 Fullscreen API. The HTML5 path fought AppShell's window-resize → isFullscreen()
+  // listener: entering element-fullscreen resized the window, the shell read the OS window
+  // as NOT fullscreen, re-rendered layout, and the browser immediately dropped fullscreen
+  // (the "opens then instantly escapes" bug). Using the OS window means one fullscreen
+  // concept app-wide; AppShell already hides its chrome for it.
+  const toggleFullscreen = useCallback(async () => {
+    if (!isTauri()) return;
+    try {
+      const w = getCurrentWindow();
+      const target = !(await w.isFullscreen());
+      await w.setFullscreen(target);
+      setIsFullscreen(target);
+      window.dispatchEvent(new CustomEvent("app-fullscreen-changed", { detail: target }));
+    } catch {
+      /* ignore — user can still use OS controls */
+    }
+  }, []);
 
   useEffect(() => {
-    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
-    document.addEventListener("fullscreenchange", onChange);
-    return () => document.removeEventListener("fullscreenchange", onChange);
+    if (!isTauri()) return;
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    const sync = async () => {
+      try {
+        const fs = await getCurrentWindow().isFullscreen();
+        if (active) setIsFullscreen(fs);
+      } catch {
+        /* ignore */
+      }
+    };
+    void sync();
+    getCurrentWindow()
+      .onResized(() => void sync())
+      .then((u) => (unlisten = u))
+      .catch(() => {});
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, []);
 
   // ── Keyboard shortcuts (active in fullscreen too — window-level) ───────────
@@ -277,12 +307,21 @@ export default function PdfViewer({ path }: { path: string }) {
           e.preventDefault();
           jumpToPage(numPages);
           break;
+        case "Escape":
+          // OS-window fullscreen isn't auto-exited by the browser (unlike the old HTML5
+          // path), so handle Esc ourselves when we're fullscreen.
+          if (isTauri()) {
+            void getCurrentWindow().isFullscreen().then((fs) => {
+              if (fs) void toggleFullscreen();
+            });
+          }
+          break;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [numPages, currentPage, slotH, goNext, goPrev, jumpToPage]);
+  }, [numPages, currentPage, slotH, goNext, goPrev, jumpToPage, toggleFullscreen]);
 
   const ready = numPages > 0;
 
