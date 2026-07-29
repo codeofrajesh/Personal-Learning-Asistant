@@ -1,0 +1,12 @@
+# Project-local Cargo configuration.
+#
+# This machine has ~4 GB RAM. Parallel compilation of heavy crates (bundled
+# SQLite, Tauri, tokio) exhausts the system commit limit and kills the MSVC
+# linker (LNK1171 / ERROR_COMMITMENT_LIMIT). Serializing the build keeps peak
+# memory low at the cost of wall-clock time.
+[build]
+jobs = 1
+
+[profile.dev]
+# Fewer codegen units => lower peak memory per crate during dev builds.
+codegen-units = 1

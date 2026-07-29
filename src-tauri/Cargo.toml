@@ -1,0 +1,51 @@
+[package]
+name = "ple"
+version = "0.1.0"
+description = "Local-First Personal Learning Environment"
+authors = ["PLE"]
+edition = "2021"
+rust-version = "1.77.2"
+
+# The `_lib` name lets both the binary (main.rs) and integration reuse the library.
+[lib]
+name = "ple_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `protocol-asset` enables the `asset:` protocol so the webview can load
+# local files (PDFs, images, media) from registered folders — matches
+# `assetProtocol.enable` in tauri.conf.json.
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+
+# Serialization for IPC command payloads.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SQLite — used directly (NOT tauri-plugin-sql) for fine-grained FTS5 control.
+# `bundled` compiles SQLite from source with FTS5 enabled, so no system dep is needed.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# File scanning.
+walkdir = "2"       # recursive initial scan
+notify = "6"        # live file watcher (ReadDirectoryChangesW on Windows)
+
+# Async runtime bits used by Tauri command spawning.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# Error handling & logging.
+thiserror = "1"
+log = "0.4"
+tauri-plugin-libmpv = "0.3.2"
+tauri-plugin-shell = "2.3.5"
+
+[profile.release]
+# Optimize for the small-binary / low-memory target (Section 1: 30-50MB idle).
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

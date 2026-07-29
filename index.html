@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- CSP is configured in src-tauri/tauri.conf.json (app.security.csp) and injected
+         by Tauri into the production build. Do NOT hardcode a CSP <meta> here — in
+         `tauri dev` the webview loads Vite directly, so a stale <meta> would be the
+         enforced policy and can block Vite's inline React-Refresh preamble
+         (window.$RefreshReg$ stays undefined → every component module throws → white
+         screen). Letting tauri.conf.json own the CSP keeps dev unrestricted and prod
+         locked down. -->
+    <title>PLE — Personal Learning Environment</title>
+  </head>
+  <body>
+    <div id="root">
+      <!-- Pre-React loading state. React replaces this on mount; if it never does, you
+           see this text instead of a white screen (proves the JS bundle didn't run). -->
+      <div style="display:grid;place-items:center;height:100vh;background:#0D0D0D;color:#71717A;font-family:system-ui,sans-serif;font-size:14px">
+        Loading PLE…
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,229 @@
+//! Background media-metadata + thumbnail extraction — CPU-safe engine.
+//!
+//! ## Why this is careful about CPU
+//! Extraction shells out to ffprobe/ffmpeg (bundled sidecars). Naively looping over every
+//! pending file, or letting the three trigger sites (boot, post-import, on-demand) each
+//! start their own loop, can saturate the CPU and fight over the same output files. This
+//! module therefore enforces:
+//!   - a **single-flight guard** (`EXTRACTING`): only one extraction pass runs at a time;
+//!     overlapping triggers return immediately instead of stacking.
+//!   - a **bounded concurrency cap** (`Semaphore`, ≤2, derived from core count): at most a
+//!     couple of ffmpeg processes run simultaneously, so the UI never janks.
+//!   - **downscaled thumbnails** (`-vf scale=640:-2`): small JPEGs, not full-res frames.
+//!   - a **random-ish frame** in the 10–80% range (avoids intros/black frames/credits),
+//!     seeded deterministically from the material id so re-runs are stable.
+//!   - **idempotence**: only rows missing duration/thumbnail are selected, so it is safe to
+//!     re-run and it resumes after a restart.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_shell::ShellExt;
+use tokio::sync::Semaphore;
+
+use crate::db::Db;
+use crate::utils::errors::AppResult;
+
+#[derive(serde::Serialize, Clone)]
+pub struct MetadataExtractedEvent {
+    pub material_id: i64,
+    pub duration_secs: Option<f64>,
+    pub thumbnail_path: Option<String>,
+}
+
+/// Single-flight guard: true while an extraction pass is in progress.
+static EXTRACTING: AtomicBool = AtomicBool::new(false);
+
+/// Hard ceiling on simultaneous ffmpeg/ffprobe processes (keeps the CPU calm).
+const MAX_CONCURRENT: usize = 2;
+/// Thumbnail width in px; height auto (`-2` keeps aspect + even dimension).
+const THUMB_WIDTH: u32 = 640;
+
+/// Resets the single-flight flag on drop, even on early return / error.
+struct FlightGuard;
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        EXTRACTING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Deterministic frame fraction in [0.10, 0.80) from a material id (golden-ratio hash).
+/// Stable per id, so re-runs pick the same frame — no flicker across regenerations.
+fn frame_fraction(id: i64) -> f64 {
+    let mixed = (id as f64 * 0.618_033_988_749_895).fract().abs();
+    0.10 + mixed * 0.70
+}
+
+pub async fn extract_missing_metadata(app: AppHandle) -> AppResult<()> {
+    // Single-flight: if a pass is already running, don't start another.
+    if EXTRACTING.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let _guard = FlightGuard;
+
+    let db = app.state::<Db>();
+    let pending = db.with(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, file_type
+             FROM materials
+             WHERE status = 'active'
+               AND file_type IN ('video', 'audio')
+               AND (duration_secs IS NULL OR (file_type = 'video' AND thumbnail_path IS NULL))",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })?;
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .expect("failed to resolve app_data_dir");
+    let thumbnails_dir = data_dir.join("thumbnails");
+    std::fs::create_dir_all(&thumbnails_dir)?;
+
+    // Bounded concurrency: at most MAX_CONCURRENT (and never more than the core count)
+    // ffmpeg processes run at once.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let permits = cores.min(MAX_CONCURRENT).max(1);
+    let sem = Arc::new(Semaphore::new(permits));
+    let thumbnails_dir = Arc::new(thumbnails_dir);
+
+    let mut handles = Vec::with_capacity(pending.len());
+    for (id, path, file_type) in pending {
+        let app = app.clone();
+        let sem = sem.clone();
+        let thumbnails_dir = thumbnails_dir.clone();
+        handles.push(tauri::async_runtime::spawn(async move {
+            // Acquire a permit; released when this task ends (RAII).
+            let _permit = sem.acquire_owned().await;
+            process_one(&app, id, &path, &file_type, &thumbnails_dir).await;
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    Ok(())
+}
+
+/// Extract duration (+ a downscaled thumbnail for video) for one material, then persist.
+async fn process_one(
+    app: &AppHandle,
+    id: i64,
+    path: &str,
+    file_type: &str,
+    thumbnails_dir: &PathBuf,
+) {
+    let mut duration: Option<f64> = None;
+    let mut thumb_path: Option<String> = None;
+
+    // Duration via ffprobe (both video + audio).
+    match app.shell().sidecar("ffprobe") {
+        Ok(ffprobe) => {
+            let cmd = ffprobe.args([
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ]);
+            if let Ok(output) = cmd.output().await {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Ok(d) = stdout.trim().parse::<f64>() {
+                        duration = Some(d);
+                    }
+                } else {
+                    log::warn!(
+                        "ffprobe failed for {}: {}",
+                        path,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+        Err(e) => log::error!("Failed to resolve ffprobe sidecar: {e}"),
+    }
+
+    // Thumbnail for videos: a random-ish frame, downscaled to THUMB_WIDTH.
+    if file_type == "video" {
+        let out_file = thumbnails_dir.join(format!("{}.jpg", id));
+        // Random-ish frame within the body of the clip (fallback 0s if duration unknown).
+        let timestamp = duration.map(|d| d * frame_fraction(id)).unwrap_or(0.0);
+        let ts_str = format!("{:.3}", timestamp);
+        let scale = format!("scale={}:-2", THUMB_WIDTH);
+
+        match app.shell().sidecar("ffmpeg") {
+            Ok(ffmpeg) => {
+                let cmd = ffmpeg.args([
+                    "-ss", &ts_str,
+                    "-i", path,
+                    "-vframes", "1",
+                    "-vf", &scale,
+                    "-q:v", "4",
+                    "-y",
+                    out_file.to_string_lossy().as_ref(),
+                ]);
+                if let Ok(output) = cmd.output().await {
+                    if output.status.success() {
+                        thumb_path = Some(out_file.to_string_lossy().to_string());
+                    } else {
+                        log::warn!(
+                            "ffmpeg failed for {}: {}",
+                            path,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                }
+            }
+            Err(e) => log::error!("Failed to resolve ffmpeg sidecar: {e}"),
+        }
+    }
+
+    // Persist + notify (only if we learned something).
+    if duration.is_some() || thumb_path.is_some() {
+        let d = duration;
+        let t = thumb_path.clone();
+        let db = app.state::<Db>();
+        let res = db.with_mut(move |conn| {
+            let count = conn.execute(
+                "UPDATE materials
+                 SET duration_secs = COALESCE(?1, duration_secs),
+                     thumbnail_path = COALESCE(?2, thumbnail_path),
+                     updated_at = datetime('now')
+                 WHERE id = ?3",
+                rusqlite::params![d, t, id],
+            )?;
+            Ok(count)
+        });
+
+        if res.is_ok() {
+            let _ = app.emit(
+                "metadata://extracted",
+                MetadataExtractedEvent {
+                    material_id: id,
+                    duration_secs: duration,
+                    thumbnail_path: thumb_path,
+                },
+            );
+        }
+    }
+}

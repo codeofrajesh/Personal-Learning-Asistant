@@ -1,0 +1,408 @@
+# PLE — Personal Learning Environment · Progress & Architecture
+
+A local-first desktop app that turns a folder of learning material (videos, PDFs, notes,
+audio, images) into a structured, trackable study environment. Built with **Tauri v2 +
+Rust** (backend, SQLite, native mpv playback) and **React + Vite + TypeScript + Tailwind**
+(frontend). Everything runs offline. Content, progress, tasks, and database-backed settings
+live in one local SQLite database; focus-timer runtime/configuration is kept in WebView
+`localStorage`.
+
+Last updated: 2026-07-29.
+
+---
+
+## 1. Tech Stack & Conventions
+
+| Layer | Choice |
+|-------|--------|
+| Shell | Tauri v2 (transparent window; libmpv, dialog, shell, and asset protocol) |
+| Backend | Rust — `rusqlite` (bundled SQLite, WAL), single `Mutex<Connection>` |
+| Video | libmpv rendered behind the transparent WebView (HTML5 fallback) |
+| Frontend | React 18, Vite, TypeScript, React Router (`HashRouter`) |
+| State | Zustand (timer, toasts), local component state elsewhere |
+| Styling | Tailwind, dark glassmorphism design system |
+| Animation | GSAP for entrances, modal/toast transitions, player-control fades, and lesson-state motion |
+| Icons | `lucide-react` v1.27.0 (verify names against `node_modules` before use) |
+
+### Design DNA (glassmorphism, dark)
+- Primary lime `#AAFF00`, secondary cyan-400 `#22D3EE`, accent orange `#FF6B35`.
+- Cards: `bg-white/[0.02] border-white/[0.05] shadow-2xl backdrop-blur-xl rounded-[24px]`.
+- One unified ambient canvas (gradient + lime/cyan blur blobs) sits behind the whole app;
+  the sidebar and header float over it as frosted-glass pills.
+- **Transparent-window constraint:** the player route keeps a *flush opaque* sidebar
+  because libmpv renders *behind* the WebView — a floating panel or ambient canvas can't sit
+  over the video. The **top bar is fully transparent on every route** (only its 3 glass
+  pills float), so it overlays the player without an opaque strip; the sidebar stays opaque
+  on the player route to avoid desktop bleed-through.
+
+### Verify pattern
+- Frontend: `npm run build` (tsc typecheck + Vite build).
+- Backend: `cargo test` in `src-tauri` — **7 tests, all passing** (3 schema/migration, 4
+  scanner). Most motion is reduced-motion gated; `LessonOverview` still needs an explicit
+  reduced-motion guard.
+
+---
+
+## 2. Routing
+
+`HashRouter` (avoids deep-link 404s under Tauri's static-file origin). All pages are
+code-split with `React.lazy` + `Suspense` and nested inside a single `AppShell` layout route
+(eager-loaded so the sidebar/header never flash).
+
+| Path | Page | Purpose |
+|------|------|---------|
+| `/` | `Dashboard` | Bento home: progress, activity, Pomodoro, Next Up, tasks, recents |
+| `/library` | `Library` | Goals grid (top of the library tree) |
+| `/library/goal/:goalId` | `GoalPage` | Subjects in a goal |
+| `/library/subject/:subjectId` | `SubjectPage` | Chapters in a subject |
+| `/library/chapter/:chapterId` | `ChapterPage` | Materials in a chapter |
+| `/library/material/:materialId` | `PlayerPage` | Video/PDF/audio/image player |
+| `/courses` | `CoursesPage` | LMS-style course cards |
+| `/courses/:subjectId` | `CourseDetailPage` | Flattened, sequence-ordered lessons |
+| `/planning` | `PlanningHub` | Planner + View (Timeline / Table) + Consistency |
+| `/settings` | `Settings` | Folders, widgets, focus timer, theme, data, shortcuts |
+| `*` | `NotFound` | Catch-all |
+
+`main.tsx` → `<StrictMode>` → `<ErrorBoundary>` → `<App/>`.
+
+---
+
+## 3. Database Schema
+
+Canonical DDL in `src-tauri/src/db/schema.rs` (`SCHEMA_SQL`). Migration logic in
+`src-tauri/src/db/connection.rs::migrate()`.
+
+- **`SCHEMA_VERSION = 4`**, stamped into SQLite `PRAGMA user_version`.
+- **Migration model:** two-part and idempotent — (1) run all
+  `CREATE TABLE IF NOT EXISTS` from `SCHEMA_SQL`, then (2) guarded incremental
+  `ALTER TABLE ... ADD COLUMN` steps for columns added to already-existing DBs. Those schema
+  changes run transactionally; after commit, `PRAGMA user_version` is stamped to 4. This is
+  not a numbered migration-file list.
+- **Pragmas:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`,
+  `busy_timeout=5s`.
+
+### Version history
+- **v2** — added the `tasks` table + indexes.
+- **v3** — added `study_sessions.session_type` (`'work' | 'short_break' | 'long_break'`).
+- **v4** — added `tasks.estimated_mins` + the `consistency_log` table.
+
+### Tables (10 ordinary + 1 FTS5 virtual + 3 sync triggers)
+
+**Content tree** — `goals` → `subjects` → `chapters` → `materials` (each `ON DELETE
+CASCADE` down the chain). `materials` carries file metadata (`file_type`, `duration_secs`,
+`thumbnail_path`, `resolution`, `codec`, `page_count`, `status`, `is_bookmarked`,
+`is_completed`, …). `watch_progress` holds one row per material (`position_secs`,
+`duration_secs`, a STORED generated `completion_pct`, `completed`, `watch_count`).
+`registered_dirs` tracks scanned folders (`path`, `category_level`, scan status).
+
+**`settings`** — key/value store.
+| Column | Type |
+|--------|------|
+| `key` | TEXT PRIMARY KEY |
+| `value` | TEXT NOT NULL |
+
+**`study_sessions`** — session logging (feeds the activity chart + consistency study-minutes).
+| Column | Type / Notes |
+|--------|------|
+| `id` | INTEGER PK AUTOINCREMENT |
+| `material_id` | INTEGER → materials(id), nullable (Pomodoro sessions have no material) |
+| `started_at` | TEXT NOT NULL |
+| `ended_at` | TEXT |
+| `duration_secs` | REAL DEFAULT 0 |
+| `session_type` | TEXT DEFAULT 'work' — `'work' \| 'short_break' \| 'long_break'` (v3) |
+| `session_date` | TEXT GENERATED ALWAYS AS `date(started_at)` STORED |
+
+**`tasks`** — to-do items (Planning Hub).
+| Column | Type / Notes |
+|--------|------|
+| `id` | INTEGER PK AUTOINCREMENT |
+| `title` | TEXT NOT NULL |
+| `done` | INTEGER DEFAULT 0 |
+| `priority` | INTEGER DEFAULT 0 — 0 none / 1 low / 2 medium / 3 high |
+| `due_at` | TEXT — ISO `YYYY-MM-DD HH:MM:SS`, nullable |
+| `material_id` | INTEGER → materials(id) ON DELETE SET NULL |
+| `sort_order` | INTEGER DEFAULT 0 |
+| `estimated_mins` | INTEGER — optional effort estimate (v4) |
+| `completed_at` | TEXT |
+| `created_at` / `updated_at` | TEXT DEFAULT `datetime('now')` |
+
+**`consistency_log`** — at most one upserted snapshot per SQLite UTC date. Task completion
+refreshes today; boot backfill refreshes the latest logged day and fills subsequent dates.
+| Column | Type / Notes |
+|--------|------|
+| `day` | TEXT PRIMARY KEY — `YYYY-MM-DD` |
+| `tasks_due` | INTEGER DEFAULT 0 |
+| `tasks_completed_on_time` | INTEGER DEFAULT 0 |
+| `tasks_completed_late` | INTEGER DEFAULT 0 |
+| `tasks_missed` | INTEGER DEFAULT 0 |
+| `study_minutes` | REAL DEFAULT 0 |
+| `score` | REAL DEFAULT 0 — 0-100 (`queries::score_for_day`) |
+| `created_at` | TEXT DEFAULT `datetime('now')` |
+
+**`materials_fts`** — FTS5 virtual table (`file_name`, `file_path`; `unicode61`), kept in
+sync with `materials` by the `materials_ai` / `materials_ad` / `materials_au` triggers.
+
+**Indexes:** materials (chapter/type/status/bookmarked-partial), watch_progress (last),
+study_sessions (date), chapters (subject), subjects (goal), tasks (done/material).
+
+---
+
+## 4. IPC Surface
+
+34 commands registered in `generate_handler!` (`src-tauri/src/lib.rs`), by module. The
+frontend calls them through the typed `ipc` object in `src/lib/ipc.ts`, which throws
+`NotInTauriError` outside the shell (guarded by `isTauri()`).
+
+- **root** (`commands/mod.rs`): `health_check`, `dashboard_data`.
+- **scanner**: `preview_folder`, `scan_and_import`, `list_library`, `extract_library_metadata`.
+- **library**: `goal_view`, `subject_view`, `chapter_view`, `course_view`, `get_recent_goal`.
+- **player**: `open_material`, `save_progress`, `set_bookmark`, `set_completed`,
+  `log_session`, `read_file_base64`, `read_file_bytes`, `open_in_system_player`.
+- **materials**: `search_materials` (FTS5).
+- **settings**: `list_registered_dirs`, `remove_registered_dir`, `rescan_folder`,
+  `get_setting`, `set_setting`, `export_data_to_file`, `backup_database`,
+  `import_data_from_file`.
+- **tasks**: `list_tasks`, `create_task`, `update_task`, `set_task_done`, `delete_task`,
+  `consistency_summary` (default window 91 days ≈ 13 weeks).
+
+`create_task` / `update_task` validate a non-empty title and clamp priority to 0-3.
+`set_task_done` stamps/clears `completed_at`, then re-runs the day snapshot for today.
+
+Frontend `ipc` task/session/consistency/settings methods:
+`listTasks`, `createTask(title, priority, dueAt, materialId, estimatedMins=null)`,
+`updateTask(id, …)`, `setTaskDone(id, done)`, `deleteTask(id)`,
+`logSession(materialId, seconds, type='work')`, `consistencySummary(windowDays?)`,
+`getSetting(key)`, `setSetting(key, value)`, plus folder/data-management helpers.
+
+---
+
+## 5. Feature Sets
+
+### 5.1 Library & Courses
+Folder scan wizard imports a directory into the goal → subject → chapter → material tree,
+extracting metadata + thumbnails in the background. The Library exposes the raw tree; the
+Courses surface re-presents subjects as sequence-ordered "courses" with a flattened lesson
+list under sticky chapter headers. FTS5 powers Ctrl+K search.
+
+### 5.2 Player
+Three-column immersive layout. libmpv renders behind the transparent WebView for MKV/HEVC;
+HTML5 is the automatic fallback, and "Open in system player" always hands off to the OS.
+Resume position, bookmark, and completion are persisted. Shortcuts: Space, ←/→ seek, ↑/↓
+volume, F fullscreen, M complete, N/P next/previous. Fullscreen hides all app chrome so the
+video anchor fills the screen.
+
+### 5.3 Dashboard (bento)
+Customizable bento grid. Widgets (`dashboard.layout` setting via `dashboardLayout.ts`):
+progress · current/continue · activity chart · pomodoro · next-up · tasks · recents ·
+quick-access. Each can be shown/hidden/reordered in Settings.
+
+### 5.4 Planning Hub (`/planning`)
+Top-level **Planner | View** tabs, sharing one task state via `usePlanningTasks`
+(optimistic CRUD hook).
+
+- **Planner tab** — dashboard-style: to-do list + Consistency (score + heatmap) + Next Up.
+- **View tab** — full-screen, with a **Timeline | Table** sub-toggle.
+
+**Task creation** — a slash-command `QuickAddBar` (`/high` `/today` `/1h` `/link`) parses
+tokens live into chips, plus a glass `TaskModal` (segmented priority, date-time picker,
+estimate presets, FTS lesson linker) for full detail. Rows stay pristine; editing opens the
+modal.
+
+**Timeline (`CalendarTimeline`)** — a true Google-Calendar-style experience with Day / Month
+/ Year granularity and a `‹ Today ›` navigator:
+- **Day** — vertical 24-hour axis, positioned gradient-glass blocks, a live now-line
+  (auto-scrolls to the workday).
+- **Month** — 7-column day grid with task chips + "+k more"; click a day → Day view.
+- **Year** — 12 density-tinted mini-months; click a month → Month view.
+- **Status color-coding** (status-only): upcoming → neutral slate,
+  **due soon (≤24h) → amber**, **overdue → red**, **done → muted green**. Logic centralized
+  in `planningUtils.ts` (`taskStatus`, `statusStyle`, `SOON_WINDOW_MS`).
+- **Deadline-window meter** — each expanded Day block has a subtle bar showing elapsed time
+  across a derived window (`deadline − estimate`, or a 60-minute fallback). It is explicitly
+  labeled "Window", not task completion progress.
+- **Collision layout** — concurrent intervals are partitioned into deterministic horizontal
+  lanes instead of painting full-width blocks over one another.
+- **Type icons** — `TaskGlyph` maps a task to a lucide glyph (video/pdf/note/image/audio, or
+  a generic checklist for unlinked tasks); shown on Day + Month.
+- **Legend** — `TimelineLegend`, a glassmorphic key (status colors + type icons) in normal
+  flow below Day/Month, so it never covers content. Year has a density explanation.
+- Native scroll (`overflow-auto` + `.scroll-thin`) for ~0-CPU smoothness; GSAP only for
+  cell entrances, reduced-motion gated.
+
+**Table (`TableView`)** — Notion-database style: quiet header, click-to-sort columns
+(Task · Priority · Deadline · Lesson · Status) with asc/desc arrows, `divide-y` rows, status
+pills, type glyphs, hover edit/delete. Header and rows share one horizontal/vertical scroll
+surface with a sticky header and minimum table width; Task/Lesson use `min-w-0` + `truncate`,
+so long filenames ellipsize and never overlap or desynchronize Status.
+
+### 5.5 Consistency Engine
+Every task-completion mutation re-snapshots today's row in `consistency_log`; startup also
+runs a one-shot backfill. On days with due tasks, score = 60% on-time completion rate + 40%
+`consistency_summary` returns a trailing weighted score, a streak of signal-bearing days
+scoring at least 60 (neutral dates neither extend nor break it), and heatmap rows. There is
+no periodic snapshot loop: newly logged study sessions appear after the next applicable
+refresh. Consistency dates currently follow SQLite UTC dates while task due strings use
+frontend local time.
+
+### 5.6 Pomodoro / Focus Timer
+`timerStore.ts` — a single global Zustand store, **timestamp-based**: it stores the absolute
+`phaseEndsAt` and derives `remaining = phaseEndsAt − now` on each 1 Hz tick, so WebView2
+background throttling causes no drift. State persists to `localStorage` on every transition
+and resolves forward on boot (a phase that ended while the app was closed is logged +
+advanced). Naturally completed phases are logged in full; skipping logs the elapsed portion
+before advancing (breaks are excluded from study-time aggregates). Long break after every 4
+focus sessions.
+- **`HeaderTimeBox`** is the persistent cross-route timer surface; the Dashboard also has a
+  larger Pomodoro widget backed by the same store. The header shows
+  a "Start focus" pill when idle and a live MM:SS + ring + phase label + play/pause when
+  running (lime for focus, cyan for breaks). Idle starts in place; the active timer body
+  routes to the Dashboard.
+- **Truly global:** the header renders on *every* route including the Player page (in the
+  player's opaque sibling bar, so it never covers the mpv overlay); it is only hidden when
+  the OS window is in full-screen immersive mode.
+- **Configurable durations:** Settings → Focus Timer edits Focus / Short Break / Long Break
+  in **hours : minutes : seconds** (`setDurations`, clamped 5s–8h). Idle → the visible clock
+  re-syncs instantly; running/paused sessions retain an immutable current-session baseline,
+  so new lengths take effect only on the next phase without corrupting ring/logged time.
+
+### 5.7 Notifications (Toasts)
+`toastStore.ts` + `ToastHost` (mounted once in `AppShell`). Glassmorphism cards tinted by
+tone (focus/break/success/warning/info), GSAP slide-fade enter, timed auto-dismiss with a
+progress hairline, a vertically bounded scrollable stack, and dedupe by `key`/cooldown.
+`useTaskReminders` polls every 60s, warns for deadlines within 60 minutes, and emits an
+overdue toast only when it observes the deadline crossing within roughly one poll. Timer
+phase completions raise
+focus/break toasts with a one-tap action to start the next phase.
+
+### 5.8 Settings
+A **two-pane left-nav tab shell** (`role="tablist"` rail + `role="tabpanel"`), hash
+deep-linkable (`/settings#library`), reusing every section component:
+- **Library & Content** — Manage Folders (add / rescan / remove).
+- **Appearance** — Theme, Dashboard Widgets.
+- **Focus & Planning** — Focus Timer durations, Consistency Tracking.
+- **Playback** — Default Player (mpv/HTML5).
+- **Data** — export JSON / backup DB / import merge.
+- **About & Shortcuts** — keyboard shortcuts + app info.
+Arrow-key roving on the rail; on narrow widths the rail becomes a horizontal scroll strip.
+
+### 5.9 Global Top Bar
+One `GlobalTopBar` (`components/layout/GlobalTopBar.tsx`) rendered once in `AppShell` on
+every route, stripped to exactly three floating glass pills — (1) hamburger + "Personal
+Learning Environment", (2) the Pomodoro `HeaderTimeBox`, (3) the Ctrl+K search launcher —
+over a **fully transparent** strip. It's a flex sibling above `<main>` (the only scroll
+container), so it stays fixed while content scrolls, identical across pages. Hidden only in
+OS fullscreen. On the player route the transparent bar overlays the video; the player's own
+breadcrumb/actions render as a **second row directly beneath** it.
+
+### 5.10 Unified Material Management
+- **`materialManagerStore` (Zustand)** is the single source of truth for add/scan state:
+  `openAddFolder()` / `closeAddFolder()` and an `importNonce` counter bumped on each
+  successful import. Library, Courses, and Settings all call `openAddFolder()` and refetch
+  when `importNonce` changes — replacing three independently-mounted wizards.
+- **`AddFolderModal`** is mounted once in `AppShell` (like ToastHost). It's a deliberate,
+  **Goal-first stepper** with a visible progress rail: **Folder** (explicit Browse button,
+  no auto-picker) → **Goal** (assign/create) → **Subject & preview** (editable name + live
+  chapter mapping) → **Review** (summary) → scanning → done. Categorization is single-level
+  per product decision: picked folder = Subject, sub-folders = Chapters, files = materials.
+  `CategoryPicker` gained `showGoal`/`showSubject` flags to split its combos across steps.
+- The old `AddFolderWizard.tsx` was deleted.
+
+### 5.11 Thumbnail Engine (CPU-safe)
+`scanner/metadata.rs` rewritten as a CPU-safe engine:
+- **Single-flight guard** (`AtomicBool`): overlapping triggers (boot / post-import /
+  on-demand) no longer stack — only one pass runs at a time.
+- **Bounded concurrency** via a `tokio::Semaphore` capped at `min(cores, 2)` — at most a
+  couple of ffmpeg processes at once, so the UI never janks.
+- **Downscaled thumbnails** (`-vf scale=640:-2`, JPEG q4) instead of full-res frames.
+- **Random-ish frame**: a deterministic golden-ratio hash of the material id picks a
+  timestamp in the 10–80% range (avoids intros/black frames/credits), stable across re-runs.
+- **Idempotent + resumable**: only rows missing duration/thumbnail are selected.
+- ffprobe/ffmpeg remain bundled sidecars; video-only for v1 (audio → duration only;
+  PDF/others fall back to the gradient below).
+- **`CoverArt` component** (`components/ui/CoverArt.tsx`) is the shared cover surface for
+  course cards: it shows the extracted thumbnail when present, else a **deterministic CSS
+  gradient** derived from a stable seed (id/name) — same item always renders the same
+  brand-palette (lime/cyan/orange) duotone blob with a centered glyph, so courses never
+  look empty or flicker. Image tier fades in over the gradient; falls back on load error.
+  Wired into `CourseCard` and the Courses "Continue Learning" featured card.
+
+---
+
+## 6. Key Files
+
+**State / lib**
+- `src/lib/timerStore.ts` — global Pomodoro store (timestamp-based, persisted, session-logging).
+- `src/lib/toastStore.ts` — global toast store (dedupe by key/cooldown).
+- `src/lib/dashboardLayout.ts` — bento widget registry + persistence.
+- `src/lib/ipc.ts` — typed IPC wrapper + Tauri helpers.
+- `src/lib/types.ts` — TS interfaces mirroring Rust structs.
+
+**Layout**
+- `src/components/layout/AppShell.tsx` — sidebar + top bar + content; ambient canvas; mounts
+  `GlobalTopBar`, `SearchModal`, `AddFolderModal`, `ToastHost` + `useTaskReminders`.
+- `src/components/layout/GlobalTopBar.tsx` — the single universal transparent top bar.
+- `src/components/layout/HeaderTimeBox.tsx` — the global timer control (named + default export).
+- `src/components/layout/Sidebar.tsx` — floating nav (sidebar timer removed).
+- `src/components/ui/ToastHost.tsx` — toast stack renderer.
+- `src/components/ui/CoverArt.tsx` — shared thumbnail/gradient cover surface.
+- `src/components/useTaskReminders.ts` — 60s deadline-reminder poll.
+
+**Material management**
+- `src/lib/materialManagerStore.ts` — Zustand store for the global add/scan flow.
+- `src/components/wizard/AddFolderModal.tsx` — the single Goal-first stepper modal.
+- `src/components/wizard/CategoryPicker.tsx` / `ComboSelect.tsx` / `FolderPreview.tsx`.
+
+**Planning (`src/components/planning/`)**
+`usePlanningTasks.ts`, `planningUtils.ts`, `TaskModal.tsx`, `QuickAddBar.tsx`, `TaskRow.tsx`,
+`PlannerTab.tsx`, `ViewTab.tsx`, `CalendarTimeline.tsx`, `TableView.tsx`, `TaskGlyph.tsx`,
+`TimelineLegend.tsx`, `DateTimePicker.tsx`, `ConsistencyHeatmap.tsx`, `ConsistencyScore.tsx`.
+
+**Backend (`src-tauri/src/`)**
+- `db/schema.rs` (SCHEMA_SQL, SCHEMA_VERSION), `db/connection.rs` (migrate + pragmas),
+  `db/queries.rs` (score_for_day, snapshot_day, …).
+- `commands/` — active handlers in `mod.rs`, `scanner.rs`, `library.rs`, `player.rs`,
+  `materials.rs`, `settings.rs`, `tasks.rs`; declared placeholders: `goals.rs`,
+  `subjects.rs`, `chapters.rs`, `progress.rs`.
+- `scanner/` — `walker.rs`, `metadata.rs`, `watcher.rs`; `player/` — `mpv.rs`, `server.rs`.
+- `lib.rs` — `generate_handler!` registration.
+
+---
+
+## 7. Recent Session — Planning polish, global timer, docs
+
+1. **Timeline refinements** — status-only colors, visible relative-deadline labels,
+   side-by-side collision lanes, semantic type icons, a correctly labeled deadline-window
+   meter, native sibling controls, local date-only parsing, safe month/year navigation, and
+   a non-obscuring glass legend.
+2. **Table fix** — one synchronized overflow viewport + sticky header + minimum width;
+   long lesson names truncate, and status labels/sorting match Timeline.
+3. **Global timer** — `HeaderTimeBox` now also mounts in the Player page's opaque header, so
+   Pomodoro status is always visible (hidden only in OS full-screen). Scaled up the timer
+   ring/digits and the toast cards for prominence.
+4. **Configurable durations** — bounded h/m/s editors and an immutable active-session total,
+   so configuration changes cannot alter elapsed/logged time for a running or paused phase.
+5. **Docs** — this file rewritten end-to-end.
+
+---
+
+## 8. Recent Session — Architectural overhaul (Top bar · Settings IA · Material mgmt · Thumbnails)
+
+1. **Top bar unification (Phase 1)** — one `GlobalTopBar` rendered on every route, stripped
+   to 3 floating glass pills over a **fully transparent** strip (including the video/PDF
+   player); the two divergent header variants were removed. The player's breadcrumb/actions
+   now sit as a second row beneath it.
+2. **Settings IA (Phase 2)** — replaced the single long scroll with a two-pane left-nav tab
+   shell (6 categories), hash deep-linking, arrow-key roving; all existing section
+   components reused unchanged.
+3. **Unified Material Management (Phase 3)** — new `materialManagerStore`; a single global
+   `AddFolderModal` with a Goal-first stepper replaces the three separately-mounted
+   wizards; pages refetch off `importNonce`. Old `AddFolderWizard.tsx` deleted.
+4. **Thumbnail engine (Phase 4)** — CPU-safe rewrite of `metadata.rs` (single-flight guard,
+   ≤2 concurrent ffmpeg via semaphore, downscaled JPEGs, deterministic random frame) + a
+   shared `CoverArt` component with a deterministic brand-palette CSS gradient fallback, so
+   course covers are never empty. Single-level chapters and video-only thumbnails per
+   product decision.
+
+Verification: `npm run build` green; `cargo build` + `cargo test --lib` green (7/7).
+
+Verification: `npm run build` green; `cargo test` 7/7 passing.
