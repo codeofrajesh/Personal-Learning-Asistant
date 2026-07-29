@@ -370,48 +370,63 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
   // so the ResizeObserver can fire mid-animation and measure stale
   // dimensions (→ black border around the video). Debounce ~80 ms so the
   // OS window layout settles before we measure + send the final coordinates.
+  // Cached window metrics (CSS px). innerSize/scaleFactor only change on resize, so we
+  // read them once and refresh on `resize` — alignViewport then makes a SINGLE async call
+  // (setVideoMarginRatio) instead of awaiting innerSize + scaleFactor every time.
+  const winMetricsRef = useRef<{ w: number; h: number } | null>(null);
+  const refreshWinMetrics = useCallback(async () => {
+    try {
+      const win = await getCurrentWindow().innerSize();
+      const dpr = await getCurrentWindow().scaleFactor();
+      const w = win.width / dpr;
+      const h = win.height / dpr;
+      if (w > 0 && h > 0) winMetricsRef.current = { w, h };
+    } catch {
+      /* keep last metrics */
+    }
+  }, []);
+
   const alignViewport = useCallback(() => {
     const el = videoAnchorRef.current;
     if (!el || !initedRef.current) return;
     window.clearTimeout(alignDebounceRef.current);
+    // Debounce lets an async OS-window layout change (fullscreen/resize) settle before
+    // we measure. Scroll no longer triggers this at all (the anchor is fixed in a strict
+    // full-height player layout), so there's no per-scroll-frame IPC cost anymore.
     alignDebounceRef.current = window.setTimeout(() => {
       void (async () => {
+        if (!winMetricsRef.current) await refreshWinMetrics();
+        const m = winMetricsRef.current;
+        if (!m) return;
         const rect = el.getBoundingClientRect();
-        try {
-          const win = await getCurrentWindow().innerSize();
-          const dpr = await getCurrentWindow().scaleFactor();
-          const winW = win.width / dpr; // physical → CSS px
-          const winH = win.height / dpr;
-          if (winW <= 0 || winH <= 0) return;
-          void setVideoMarginRatio({
-            left: Math.max(0, rect.left / winW),
-            right: Math.max(0, (winW - rect.right) / winW),
-            top: Math.max(0, rect.top / winH),
-            bottom: Math.max(0, (winH - rect.bottom) / winH),
-          }).catch(() => {});
-        } catch {
-          /* window API unavailable — keep last alignment */
-        }
+        void setVideoMarginRatio({
+          left: Math.max(0, rect.left / m.w),
+          right: Math.max(0, (m.w - rect.right) / m.w),
+          top: Math.max(0, rect.top / m.h),
+          bottom: Math.max(0, (m.h - rect.bottom) / m.h),
+        }).catch(() => {});
       })();
     }, 80);
-  }, []);
+  }, [refreshWinMetrics]);
 
   useEffect(() => {
     if (!ready) return;
+    // Geometry changes come from: the anchor resizing (sidebar toggle, layout) and window
+    // resize/fullscreen. NOT scroll — the player layout is fixed-height, so the anchor
+    // never moves on scroll. On window resize we refresh the cached metrics, then re-align.
     const ro = new ResizeObserver(() => void alignViewport());
     if (videoAnchorRef.current) ro.observe(videoAnchorRef.current);
-    const onScroll = () => void alignViewport();
-    window.addEventListener("resize", onScroll);
-    const main = videoAnchorRef.current?.closest(".scroll-thin");
-    main?.addEventListener("scroll", onScroll);
-    void alignViewport();
+    const onResize = () => {
+      void refreshWinMetrics().then(() => alignViewport());
+    };
+    window.addEventListener("resize", onResize);
+    void refreshWinMetrics().then(() => alignViewport());
     return () => {
       ro.disconnect();
-      window.removeEventListener("resize", onScroll);
-      main?.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onResize);
       window.clearTimeout(alignDebounceRef.current); // cancel pending align
     };
-  }, [ready, alignViewport]);
+  }, [ready, alignViewport, refreshWinMetrics]);
 
   // ── Control bar fade in/out on mouse move (GSAP, Phase 3) ──────────────────
   // The bar fades in when the pointer moves over the video and fades out after

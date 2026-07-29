@@ -138,8 +138,20 @@ export default function AppShell() {
 
         {/* Content — transparent + NO padding here. On the floating canvas, pages are
             transparent so the unified background shows through; the player page leaves
-            its video viewport transparent for the mpv overlay. */}
-        <main className="scroll-thin min-h-0 flex-1 overflow-y-auto">
+            its video viewport transparent for the mpv overlay.
+
+            Scroll ownership: on the PLAYER route the main region does NOT scroll — the
+            player uses a strict full-height layout and its columns scroll internally.
+            This is the key fix for the mpv scroll-lag: the transparent video anchor never
+            moves on scroll, so mpv never needs re-alignment mid-scroll. Every other route
+            keeps the single page scroll container. */}
+        <main
+          className={
+            isPlayerRoute
+              ? "min-h-0 flex-1 overflow-hidden"
+              : "scroll-thin min-h-0 flex-1 overflow-y-auto"
+          }
+        >
           <Outlet />
         </main>
       </div>
