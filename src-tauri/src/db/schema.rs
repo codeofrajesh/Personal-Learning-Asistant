@@ -10,7 +10,8 @@
 /// v2: added the `tasks` table (dashboard to-do list) + its indexes.
 /// v3: added `study_sessions.session_type` (Pomodoro focus/break tracking).
 /// v4: added `tasks.estimated_mins` + the `consistency_log` table (Planning Hub).
-pub const SCHEMA_VERSION: i64 = 4;
+/// v5: added the `notes` table (timestamped video notes).
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The complete v1 schema. Every statement is `IF NOT EXISTS` where SQLite allows,
 /// so re-application is a no-op.
@@ -155,6 +156,16 @@ CREATE TABLE IF NOT EXISTS consistency_log (
     created_at              TEXT DEFAULT (datetime('now'))
 );
 
+-- Timestamped Notes (v5): a note tied to a specific point in a material's playback.
+CREATE TABLE IF NOT EXISTS notes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id    INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+    timestamp_secs REAL NOT NULL DEFAULT 0,
+    body           TEXT NOT NULL,
+    created_at     TEXT DEFAULT (datetime('now')),
+    updated_at     TEXT DEFAULT (datetime('now'))
+);
+
 -- Full-Text Search Index
 CREATE VIRTUAL TABLE IF NOT EXISTS materials_fts USING fts5(
     file_name,
@@ -193,4 +204,5 @@ CREATE INDEX IF NOT EXISTS idx_chapters_subject ON chapters(subject_id);
 CREATE INDEX IF NOT EXISTS idx_subjects_goal ON subjects(goal_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_done ON tasks(done);
 CREATE INDEX IF NOT EXISTS idx_tasks_material ON tasks(material_id);
+CREATE INDEX IF NOT EXISTS idx_notes_material ON notes(material_id, timestamp_secs);
 "#;

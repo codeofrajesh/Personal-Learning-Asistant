@@ -1108,6 +1108,85 @@ pub fn log_study_session(
     Ok(())
 }
 
+// ── Timestamped notes (v5) ───────────────────────────────────────────────────
+
+/// A note tied to a point in a material's playback.
+#[derive(Debug, serde::Serialize)]
+pub struct Note {
+    pub id: i64,
+    pub material_id: i64,
+    pub timestamp_secs: f64,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// All notes for a material, earliest timestamp first.
+pub fn list_notes(conn: &Connection, material_id: i64) -> AppResult<Vec<Note>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, material_id, timestamp_secs, body, created_at, updated_at
+         FROM notes WHERE material_id = ?1
+         ORDER BY timestamp_secs ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([material_id], |r| {
+        Ok(Note {
+            id: r.get(0)?,
+            material_id: r.get(1)?,
+            timestamp_secs: r.get(2)?,
+            body: r.get(3)?,
+            created_at: r.get(4)?,
+            updated_at: r.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Create a note at `timestamp_secs` with `body` (trimmed, non-empty). Returns its id.
+pub fn create_note(
+    conn: &Connection,
+    material_id: i64,
+    timestamp_secs: f64,
+    body: &str,
+) -> AppResult<i64> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Err(crate::utils::errors::AppError::Invalid(
+            "note body cannot be empty".into(),
+        ));
+    }
+    let ts = timestamp_secs.max(0.0);
+    conn.execute(
+        "INSERT INTO notes(material_id, timestamp_secs, body) VALUES(?1, ?2, ?3)",
+        rusqlite::params![material_id, ts, body],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Update a note's body (trimmed, non-empty) + bump `updated_at`.
+pub fn update_note(conn: &Connection, id: i64, body: &str) -> AppResult<()> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Err(crate::utils::errors::AppError::Invalid(
+            "note body cannot be empty".into(),
+        ));
+    }
+    conn.execute(
+        "UPDATE notes SET body = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, body],
+    )?;
+    Ok(())
+}
+
+/// Delete a note by id.
+pub fn delete_note(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
+    Ok(())
+}
+
 // ── Full-text search (Section 8 Page 8, Ctrl+K) ──────────────────────────────
 //
 // The `materials_fts` FTS5 index (file_name + file_path) is kept in sync with

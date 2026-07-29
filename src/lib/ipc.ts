@@ -19,6 +19,7 @@ import type {
   HealthReport,
   ImportResult,
   ImportSummary,
+  Note,
   PlayerView,
   RegisteredDir,
   RescanCounts,
@@ -146,6 +147,25 @@ export const ipc = {
   /** Full-text search over materials for the Ctrl+K palette. */
   searchMaterials(query: string, fileType?: string): Promise<SearchResult[]> {
     return call<SearchResult[]>("search_materials", { query, fileType });
+  },
+
+  // ── Timestamped notes (v5) ──────────────────────────────────────────────────
+
+  /** All notes for a material, earliest timestamp first. */
+  listNotes(materialId: number): Promise<Note[]> {
+    return call<Note[]>("list_notes", { materialId });
+  },
+  /** Create a note anchored at `timestampSecs`. Returns the new note id. */
+  createNote(materialId: number, timestampSecs: number, body: string): Promise<number> {
+    return call<number>("create_note", { materialId, timestampSecs, body });
+  },
+  /** Update a note's body. */
+  updateNote(id: number, body: string): Promise<void> {
+    return call<void>("update_note", { id, body });
+  },
+  /** Delete a note. */
+  deleteNote(id: number): Promise<void> {
+    return call<void>("delete_note", { id });
   },
 
   // ── Tasks (dashboard to-do list) ────────────────────────────────────────────

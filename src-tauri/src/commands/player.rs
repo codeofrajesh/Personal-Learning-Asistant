@@ -15,7 +15,7 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::db::queries::{self, MaterialRow, PlayerMaterial};
+use crate::db::queries::{self, MaterialRow, Note, PlayerMaterial};
 use crate::db::Db;
 use crate::utils::errors::AppResult;
 
@@ -80,6 +80,37 @@ pub fn log_session(
 ) -> AppResult<()> {
     let stype = session_type.as_deref().unwrap_or("work");
     db.with(|conn| queries::log_study_session(conn, material_id, seconds, stype))
+}
+
+// ── Timestamped notes (v5) ───────────────────────────────────────────────────
+
+/// All notes for a material, earliest timestamp first.
+#[tauri::command]
+pub fn list_notes(db: State<'_, Db>, material_id: i64) -> AppResult<Vec<Note>> {
+    db.with(|conn| queries::list_notes(conn, material_id))
+}
+
+/// Create a note at `timestamp_secs` (seconds into the material) with `body`. Returns id.
+#[tauri::command]
+pub fn create_note(
+    db: State<'_, Db>,
+    material_id: i64,
+    timestamp_secs: f64,
+    body: String,
+) -> AppResult<i64> {
+    db.with(|conn| queries::create_note(conn, material_id, timestamp_secs, &body))
+}
+
+/// Update a note's body.
+#[tauri::command]
+pub fn update_note(db: State<'_, Db>, id: i64, body: String) -> AppResult<()> {
+    db.with(|conn| queries::update_note(conn, id, &body))
+}
+
+/// Delete a note.
+#[tauri::command]
+pub fn delete_note(db: State<'_, Db>, id: i64) -> AppResult<()> {
+    db.with(|conn| queries::delete_note(conn, id))
 }
 
 /// Read a local file and return its contents as a base64-encoded string.

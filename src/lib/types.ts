@@ -165,6 +165,17 @@ export interface Task {
   created_at: string;
 }
 
+/** A timestamped note tied to a material's playback (backend `Note`, v5). */
+export interface Note {
+  id: number;
+  material_id: number;
+  /** Seconds into the material this note is anchored to. */
+  timestamp_secs: number;
+  body: string;
+  created_at: string;
+  updated_at: string;
+}
+
 /** One day of the consistency series (backend `ConsistencyDay`). */
 export interface ConsistencyDay {
   /** YYYY-MM-DD. */
