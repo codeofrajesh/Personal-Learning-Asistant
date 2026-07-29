@@ -30,6 +30,7 @@ import { gsap } from "gsap";
 import { useGSAP } from "@gsap/react";
 import { ipc, isTauri } from "../../lib/ipc";
 import { playerBridge } from "../../lib/playerBridge";
+import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { formatDuration } from "../../lib/utils";
 import {
   PlayIcon,
@@ -75,12 +76,15 @@ interface Props {
   path: string;
   materialId: number;
   startPosition: number;
+  /** File name shown by the docked mini-player when the user navigates away mid-video. */
+  fileName?: string;
   /** Called if mpv fails to initialize or playback doesn't start — PlayerPage falls
    *  back to the HTML5 player. */
   onFail?: () => void;
 }
 
-export default function MpvVideoPlayer({ path, materialId, startPosition, onFail }: Props) {
+export default function MpvVideoPlayer({ path, materialId, startPosition, fileName, onFail }: Props) {
+  const setMiniActive = useMiniPlayer((s) => s.setActive);
   // The transparent "anchor" div — mpv renders to the OS window behind the webview,
   // showing through this hole. ResizeObserver keeps mpv's bounding box pinned to it.
   const videoAnchorRef = useRef<HTMLDivElement>(null);
@@ -331,6 +335,9 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, onFail
     void (async () => {
       try {
         await command("loadfile", [path]);
+        // Mark this video as the globally-active one so the docked mini-player can take
+        // over if the user navigates away mid-playback.
+        setMiniActive(materialId, fileName ?? path.split(/[\\/]/).pop() ?? "Now playing");
         // After loading a file, MPV auto-plays WITHOUT emitting a pause event.
         // We MUST manually sync the true pause state to fix the initial freeze.
         const actualPause = await getProperty("pause", "flag");

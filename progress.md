@@ -385,24 +385,15 @@ breadcrumb/actions render as a **second row directly beneath** it.
 
 ---
 
-## 8. Recent Session — Architectural overhaul (Top bar · Settings IA · Material mgmt · Thumbnails)
+## 9. Recent Session — Video Player & Performance Architecture
 
-1. **Top bar unification (Phase 1)** — one `GlobalTopBar` rendered on every route, stripped
-   to 3 floating glass pills over a **fully transparent** strip (including the video/PDF
-   player); the two divergent header variants were removed. The player's breadcrumb/actions
-   now sit as a second row beneath it.
-2. **Settings IA (Phase 2)** — replaced the single long scroll with a two-pane left-nav tab
-   shell (6 categories), hash deep-linking, arrow-key roving; all existing section
-   components reused unchanged.
-3. **Unified Material Management (Phase 3)** — new `materialManagerStore`; a single global
-   `AddFolderModal` with a Goal-first stepper replaces the three separately-mounted
-   wizards; pages refetch off `importNonce`. Old `AddFolderWizard.tsx` deleted.
-4. **Thumbnail engine (Phase 4)** — CPU-safe rewrite of `metadata.rs` (single-flight guard,
-   ≤2 concurrent ffmpeg via semaphore, downscaled JPEGs, deterministic random frame) + a
-   shared `CoverArt` component with a deterministic brand-palette CSS gradient fallback, so
-   course covers are never empty. Single-level chapters and video-only thumbnails per
-   product decision.
+1. **Scroll lag fix (Step 1)** — The `PlayerPage` was locked into a strict, non-scrolling `100dvh` layout. Because the transparent video anchor never moves relative to the OS window, MPV never needs async re-alignment mid-scroll, completely eliminating the "tearing/lag" effect.
+2. **PDF fullscreen unify (Step 2)** — Killed the conflicting HTML5 Fullscreen API path in `PdfViewer`. PDFs now use the exact same Tauri OS-window fullscreen as the video player.
+3. **Tracking hardening (Step 3)** — Optimized SQLite writes to save cheap SSDs: coalesced rapid pause/seek saves (ignoring changes < 5s), fixed the wildly inflating `watch_count` bug, and added a final synchronous flush on window close.
+4. **4GB perf program (Step 4)** — Massive memory savings for low-end machines. PDFs now stream chunks instead of loading massive Base64 strings into RAM. Implemented virtualization for long library lists and thumbnail LRU capping to protect the disk.
+5. **Timestamped notes (Step 5a & 5b)** — Migrated SQLite to schema v5 (`notes` table) with full IPC CRUD. Added a Notes panel to the player where users can add notes at the current video timestamp, and click chips to seek.
+6. **Below-video recommendations (Step 5c)** — Added a smart recommendation rail below the video that suggests the next natural lesson in the series, course, or goal.
 
-Verification: `npm run build` green; `cargo build` + `cargo test --lib` green (7/7).
+*(Note: Step 5d - In-app docked MPV mini-player is currently in progress).*
 
 Verification: `npm run build` green; `cargo test` 7/7 passing.

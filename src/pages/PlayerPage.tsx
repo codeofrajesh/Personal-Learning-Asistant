@@ -252,7 +252,7 @@ export default function PlayerPage() {
             {state.kind === "ready" && material && material.file_type === "video" && (
               usingMpv ? (
                 <Suspense fallback={null}>
-                  <MpvVideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} onFail={onMpvFail} />
+                  <MpvVideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} fileName={material.file_name} onFail={onMpvFail} />
                 </Suspense>
               ) : (
                 <VideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
@@ -282,7 +282,7 @@ export default function PlayerPage() {
                 {state.kind === "ready" && material && material.file_type === "video" && (
                   usingMpv ? (
                     <Suspense fallback={<div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading player…</div>}>
-                      <MpvVideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} onFail={onMpvFail} />
+                      <MpvVideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} fileName={material.file_name} onFail={onMpvFail} />
                     </Suspense>
                   ) : (
                     <VideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />

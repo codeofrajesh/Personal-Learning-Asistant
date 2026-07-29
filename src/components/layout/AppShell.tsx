@@ -19,6 +19,8 @@ import GlobalTopBar from "./GlobalTopBar";
 import SearchModal from "../ui/SearchModal";
 import ToastHost from "../ui/ToastHost";
 import AddFolderModal from "../wizard/AddFolderModal";
+import MiniPlayer from "../player/MiniPlayer";
+import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { useTaskReminders } from "../useTaskReminders";
 
 export default function AppShell() {
@@ -26,6 +28,9 @@ export default function AppShell() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [appFullscreen, setAppFullscreen] = useState(false);
   const location = useLocation();
+  // Docked mini-player rect — used to punch a transparent notch through the opaque
+  // ambient canvas so the MPV surface (behind the webview) shows through the mini card.
+  const miniRect = useMiniPlayer((s) => s.rect);
 
   // App-wide task-deadline reminders (low-CPU 60s poll; deduped toasts).
   useTaskReminders();
@@ -99,22 +104,36 @@ export default function AppShell() {
       {/* ── Unified app canvas (non-player only) ──────────────────────────────
           One dark gradient + two cinematic lime/cyan blobs behind the whole app, so
           the floating sidebar + pages hover over a single continuous background. The
-          player route omits this (its window stays transparent for the mpv overlay). */}
+          player route omits this (its window stays transparent for the mpv overlay).
+
+          When the docked mini-player is active, we punch a transparent notch through
+          this canvas (via clip-path) so MPV's native surface (behind the webview) shows
+          through the mini card. */}
       {floating && !appFullscreen && (
-        <>
-          <div
-            aria-hidden
-            className="pointer-events-none absolute inset-0 -z-20 bg-gradient-to-br from-[#0C0C0C] to-[#050505]"
-          />
-          <div
-            aria-hidden
-            className="pointer-events-none absolute left-[-8%] top-[-12%] -z-10 h-[55%] w-[42%] rounded-full bg-lime/10 blur-[150px]"
-          />
-          <div
-            aria-hidden
-            className="pointer-events-none absolute bottom-[-14%] right-[-6%] -z-10 h-[50%] w-[38%] rounded-full bg-cyan-400/10 blur-[140px]"
-          />
-        </>
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 -z-10"
+          style={
+            miniRect
+              ? {
+                  clipPath: `polygon(
+                    0 0,
+                    100% 0,
+                    100% ${miniRect.y}px,
+                    ${miniRect.x + miniRect.w}px ${miniRect.y}px,
+                    ${miniRect.x + miniRect.w}px ${miniRect.y + miniRect.h}px,
+                    ${miniRect.x}px ${miniRect.y + miniRect.h}px,
+                    ${miniRect.x}px ${miniRect.y}px,
+                    0 ${miniRect.y}px
+                  )`,
+                }
+              : undefined
+          }
+        >
+          <div className="absolute inset-0 -z-20 bg-gradient-to-br from-[#0C0C0C] to-[#050505]" />
+          <div className="absolute left-[-8%] top-[-12%] -z-10 h-[55%] w-[42%] rounded-full bg-lime/10 blur-[150px]" />
+          <div className="absolute bottom-[-14%] right-[-6%] -z-10 h-[50%] w-[38%] rounded-full bg-cyan-400/10 blur-[140px]" />
+        </div>
       )}
 
       {/* Sidebar — hidden entirely when the OS window is fullscreen (so the video
@@ -158,6 +177,7 @@ export default function AppShell() {
 
       <SearchModal open={searchOpen} onClose={closeSearch} />
       <AddFolderModal />
+      <MiniPlayer />
       <ToastHost />
     </div>
   );
