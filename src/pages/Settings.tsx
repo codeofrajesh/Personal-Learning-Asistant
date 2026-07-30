@@ -17,6 +17,7 @@ import {
   Eye, EyeOff, ArrowUp, ArrowDown, Timer, Coffee, Moon, RotateCcw,
   Folder, Palette, Play, Database, Info, DownloadCloud,
 } from "lucide-react";
+import { usePerf, detectTier, type PerfPreference } from "../lib/perfStore";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import { useTimerStore, TIMER_DEFAULTS, type Phase } from "../lib/timerStore";
 import { useMaterialManager } from "../lib/materialManagerStore";
@@ -318,6 +319,60 @@ function Theme() {
           </button>
         ))}
       </div>
+    </Section>
+  );
+}
+
+// ── Performance ──────────────────────────────────────────────────────────────
+
+const PERF_OPTIONS: { value: PerfPreference; label: string; hint: string }[] = [
+  { value: "auto", label: "Auto", hint: "Match this device" },
+  { value: "high", label: "High", hint: "Full glass + effects" },
+  { value: "balanced", label: "Balanced", hint: "Lighter blur" },
+  { value: "lite", label: "Lite", hint: "Fastest, flat surfaces" },
+];
+
+function Performance() {
+  const preference = usePerf((s) => s.preference);
+  const tier = usePerf((s) => s.tier);
+  const setPreference = usePerf((s) => s.setPreference);
+  // What "Auto" resolves to on this machine, shown so the user knows the effective tier.
+  const autoTier = useMemo(() => detectTier(), []);
+
+  return (
+    <Section
+      title="Performance"
+      description="Scales the premium visual finish (glass blur, ambient glow, animations) to your hardware. On low-end PCs, Lite removes the expensive blur effects for smooth, lag-free browsing. Auto picks the best fit for this device."
+    >
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {PERF_OPTIONS.map((opt) => {
+          const active = preference === opt.value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => setPreference(opt.value)}
+              className={
+                "flex flex-col items-start rounded-btn border px-3 py-2.5 text-left transition-colors " +
+                (active
+                  ? "border-lime/40 bg-lime/10 text-lime"
+                  : "border-white/10 text-content-secondary hover:bg-white/[0.05]")
+              }
+            >
+              <span className="text-sm font-medium">
+                {opt.label}
+                {opt.value === "auto" && (
+                  <span className="ml-1 text-[0.7rem] text-content-faint">→ {autoTier}</span>
+                )}
+              </span>
+              <span className="mt-0.5 text-[0.7rem] text-content-muted">{opt.hint}</span>
+            </button>
+          );
+        })}
+      </div>
+      <p className="mt-3 text-xs text-content-muted">
+        Currently running in <span className="text-content-secondary">{tier}</span> mode.
+      </p>
     </Section>
   );
 }
@@ -925,10 +980,11 @@ const CATEGORIES: Category[] = [
     id: "appearance",
     label: "Appearance",
     icon: Palette,
-    description: "Theme and the layout of your Dashboard.",
+    description: "Theme, performance, and the layout of your Dashboard.",
     render: () => (
       <>
         <Theme />
+        <Performance />
         <DashboardWidgets />
       </>
     ),

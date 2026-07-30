@@ -21,6 +21,7 @@ import ToastHost from "../ui/ToastHost";
 import AddFolderModal from "../wizard/AddFolderModal";
 import MiniPlayer from "../player/MiniPlayer";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
+import { usePerf } from "../../lib/perfStore";
 import { useTaskReminders } from "../useTaskReminders";
 
 export default function AppShell() {
@@ -31,6 +32,14 @@ export default function AppShell() {
   // Docked mini-player rect — used to punch a transparent notch through the opaque
   // ambient canvas so the MPV surface (behind the webview) shows through the mini card.
   const miniRect = useMiniPlayer((s) => s.rect);
+
+  // Reconcile the performance tier with the DB-backed preference once on mount. The tier
+  // was already applied to <html> pre-paint from the localStorage mirror (main.tsx); this
+  // confirms it against the source-of-truth setting and corrects it if they diverged.
+  const hydratePerf = usePerf((s) => s.hydrate);
+  useEffect(() => {
+    void hydratePerf();
+  }, [hydratePerf]);
 
   // App-wide task-deadline reminders (low-CPU 60s poll; deduped toasts).
   useTaskReminders();
@@ -132,8 +141,11 @@ export default function AppShell() {
       {floating && !appFullscreen && (
         <div aria-hidden className="pointer-events-none absolute inset-0 -z-10">
           <div className="absolute inset-0 -z-20 bg-gradient-to-br from-[#0C0C0C] to-[#050505]" />
-          <div className="absolute left-[-8%] top-[-12%] -z-10 h-[55%] w-[42%] rounded-full bg-lime/10 blur-[150px]" />
-          <div className="absolute bottom-[-14%] right-[-6%] -z-10 h-[50%] w-[38%] rounded-full bg-cyan-400/10 blur-[140px]" />
+          {/* The two blur blobs are the premium ambient finish. `perf-blob` lets the tier
+              CSS (index.css) shrink their blur radius on balanced and drop them on lite,
+              where large-radius blurs are too costly for a weak GPU. */}
+          <div className="perf-blob absolute left-[-8%] top-[-12%] -z-10 h-[55%] w-[42%] rounded-full bg-lime/10 blur-[150px]" />
+          <div className="perf-blob absolute bottom-[-14%] right-[-6%] -z-10 h-[50%] w-[38%] rounded-full bg-cyan-400/10 blur-[140px]" />
         </div>
       )}
 
