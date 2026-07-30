@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Outlet, useLocation } from "react-router-dom";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { subscribeFullscreen } from "../../lib/fullscreen";
 import Sidebar from "./Sidebar";
 import GlobalTopBar from "./GlobalTopBar";
 import SearchModal from "../ui/SearchModal";
@@ -79,29 +79,10 @@ export default function AppShell() {
   // When the Tauri window goes fullscreen (triggered by the player's Fullscreen
   // button), hide the sidebar + top bar entirely so the transparent video anchor
   // can fill the screen with no chrome bleeding through. Esc (OS-handled) exits.
-  // Tauri v2 has no dedicated fullscreen event; onResized fires on the size change
-  // a fullscreen transition causes, so re-read isFullscreen() there.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    const onChange = async () => {
-      try {
-        setAppFullscreen(await getCurrentWindow().isFullscreen());
-      } catch {
-        /* ignore */
-      }
-    };
-    void onChange();
-    const onFullscreenEvent = (event: Event) => setAppFullscreen(Boolean((event as CustomEvent).detail));
-    window.addEventListener("app-fullscreen-changed", onFullscreenEvent);
-    getCurrentWindow()
-      .onResized(() => void onChange())
-      .then((u) => (unlisten = u))
-      .catch(() => {});
-    return () => {
-      unlisten?.();
-      window.removeEventListener("app-fullscreen-changed", onFullscreenEvent);
-    };
-  }, []);
+  // Uses the shared, debounced fullscreen source (one window listener app-wide) instead
+  // of a per-component onResized poll — that de-duplicates the IPC storm during the
+  // fullscreen animation that used to cause the transition lag.
+  useEffect(() => subscribeFullscreen(setAppFullscreen), []);
 
   // The Player route keeps the transparent shell + flush opaque sidebar (libmpv
   // renders behind the webview, so a floating panel / ambient canvas can't sit over

@@ -31,6 +31,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { gsap } from "gsap";
 import { useGSAP } from "@gsap/react";
 import { ipc, isTauri } from "../../lib/ipc";
+import { subscribeFullscreen } from "../../lib/fullscreen";
 import { playerBridge } from "../../lib/playerBridge";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { formatDuration } from "../../lib/utils";
@@ -419,7 +420,11 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     // full-height player layout), so there's no per-scroll-frame IPC cost anymore.
     alignDebounceRef.current = window.setTimeout(() => {
       void (async () => {
-        if (!winMetricsRef.current) await refreshWinMetrics();
+        // Always refresh metrics before measuring. The old code only refreshed when the
+        // cache was empty, so an anchor-only layout change (fullscreen frame swap, sidebar
+        // toggle) aligned mpv against STALE window dimensions → a black band around the
+        // video. The 80 ms debounce keeps this from storming during a resize animation.
+        await refreshWinMetrics();
         const m = winMetricsRef.current;
         if (!m) return;
         const rect = el.getBoundingClientRect();
@@ -542,30 +547,17 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     }
   }, []);
 
+  // Mirror fullscreen via the shared, debounced source (one app-wide window listener) rather
+  // than this component's own onResized→isFullscreen poll — that per-tick IPC across three
+  // components was the fullscreen-lag storm. On each change, refresh the cached window
+  // metrics and re-align mpv to the new (full-screen or windowed) anchor rect.
   useEffect(() => {
-    let active = true;
-    const onChange = async () => {
-      if (disposedRef.current || !active) return; 
-      try {
-        const fs = await getCurrentWindow().isFullscreen();
-        if (!active) return;
-        setIsFullscreen(fs);
-        setTimeout(() => void alignViewport(), 120);
-      } catch {
-        /* ignore */
-      }
-    };
-    
-    let unlisten: (() => void) | null = null;
-    getCurrentWindow().onResized(() => void onChange()).then(u => {
-      unlisten = u;
-    }).catch(() => {});
-    
-    return () => {
-      active = false;
-      if (unlisten) unlisten();
-    };
-  }, [alignViewport]);
+    return subscribeFullscreen((fs) => {
+      if (disposedRef.current) return;
+      setIsFullscreen(fs);
+      void refreshWinMetrics().then(() => alignViewport());
+    });
+  }, [alignViewport, refreshWinMetrics]);
 
   // ── Controls ───────────────────────────────────────────────────────────────
   // Bug 4 fix: togglePlay reads isPlayingRef (the ref-mirrored backend pause

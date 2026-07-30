@@ -10,10 +10,10 @@
  * not padding/margins (which would be transparent → desktop bleed-through).
  */
 
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { subscribeFullscreen } from "../lib/fullscreen";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
 import LessonOverview from "../components/player/LessonOverview";
@@ -61,32 +61,9 @@ export default function PlayerPage() {
   // Right-panel tab: the lesson list, timestamped notes (video only), or suggested lectures.
   const [rightTab, setRightTab] = useState<"lessons" | "notes" | "suggested">("lessons");
 
-  useEffect(() => {
-    if (!isTauri()) return;
-    let unlisten: (() => void) | undefined;
-    // Tauri v2 has no dedicated fullscreen event; onResized fires on the size
-    // change a fullscreen transition causes, so re-read isFullscreen() there.
-    const onChange = async () => {
-      try {
-        setIsFullscreen(await getCurrentWindow().isFullscreen());
-      } catch {
-        /* ignore */
-      }
-    };
-    getCurrentWindow()
-      .onResized(() => void onChange())
-      .then((u) => (unlisten = u))
-      .catch(() => {});
-      
-    // Listen for the explicit toggle from the video player to bypass OS polling delays.
-    const onFsEvent = (e: Event) => setIsFullscreen((e as CustomEvent).detail);
-    window.addEventListener('app-fullscreen-changed', onFsEvent);
-    
-    return () => {
-      unlisten?.();
-      window.removeEventListener('app-fullscreen-changed', onFsEvent);
-    };
-  }, []);
+  // Mirror the OS-window fullscreen state via the shared, debounced source (one app-wide
+  // listener; instant on app-initiated toggles). Replaces this page's own onResized poll.
+  useEffect(() => subscribeFullscreen(setIsFullscreen), []);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -176,6 +153,7 @@ export default function PlayerPage() {
   const material = state.kind === "ready" ? state.view.material : null;
   const siblings = state.kind === "ready" ? state.view.siblings : [];
   const usingMpv = engine === "mpv" && state.kind === "ready" && material?.file_type === "video";
+
   // Breadcrumbs follow the launch surface: from Courses the trail is
   // Courses → Subject (course detail) → File; from the Library it stays the classic
   // Goal → Subject → Chapter tree. Anything without state defaults to the Library.
@@ -211,6 +189,55 @@ export default function PlayerPage() {
         ? "/courses"
         : "/library";
 
+  // The media element is rendered ONCE and kept at a stable position in the React tree, so
+  // toggling fullscreen only swaps wrapper classNames — it never unmounts/remounts the
+  // player. That remount was the cause of the black frame + full mpv re-init on every
+  // fullscreen toggle.
+  const mediaEl = useMemo(() => {
+    if (state.kind === "loading") {
+      return <div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading…</div>;
+    }
+    if (state.kind === "preview") {
+      return <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-content-muted">Preview mode — open inside the desktop app.</div>;
+    }
+    if (state.kind === "error") {
+      return (
+        <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-orange">
+          {state.message}
+          <button type="button" onClick={() => void load()} className="ml-3 rounded-btn border border-orange/40 px-2.5 py-1 text-xs text-orange hover:bg-orange/10">Retry</button>
+        </div>
+      );
+    }
+    if (state.kind === "ready" && material) {
+      if (material.file_type === "video") {
+        return usingMpv ? (
+          <Suspense fallback={<div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading player…</div>}>
+            <MpvVideoPlayer
+              path={material.file_path}
+              materialId={material.id}
+              startPosition={material.position_secs}
+              fileName={material.file_name}
+              onFail={onMpvFail}
+              onPip={() => navigate(playerParent, { state: { source } })}
+            />
+          </Suspense>
+        ) : (
+          <VideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
+        );
+      }
+      if (material.file_type === "audio") {
+        return <AudioPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />;
+      }
+      if (material.file_type === "pdf") return <PdfViewer path={material.file_path} />;
+      if (material.file_type === "image") return <ImageViewer path={material.file_path} />;
+      if (material.file_type === "note") {
+        return <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-content-muted">Note preview arrives in a later milestone.</div>;
+      }
+    }
+    return null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, material, usingMpv, onMpvFail, navigate, source, playerParent, load]);
+
   return (
     <div className="flex h-full flex-col">
       {/* ── Compact top bar (opaque) — hidden when the OS window is fullscreen ── */}
@@ -243,97 +270,41 @@ export default function PlayerPage() {
       )}
 
       {/* ── 3-column content (transparent; gaps via opaque borders) ────────────
-          In fullscreen, collapse to JUST the video anchor (fixed inset-0, filling the
-          screen) — the description + right column are hidden, the borders removed. */}
-      {isFullscreen ? (
-        <div className="fixed inset-0 z-20">
-          {/* Video anchor — transparent for the mpv overlay to fill the screen */}
-          <div className={"absolute inset-0 " + (usingMpv ? "" : "bg-black")}>
-            {state.kind === "ready" && material && material.file_type === "video" && (
-              usingMpv ? (
-                <Suspense fallback={null}>
-                  <MpvVideoPlayer 
-                    path={material.file_path} 
-                    materialId={material.id} 
-                    startPosition={material.position_secs} 
-                    fileName={material.file_name} 
-                    onFail={onMpvFail} 
-                    onPip={() => navigate(playerParent, { state: { source } })}
-                  />
-                </Suspense>
-              ) : (
-                <VideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
-              )
-            )}
-            {state.kind === "ready" && material && material.file_type === "audio" && (
-              <AudioPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
-            )}
-            {state.kind === "ready" && material && material.file_type === "pdf" && (
-              <PdfViewer path={material.file_path} />
-            )}
-            {state.kind === "ready" && material && material.file_type === "image" && (
-              <ImageViewer path={material.file_path} />
-            )}
-          </div>
-        </div>
-      ) : (
-        <div className="flex min-h-0 flex-1">
-          {/* Middle column — transparent, with opaque borders for breathing gaps */}
-          <div className="flex min-w-0 flex-1 flex-col border-l-4 border-t-4 border-ink-900">
-            {/* Video frame — flex space with min-h, centering the perfectly aspect-locked video box */}
-            <div className="relative flex-1 w-full min-h-[300px] overflow-hidden shadow-2xl flex items-center justify-center">
-              {/* Aspect Ratio lock container with shadow hack to draw pillarboxes while keeping the center transparent */}
-              <div 
-                className={"relative aspect-video max-w-full max-h-full shadow-[0_0_0_9999px_#000] " + (usingMpv ? "" : "bg-black")} 
-                style={{ height: "100%" }}
-              >
-                <div className="absolute inset-0">
-                  {state.kind === "loading" && (
-                    <div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading…</div>
-                  )}
-                  {state.kind === "ready" && material && material.file_type === "video" && (
-                    usingMpv ? (
-                      <Suspense fallback={<div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading player…</div>}>
-                        <MpvVideoPlayer 
-                          path={material.file_path} 
-                          materialId={material.id} 
-                          startPosition={material.position_secs} 
-                          fileName={material.file_name} 
-                          onFail={onMpvFail} 
-                          onPip={() => navigate(playerParent, { state: { source } })}
-                        />
-                      </Suspense>
-                    ) : (
-                      <VideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
-                    )
-                  )}
-                  {state.kind === "ready" && material && material.file_type === "audio" && (
-                    <AudioPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
-                  )}
-                  {state.kind === "ready" && material && material.file_type === "pdf" && (
-                    <PdfViewer path={material.file_path} />
-                  )}
-                  {state.kind === "ready" && material && material.file_type === "image" && (
-                    <ImageViewer path={material.file_path} />
-                  )}
-                  {state.kind === "ready" && material && material.file_type === "note" && (
-                    <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-content-muted">Note preview arrives in a later milestone.</div>
-                  )}
-                  {state.kind === "preview" && (
-                    <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-content-muted">Preview mode — open inside the desktop app.</div>
-                  )}
-                  {state.kind === "error" && (
-                    <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-orange">
-                      {state.message}
-                      <button type="button" onClick={() => void load()} className="ml-3 rounded-btn border border-orange/40 px-2.5 py-1 text-xs text-orange hover:bg-orange/10">Retry</button>
-                    </div>
-                  )}
-                </div>
-              </div>
+          CRITICAL: the media element (`mediaEl`) is rendered at ONE stable position in the
+          tree — its ancestor chain (wrapper → middle column → frame → aspect box → inset)
+          is identical whether or not we're in fullscreen; only the classNames change. This
+          means React never unmounts/remounts the mpv player on a fullscreen toggle (the old
+          two-branch ternary rendered it in two different subtrees → remount → black frame +
+          full re-init every toggle). In fullscreen the frame goes `fixed inset-0` and the
+          description + right column are simply not rendered. */}
+      <div className={isFullscreen ? "min-h-0 flex-1" : "flex min-h-0 flex-1"}>
+        {/* Middle column — transparent, with opaque borders for breathing gaps */}
+        <div className={isFullscreen ? "" : "flex min-w-0 flex-1 flex-col border-l-4 border-t-4 border-ink-900"}>
+          {/* Video frame — in fullscreen it fills the screen; otherwise it centers the
+              aspect-locked video box within the flex space. */}
+          <div
+            className={
+              isFullscreen
+                ? "fixed inset-0 z-20"
+                : "relative flex-1 w-full min-h-[300px] overflow-hidden shadow-2xl flex items-center justify-center"
+            }
+          >
+            {/* Aspect-ratio lock (normal) / full-bleed (fullscreen). The shadow hack draws
+                pillarboxes while keeping the center transparent for the mpv overlay. */}
+            <div
+              className={
+                isFullscreen
+                  ? "absolute inset-0 " + (usingMpv ? "" : "bg-black")
+                  : "relative aspect-video max-w-full max-h-full shadow-[0_0_0_9999px_#000] " + (usingMpv ? "" : "bg-black")
+              }
+              style={isFullscreen ? undefined : { height: "100%" }}
+            >
+              <div className="absolute inset-0">{mediaEl}</div>
             </div>
+          </div>
 
-            {/* Description section (compact at the bottom) */}
-            {state.kind === "ready" && material && (
+          {/* Description section (compact at the bottom) — hidden in fullscreen */}
+          {!isFullscreen && state.kind === "ready" && material && (
               <div className="shrink-0 bg-ink-900 px-6 pb-4 pt-4 border-t border-glass-border">
                 <div className="flex items-center gap-2 text-sm text-content-muted">
                   <span>{TYPE_GLYPH[material.file_type] ?? "📁"}</span>
@@ -369,8 +340,9 @@ export default function PlayerPage() {
             )}
           </div>
 
-          {/* Right column — Lesson Overview + (video) timestamped Notes, tabbed. */}
-          {state.kind === "ready" && material && (
+        {/* Right column — Lesson Overview + (video) timestamped Notes, tabbed. Hidden in
+            fullscreen so the video anchor owns the whole screen. */}
+        {!isFullscreen && state.kind === "ready" && material && (
             <div className="flex shrink-0 flex-col border-t-4 border-ink-900 bg-ink-900">
               {material.file_type === "video" ? (
                 <div className="flex min-h-0 w-[480px] flex-1 flex-col px-6 pb-6 pt-6">
@@ -409,9 +381,8 @@ export default function PlayerPage() {
                 <LessonOverview siblings={siblings} currentId={material.id} source={source} />
               )}
             </div>
-          )}
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
