@@ -691,3 +691,73 @@ requested resizable/draggable mini-player. Both phases committed; `npm run build
   pre-v7 DB. Node queries + scan flow + v7 migration remain compile/test-checked only.
 - Consider surfacing the resolved tier + a "reduce effects" hint the first time a `lite`
   device is detected.
+
+> **Update:** the draggable/resizable mini-player (12.7) was later **reverted** to the fixed
+> bottom-right card — the drag/resize fought the clip-path hole (phantom mpv frame at 0,0,
+> flickering controls at the transparent-hole seam). `MiniPlayer.tsx` + `miniPlayerStore.ts`
+> are back at their pre-drag state; the tier-motion refinements from 12.7 all remain.
+
+---
+
+## 13. Courses Page → Multi-Section EdTech Hub
+
+Redesigned the flat root Courses page into a responsive dashboard hub (Coursera/Udemy
+vocabulary), keeping the `/courses/:nodeId` tree explorer untouched. Research grounded in the
+`ui-ux-pro-max` DB (EdTech design-system + navigation/dashboard/react-perf domains) plus the
+`frontend-design`/`ui-styling` skills. Each phase committed; `npm run build` +
+(`src-tauri`) `cargo build && cargo test --lib` (**14/14**) green.
+
+### 13.1 Backend — schema v8 (`nodes.is_pinned`)
+- New `nodes.is_pinned` column (the hub "Pinned" favorite; mirrors `materials.is_bookmarked`).
+  Guarded `ADD COLUMN` migration for pre-v8 DBs. **Gotcha handled:** the partial
+  `idx_nodes_pinned` is created in `connection.rs::migrate` *after* the ALTER, NOT in
+  `SCHEMA_SQL` — SCHEMA_SQL re-applies before the ALTER on a migrating DB, so an index there
+  fails with `no such column: is_pinned`.
+- `NodeCard` gained `is_pinned` + `created_at`. Extracted the shared subtree-rollup SELECT
+  into `node_card_sql()`/`map_node_card()` so every hub feed reuses the exact count+cover
+  logic. New queries: `pinned_nodes`, `nodes_in_progress` (roots with 0<done<total, HAVING),
+  `recent_nodes` (newest roots), `set_node_pinned`. New commands registered in `lib.rs`.
+- Tests: pin toggle+list, in-progress/recent feeds (2 new → 14 total).
+
+### 13.2 Frontend — the hub (`/courses`, root only)
+- Sections top→bottom: **Continue Learning** (featured resume card, reuses
+  `dashboard_data.continue_learning`), **Pinned** (hidden when empty), **In Progress**,
+  **Recently Added**, **All Courses**. Comfortable margins (`max-w-[100rem]`, `p-6/10/14`),
+  `space-y-12` between sections.
+- New `CourseHubSection.tsx`: header (icon + title + count + **Explore ›**) over a **capped
+  responsive grid** (2→3→4→5 cols, max 5 cards). Deliberately NOT a sideways swimlane — the
+  UX DB flags horizontal scroll High-severity on mobile, and a wrapping grid is cheaper on
+  weak GPUs.
+- New `PinButton.tsx` (favorite toggle) + `FolderCard` optional pin overlay. Pin toggles are
+  **optimistic** (local state + Pinned-section membership patched, no refetch/re-stagger).
+- Motion: GSAP entrance extended to `.hub-section`, still gated on `motionAllowed()` (zero on
+  lite / reduced-motion). New IPC wrappers: `pinnedNodes`, `nodesInProgress`, `recentNodes`,
+  `setNodePinned`.
+
+### 13.3 Frontend — the Explore drill-down (`/explore/:category`)
+- New lazy `ExploreCategoryPage.tsx` (own 7.6 kB chunk = "conditional loading"). Categories
+  `pinned | in-progress | recent | all`, each backed by its hub feed. Lists EVERY course with
+  large-library tooling: **in-page search**, **sort** (Default/A–Z/%complete/Most content),
+  **status filter chips** (All/In progress/Completed/Not started). Filter+sort are pure +
+  memoized (no refetch on keystroke).
+- **Instant-drill-down performance:** NO GSAP stagger even on high tier — the list paints
+  immediately. Off-screen cards virtualized for free via the existing `perf-card`
+  `content-visibility` marker (no new dependency). All motion scoped → lite kill-switch
+  neutralizes it. Route added in `App.tsx`.
+
+### 13.4 Files touched
+- New: `src/components/courses/PinButton.tsx`, `src/components/courses/CourseHubSection.tsx`,
+  `src/pages/ExploreCategoryPage.tsx`.
+- Frontend: `CoursesPage.tsx` (root → hub), `FolderCard.tsx` (pin overlay), `App.tsx` (route),
+  `lib/types.ts` (NodeCard fields), `lib/ipc.ts` (4 wrappers).
+- Backend: `db/schema.rs` (v8), `db/connection.rs` (migration + index), `db/queries.rs`
+  (NodeCard fields, node_card_sql/map_node_card, 3 feeds + set_node_pinned, 2 tests),
+  `commands/nodes.rs` (4 commands), `lib.rs` (registration).
+
+### 13.5 Still owed — LIVE SMOKE TEST (`npm run tauri dev`)
+Node queries + v8 migration are compile/test-checked only. Verify: (a) hub renders all
+sections with correct membership; (b) **pin/unpin** a course from a hub card and from Explore
+— Pinned section/list updates instantly, persists across reload, survives app restart
+(v8 column); (c) each **Explore ›** opens the right full list; search/sort/filter chips work;
+(d) drill a node from "All Courses" still works (explorer unchanged); (e) **Lite tier**: hub
++ Explore have zero entrance motion / hover scale; (f) v8 migration on a real pre-v8 DB.
