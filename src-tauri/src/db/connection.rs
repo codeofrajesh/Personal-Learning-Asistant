@@ -114,6 +114,15 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         return Ok(());
     }
 
+    // v6: fold the legacy goals/subjects/chapters chain into the `nodes` adjacency tree
+    // and repoint materials/registered_dirs. Runs BEFORE the generic SCHEMA_SQL below so
+    // the new `materials.node_id` column + node indexes exist when SCHEMA_SQL re-applies.
+    // Only fires on a real pre-v6 DB that still has the `goals` table (fresh installs get
+    // the tree straight from SCHEMA_SQL and skip this entirely).
+    if current < 6 && table_exists(conn, "goals")? {
+        migrate_v6_tree(conn)?;
+    }
+
     conn.execute_batch("BEGIN")?;
     let result = (|| -> AppResult<()> {
         conn.execute_batch(SCHEMA_SQL)?;
@@ -143,6 +152,232 @@ fn migrate(conn: &Connection) -> AppResult<()> {
             Err(e)
         }
     }
+}
+
+/// v6 data migration: rebuild the rigid goals→subjects→chapters hierarchy as rows in a
+/// single self-referencing `nodes` table, then repoint `materials` and `registered_dirs`.
+///
+/// Strategy (chosen to preserve `materials.id` so watch_progress / notes / study_sessions
+/// / tasks stay valid, and to avoid a risky full `materials` table rebuild that would
+/// disturb the FTS triggers + child FKs):
+///   1. FK enforcement OFF (a schema surgery must not trip cascade/ordering checks).
+///   2. Create `nodes`; insert goals (depth 0, kind 'root'), subjects (depth 1), chapters
+///      (depth 2), recording old_id→new_node_id maps in Rust.
+///   3. `materials`: ADD COLUMN node_id, UPDATE from the chapter map, drop the old
+///      `idx_materials_chapter` index, then DROP COLUMN chapter_id.
+///   4. `registered_dirs`: ADD COLUMN root_node_id (mapped from its subject_id), DROP the
+///      legacy goal_id/subject_id/chapter_id/category_level columns.
+///   5. Drop chapters, subjects, goals (their indexes vanish with them).
+///   6. `PRAGMA foreign_key_check`, COMMIT, FK back ON.
+///
+/// PRAGMA foreign_keys can only change OUTSIDE a transaction, so we toggle it around the
+/// explicit BEGIN/COMMIT here.
+fn migrate_v6_tree(conn: &Connection) -> AppResult<()> {
+    use std::collections::HashMap;
+
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    conn.execute_batch("BEGIN")?;
+
+    let result = (|| -> AppResult<()> {
+        // 1. The nodes table (mirrors SCHEMA_SQL; IF NOT EXISTS so the later re-run is a no-op).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS nodes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id   INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                kind        TEXT NOT NULL DEFAULT 'folder',
+                description TEXT,
+                icon        TEXT,
+                color       TEXT,
+                depth       INTEGER NOT NULL DEFAULT 0,
+                path        TEXT,
+                sort_order  INTEGER DEFAULT 0,
+                created_at  TEXT DEFAULT (datetime('now')),
+                updated_at  TEXT DEFAULT (datetime('now')),
+                UNIQUE(parent_id, name)
+            )",
+        )?;
+
+        // 2a. Goals → root nodes (depth 0).
+        let mut goal_map: HashMap<i64, i64> = HashMap::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT id, name, icon, color, sort_order, created_at FROM goals")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (old_id, name, icon, color, sort_order, created_at) in rows {
+                conn.execute(
+                    "INSERT INTO nodes(parent_id, name, kind, icon, color, depth, sort_order, created_at)
+                     VALUES(NULL, ?1, 'root', ?2, ?3, 0, ?4, COALESCE(?5, datetime('now')))",
+                    rusqlite::params![name, icon, color, sort_order, created_at],
+                )?;
+                goal_map.insert(old_id, conn.last_insert_rowid());
+            }
+        }
+
+        // 2b. Subjects → depth-1 nodes under their goal.
+        let mut subject_map: HashMap<i64, i64> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, goal_id, name, icon, color, sort_order, created_at FROM subjects",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (old_id, goal_id, name, icon, color, sort_order, created_at) in rows {
+                let parent = goal_map.get(&goal_id).copied();
+                conn.execute(
+                    "INSERT INTO nodes(parent_id, name, kind, icon, color, depth, sort_order, created_at)
+                     VALUES(?1, ?2, 'folder', ?3, ?4, 1, ?5, COALESCE(?6, datetime('now')))",
+                    rusqlite::params![parent, name, icon, color, sort_order, created_at],
+                )?;
+                subject_map.insert(old_id, conn.last_insert_rowid());
+            }
+        }
+
+        // 2c. Chapters → depth-2 nodes under their subject.
+        let mut chapter_map: HashMap<i64, i64> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, subject_id, name, sort_order, created_at FROM chapters")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (old_id, subject_id, name, sort_order, created_at) in rows {
+                let parent = subject_map.get(&subject_id).copied();
+                conn.execute(
+                    "INSERT INTO nodes(parent_id, name, kind, depth, sort_order, created_at)
+                     VALUES(?1, ?2, 'folder', 2, ?3, COALESCE(?4, datetime('now')))",
+                    rusqlite::params![parent, name, sort_order, created_at],
+                )?;
+                chapter_map.insert(old_id, conn.last_insert_rowid());
+            }
+        }
+
+        // 3. materials: add node_id, map from chapter_id, drop the old index + column.
+        if !column_exists(conn, "materials", "node_id")? {
+            conn.execute_batch("ALTER TABLE materials ADD COLUMN node_id INTEGER")?;
+        }
+        {
+            let mut stmt = conn.prepare("SELECT id, chapter_id FROM materials")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (mid, chapter_id) in rows {
+                if let Some(node_id) = chapter_map.get(&chapter_id) {
+                    conn.execute(
+                        "UPDATE materials SET node_id = ?1 WHERE id = ?2",
+                        rusqlite::params![node_id, mid],
+                    )?;
+                }
+            }
+        }
+        conn.execute_batch("DROP INDEX IF EXISTS idx_materials_chapter")?;
+        conn.execute_batch("ALTER TABLE materials DROP COLUMN chapter_id")?;
+
+        // 4. registered_dirs: add root_node_id (from subject_id — imports always mapped a
+        //    folder to a subject), drop the legacy columns.
+        if !column_exists(conn, "registered_dirs", "root_node_id")? {
+            conn.execute_batch("ALTER TABLE registered_dirs ADD COLUMN root_node_id INTEGER")?;
+        }
+        {
+            let mut stmt = conn.prepare("SELECT id, subject_id FROM registered_dirs")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (dir_id, subject_id) in rows {
+                if let Some(node_id) = subject_id.and_then(|s| subject_map.get(&s).copied()) {
+                    conn.execute(
+                        "UPDATE registered_dirs SET root_node_id = ?1 WHERE id = ?2",
+                        rusqlite::params![node_id, dir_id],
+                    )?;
+                }
+            }
+        }
+        for col in ["category_level", "goal_id", "subject_id", "chapter_id"] {
+            if column_exists(conn, "registered_dirs", col)? {
+                conn.execute_batch(&format!("ALTER TABLE registered_dirs DROP COLUMN {col}"))?;
+            }
+        }
+
+        // 5. Drop the legacy hierarchy tables (their indexes drop with them).
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS chapters;
+             DROP TABLE IF EXISTS subjects;
+             DROP TABLE IF EXISTS goals;",
+        )?;
+
+        // 6. Integrity check before committing the surgery. `foreign_key_check` yields one
+        //    row PER violation and no rows when clean, so count the rows.
+        let violations: i64 = {
+            let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+            let mut rows = stmt.query([])?;
+            let mut n = 0i64;
+            while rows.next()?.is_some() {
+                n += 1;
+            }
+            n
+        };
+        if violations > 0 {
+            return Err(AppError::Other(
+                "v6 migration left dangling foreign keys".into(),
+            ));
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.pragma_update(None, "foreign_keys", "ON");
+            Err(e)
+        }
+    }
+}
+
+/// True if a table with `name` exists.
+fn table_exists(conn: &Connection, name: &str) -> AppResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// True if `table` has a column named `column` (via `PRAGMA table_info`).
@@ -267,5 +502,106 @@ mod tests {
             .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn migrates_pre_v6_hierarchy_into_nodes_tree() {
+        // Simulate a pre-v6 DB: the rigid goals→subjects→chapters→materials chain plus a
+        // watch_progress row tied to a material id (must survive the migration untouched).
+        let conn = Connection::open_in_memory().expect("open");
+        configure_pragmas(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE goals (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+                 description TEXT, icon TEXT, color TEXT, sort_order INTEGER DEFAULT 0,
+                 created_at TEXT, updated_at TEXT);
+             CREATE TABLE subjects (id INTEGER PRIMARY KEY AUTOINCREMENT, goal_id INTEGER NOT NULL,
+                 name TEXT NOT NULL, description TEXT, icon TEXT, color TEXT,
+                 sort_order INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT);
+             CREATE TABLE chapters (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER NOT NULL,
+                 name TEXT NOT NULL, description TEXT, sort_order INTEGER DEFAULT 0,
+                 created_at TEXT, updated_at TEXT);
+             CREATE TABLE materials (id INTEGER PRIMARY KEY AUTOINCREMENT, chapter_id INTEGER NOT NULL,
+                 file_path TEXT NOT NULL UNIQUE, file_name TEXT NOT NULL, file_type TEXT NOT NULL,
+                 file_extension TEXT NOT NULL, file_size_bytes INTEGER DEFAULT 0, duration_secs REAL,
+                 thumbnail_path TEXT, resolution TEXT, codec TEXT, bitrate INTEGER, page_count INTEGER,
+                 status TEXT DEFAULT 'active', is_bookmarked INTEGER DEFAULT 0,
+                 is_completed INTEGER DEFAULT 0, last_opened_at TEXT, sort_order INTEGER DEFAULT 0,
+                 created_at TEXT, updated_at TEXT);
+             CREATE TABLE watch_progress (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 material_id INTEGER NOT NULL UNIQUE, position_secs REAL DEFAULT 0,
+                 duration_secs REAL DEFAULT 0, completed INTEGER DEFAULT 0,
+                 last_watched_at TEXT, watch_count INTEGER DEFAULT 1);
+             CREATE TABLE registered_dirs (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE,
+                 category_level TEXT NOT NULL, goal_id INTEGER, subject_id INTEGER, chapter_id INTEGER,
+                 is_active INTEGER DEFAULT 1, scan_status TEXT DEFAULT 'pending',
+                 last_scanned_at TEXT, created_at TEXT);
+             INSERT INTO goals(id, name) VALUES (1, 'UPSC');
+             INSERT INTO subjects(id, goal_id, name) VALUES (1, 1, 'GS2');
+             INSERT INTO chapters(id, subject_id, name) VALUES (1, 1, 'Polity');
+             INSERT INTO materials(id, chapter_id, file_path, file_name, file_type, file_extension)
+                 VALUES (42, 1, '/x/polity/intro.mp4', 'intro.mp4', 'video', 'mp4');
+             INSERT INTO watch_progress(material_id, position_secs, duration_secs) VALUES (42, 30, 100);
+             INSERT INTO registered_dirs(path, category_level, goal_id, subject_id)
+                 VALUES ('/x/polity', 'subject', 1, 1);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        // nodes tree: UPSC(root,depth0) → GS2(depth1) → Polity(depth2).
+        let (root_id, root_depth): (i64, i64) = conn
+            .query_row(
+                "SELECT id, depth FROM nodes WHERE name='UPSC' AND parent_id IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(root_depth, 0);
+        let (gs2_id, gs2_depth): (i64, i64) = conn
+            .query_row("SELECT id, depth FROM nodes WHERE name='GS2'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(gs2_depth, 1);
+        let gs2_parent: i64 = conn
+            .query_row("SELECT parent_id FROM nodes WHERE name='GS2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gs2_parent, root_id);
+        let (polity_id, polity_depth): (i64, i64) = conn
+            .query_row("SELECT id, depth FROM nodes WHERE name='Polity'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(polity_depth, 2);
+        let _ = gs2_id;
+
+        // material id 42 preserved, now pointing at the Polity node; chapter_id gone.
+        let node_id: i64 = conn
+            .query_row("SELECT node_id FROM materials WHERE id=42", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(node_id, polity_id);
+        assert!(!column_exists(&conn, "materials", "chapter_id").unwrap());
+
+        // watch_progress row still tied to material 42 (downstream data preserved).
+        let pos: f64 = conn
+            .query_row("SELECT position_secs FROM watch_progress WHERE material_id=42", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pos, 30.0);
+
+        // registered_dirs repointed to the GS2 node; legacy columns dropped.
+        let dir_root: i64 = conn
+            .query_row("SELECT root_node_id FROM registered_dirs LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dir_root, gs2_id);
+        assert!(!column_exists(&conn, "registered_dirs", "subject_id").unwrap());
+
+        // Legacy tables dropped; version stamped.
+        assert!(!table_exists(&conn, "goals").unwrap());
+        assert!(!table_exists(&conn, "chapters").unwrap());
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
     }
 }

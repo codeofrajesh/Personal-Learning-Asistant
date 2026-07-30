@@ -11,53 +11,43 @@
 /// v3: added `study_sessions.session_type` (Pomodoro focus/break tracking).
 /// v4: added `tasks.estimated_mins` + the `consistency_log` table (Planning Hub).
 /// v5: added the `notes` table (timestamped video notes).
-pub const SCHEMA_VERSION: i64 = 5;
+/// v6: introduced the `nodes` adjacency-list tree (infinite-depth categorization).
+///     `materials.node_id` replaces `chapter_id`; `registered_dirs.root_node_id`
+///     replaces goal_id/subject_id/chapter_id. Legacy goals/subjects/chapters tables
+///     are migrated into `nodes` then dropped. See `migrate_v6_tree` in connection.rs.
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The complete v1 schema. Every statement is `IF NOT EXISTS` where SQLite allows,
 /// so re-application is a no-op.
 pub const SCHEMA_SQL: &str = r#"
--- Goals: Top-level learning objectives
-CREATE TABLE IF NOT EXISTS goals (
+-- Nodes: the unified, infinite-depth categorization tree (v6). One self-referencing
+-- adjacency list replaces the old rigid goals→subjects→chapters chain. A node with
+-- `parent_id IS NULL` is a root ("Goal"); any node can have children to any depth. A
+-- casual learner has one root with materials directly under it; a power user nests
+-- Goal→Subject→Sub-subject→Topic→… as deep as they like. `depth` is denormalized
+-- (parent.depth + 1) so top-level listing is a cheap `WHERE depth = 0`. `path` holds the
+-- absolute disk folder this node mirrors (NULL for hand-made nodes).
+CREATE TABLE IF NOT EXISTS nodes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL UNIQUE,
-    description TEXT,
-    icon        TEXT DEFAULT '🎯',
-    color       TEXT DEFAULT '#AAFF00',
-    sort_order  INTEGER DEFAULT 0,
-    created_at  TEXT DEFAULT (datetime('now')),
-    updated_at  TEXT DEFAULT (datetime('now'))
-);
-
--- Subjects: Second level
-CREATE TABLE IF NOT EXISTS subjects (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    goal_id     INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    parent_id   INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'folder',   -- 'root' | 'folder' (semantic hint)
     description TEXT,
-    icon        TEXT DEFAULT '📚',
+    icon        TEXT,
     color       TEXT,
+    depth       INTEGER NOT NULL DEFAULT 0,
+    path        TEXT,
     sort_order  INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now')),
-    UNIQUE(goal_id, name)
+    UNIQUE(parent_id, name)
 );
 
--- Chapters: Third level
-CREATE TABLE IF NOT EXISTS chapters (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    subject_id  INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
-    name        TEXT NOT NULL,
-    description TEXT,
-    sort_order  INTEGER DEFAULT 0,
-    created_at  TEXT DEFAULT (datetime('now')),
-    updated_at  TEXT DEFAULT (datetime('now')),
-    UNIQUE(subject_id, name)
-);
-
--- Materials: Actual files
+-- Materials: Actual files. `node_id` points at the node (folder) they live under (v6,
+-- was `chapter_id`).
 CREATE TABLE IF NOT EXISTS materials (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    chapter_id      INTEGER NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+    node_id         INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     file_path       TEXT NOT NULL UNIQUE,
     file_name       TEXT NOT NULL,
     file_type       TEXT NOT NULL,
@@ -94,14 +84,12 @@ CREATE TABLE IF NOT EXISTS watch_progress (
     watch_count     INTEGER DEFAULT 1
 );
 
--- Registered Directories
+-- Registered Directories. `root_node_id` is the node the scanned folder maps to (v6,
+-- replaces goal_id/subject_id/chapter_id + category_level). The watcher keys on it.
 CREATE TABLE IF NOT EXISTS registered_dirs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     path            TEXT NOT NULL UNIQUE,
-    category_level  TEXT NOT NULL,
-    goal_id         INTEGER REFERENCES goals(id),
-    subject_id      INTEGER REFERENCES subjects(id),
-    chapter_id      INTEGER REFERENCES chapters(id),
+    root_node_id    INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
     is_active       INTEGER DEFAULT 1,
     scan_status     TEXT DEFAULT 'pending',
     last_scanned_at TEXT,
@@ -194,14 +182,15 @@ CREATE TRIGGER IF NOT EXISTS materials_au AFTER UPDATE ON materials BEGIN
 END;
 
 -- Performance Indexes
-CREATE INDEX IF NOT EXISTS idx_materials_chapter ON materials(chapter_id);
+CREATE INDEX IF NOT EXISTS idx_materials_node ON materials(node_id);
 CREATE INDEX IF NOT EXISTS idx_materials_type ON materials(file_type);
 CREATE INDEX IF NOT EXISTS idx_materials_status ON materials(status);
 CREATE INDEX IF NOT EXISTS idx_materials_bookmarked ON materials(is_bookmarked) WHERE is_bookmarked = 1;
 CREATE INDEX IF NOT EXISTS idx_watch_progress_last ON watch_progress(last_watched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_study_sessions_date ON study_sessions(session_date);
-CREATE INDEX IF NOT EXISTS idx_chapters_subject ON chapters(subject_id);
-CREATE INDEX IF NOT EXISTS idx_subjects_goal ON subjects(goal_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth);
+CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path);
 CREATE INDEX IF NOT EXISTS idx_tasks_done ON tasks(done);
 CREATE INDEX IF NOT EXISTS idx_tasks_material ON tasks(material_id);
 CREATE INDEX IF NOT EXISTS idx_notes_material ON notes(material_id, timestamp_secs);
