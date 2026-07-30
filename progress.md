@@ -396,3 +396,31 @@ breadcrumb/actions render as a **second row directly beneath** it.
 7. **In-app docked MPV mini-player (Step 5d)** — Reuses the global MPV singleton. When leaving the player route mid-video, a floating glass card docks at bottom-right with transparent video anchor (ambient canvas gets a clip-path notch so MPV shows through). Controls: play/pause, expand, close. Mutual-exclusive with the full player.
 
 Verification: `npm run build` green; `cargo test` green (7/7).
+
+---
+
+## 10. Software Updates & OTA Deployment
+
+- **Implemented Auto-updater**: Added seamless Over-The-Air updates using `@tauri-apps/plugin-updater`.
+- **UI Integration**: Users can check for updates, view release notes, and download new versions directly from the `Settings -> Software Update` tab.
+- **Automated CI/CD**: Pushing a new version tag to GitHub automatically builds the installer and cryptographically signs it (via GitHub Actions & `latest.json`).
+- **One-Command Release**: Added `npm run release` script to completely automate the bumping, tagging, and pushing of new versions.
+
+### 📦 How to Push a New Update to Users
+
+To push a brand new version of the app to all users, you no longer need to manually change version files or write Git commands. 
+
+Simply run this one command in your terminal:
+```bash
+npm run release
+```
+
+**What this script does:**
+1. Automatically bumps the version (e.g. `v0.1.3` -> `v0.1.4`) in `package.json`, `tauri.conf.json`, and `Cargo.toml`.
+2. Commits the changes to Git.
+3. Creates a new version tag (e.g. `v0.1.4`).
+4. Pushes everything to GitHub.
+
+Once pushed, **GitHub Actions** will automatically compile the app in the cloud, sign the installer, and publish it. Within ~15 minutes, anyone using the app can click "Check for Updates" to receive the new version!
+
+*(Note: You can also specify the bump type by running `npm run release minor` or `npm run release major`)*
