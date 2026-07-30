@@ -18,7 +18,10 @@
 /// v7: added `materials.metadata_attempts` — a counter so the thumbnail/duration engine
 ///     stops re-running ffmpeg on files that repeatedly fail to yield metadata (corrupt /
 ///     unsupported), which otherwise re-spawned ffmpeg for them on every boot/import.
-pub const SCHEMA_VERSION: i64 = 7;
+/// v8: added `nodes.is_pinned` — the Courses hub "Pinned" feature. A user can favorite any
+///     node (course/folder) to surface it in a dedicated hub section, mirroring how
+///     `materials.is_bookmarked` works for files.
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The complete v1 schema. Every statement is `IF NOT EXISTS` where SQLite allows,
 /// so re-application is a no-op.
@@ -41,6 +44,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     depth       INTEGER NOT NULL DEFAULT 0,
     path        TEXT,
     sort_order  INTEGER DEFAULT 0,
+    is_pinned   INTEGER NOT NULL DEFAULT 0,   -- Courses hub "Pinned" favorite (v8)
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now')),
     UNIQUE(parent_id, name)
@@ -195,6 +199,9 @@ CREATE INDEX IF NOT EXISTS idx_study_sessions_date ON study_sessions(session_dat
 CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_depth ON nodes(depth);
 CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path);
+-- NOTE: idx_nodes_pinned (partial index on the v8 nodes.is_pinned column) is created in
+-- connection.rs::migrate AFTER the guarded ADD COLUMN, because on a migrating pre-v8 DB the
+-- column doesn't exist yet when SCHEMA_SQL first re-applies.
 CREATE INDEX IF NOT EXISTS idx_tasks_done ON tasks(done);
 CREATE INDEX IF NOT EXISTS idx_tasks_material ON tasks(material_id);
 CREATE INDEX IF NOT EXISTS idx_notes_material ON notes(material_id, timestamp_secs);

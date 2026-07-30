@@ -155,6 +155,19 @@ fn migrate(conn: &Connection) -> AppResult<()> {
                 "ALTER TABLE materials ADD COLUMN metadata_attempts INTEGER NOT NULL DEFAULT 0",
             )?;
         }
+        // v8: nodes.is_pinned — add it to pre-v8 databases that already have the nodes
+        // table (fresh installs get it from CREATE TABLE above). The partial index is
+        // created idempotently by SCHEMA_SQL above.
+        if !column_exists(conn, "nodes", "is_pinned")? {
+            conn.execute_batch(
+                "ALTER TABLE nodes ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        // The partial index on nodes.is_pinned is created here (not in SCHEMA_SQL) so it's
+        // only built once the column is guaranteed to exist on a migrating pre-v8 DB.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_pinned ON nodes(is_pinned) WHERE is_pinned = 1",
+        )?;
         Ok(())
     })();
 

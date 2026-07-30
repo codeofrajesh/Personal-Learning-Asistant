@@ -1002,6 +1002,10 @@ pub struct NodeCard {
     pub completed_count: i64,
     /// One random video material's thumbnail from the subtree (null if none).
     pub thumbnail_path: Option<String>,
+    /// Whether the user has pinned this node to the Courses hub (v8).
+    pub is_pinned: bool,
+    /// Node creation timestamp (for the hub's "Recently Added" sort).
+    pub created_at: String,
 }
 
 /// One breadcrumb rung (root-first) for the tree browser.
@@ -1020,10 +1024,32 @@ pub fn node_children(conn: &Connection, parent_id: Option<i64>) -> AppResult<Vec
     // Bind `parent_id` once as a nullable param and let `?1 IS NULL` pick the root set.
     // The `subtree` CTE seeds from each candidate node and walks its descendants so
     // material counts roll up the ENTIRE subtree (consistent with list_subjects/goals).
-    let sql = "WITH RECURSIVE
+    let sql = node_card_sql(
+        "(?1 IS NULL AND {alias}.parent_id IS NULL) OR ({alias}.parent_id = ?1)",
+        "ORDER BY s.sort_order, s.name",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([parent_id], map_node_card)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The shared NodeCard SELECT — a subtree rollup (whole-subtree material/completed
+/// counts + a random cover thumbnail) over a set of "seed" nodes. `seed_pred` selects
+/// which nodes become cards (use `{alias}` where the predicate must name the table — it's
+/// substituted with the seed CTE's `nodes` in the seed and with `s` in the outer WHERE).
+/// `tail` is appended after `GROUP BY s.id` (a HAVING and/or ORDER BY). The 10 selected
+/// columns line up with [`map_node_card`].
+fn node_card_sql(seed_pred: &str, tail: &str) -> String {
+    let seed_where = seed_pred.replace("{alias}", "nodes");
+    let outer_where = seed_pred.replace("{alias}", "s");
+    format!(
+        "WITH RECURSIVE
          subtree(top_id, id) AS (
-             SELECT id, id FROM nodes
-              WHERE (?1 IS NULL AND parent_id IS NULL) OR (parent_id = ?1)
+             SELECT id, id FROM nodes WHERE {seed_where}
              UNION ALL
              SELECT st.top_id, n.id FROM nodes n JOIN subtree st ON n.parent_id = st.id
          )
@@ -1042,33 +1068,89 @@ pub fn node_children(conn: &Connection, parent_id: Option<i64>) -> AppResult<Vec
                  AND m2.file_type = 'video'
                  AND m2.thumbnail_path IS NOT NULL
                  AND m2.status = 'active'
-               ORDER BY RANDOM() LIMIT 1) AS thumbnail_path
+               ORDER BY RANDOM() LIMIT 1) AS thumbnail_path,
+            s.is_pinned,
+            s.created_at
          FROM nodes s
          LEFT JOIN subtree st ON st.top_id = s.id
          LEFT JOIN materials m ON m.node_id = st.id AND m.status = 'active'
-         WHERE (?1 IS NULL AND s.parent_id IS NULL) OR (s.parent_id = ?1)
+         WHERE {outer_where}
          GROUP BY s.id
-         ORDER BY s.sort_order, s.name";
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([parent_id], |r| {
-        Ok(NodeCard {
-            id: r.get(0)?,
-            parent_id: r.get(1)?,
-            name: r.get(2)?,
-            icon: r.get(3)?,
-            color: r.get(4)?,
-            depth: r.get(5)?,
-            child_count: r.get(6)?,
-            material_count: r.get(7)?,
-            completed_count: r.get(8)?,
-            thumbnail_path: r.get(9)?,
-        })
-    })?;
+         {tail}"
+    )
+}
+
+/// Row → [`NodeCard`] for any query built with [`node_card_sql`].
+fn map_node_card(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeCard> {
+    Ok(NodeCard {
+        id: r.get(0)?,
+        parent_id: r.get(1)?,
+        name: r.get(2)?,
+        icon: r.get(3)?,
+        color: r.get(4)?,
+        depth: r.get(5)?,
+        child_count: r.get(6)?,
+        material_count: r.get(7)?,
+        completed_count: r.get(8)?,
+        thumbnail_path: r.get(9)?,
+        is_pinned: r.get::<_, i64>(10)? != 0,
+        created_at: r.get(11)?,
+    })
+}
+
+/// Nodes the user has pinned to the Courses hub (v8), newest pin surfaced by name.
+/// Any node at any depth can be pinned, so this is not restricted to roots.
+pub fn pinned_nodes(conn: &Connection) -> AppResult<Vec<NodeCard>> {
+    let sql = node_card_sql("{alias}.is_pinned = 1", "ORDER BY s.name");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], map_node_card)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Root courses that are partway done — at least one completed material but not all —
+/// for the hub's "In Progress" section. Ordered most-complete first. The 0<done<total
+/// filter is a HAVING because the counts are aggregates.
+pub fn nodes_in_progress(conn: &Connection) -> AppResult<Vec<NodeCard>> {
+    let sql = node_card_sql(
+        "{alias}.parent_id IS NULL",
+        "HAVING completed_count > 0 AND completed_count < material_count
+         ORDER BY CAST(completed_count AS REAL) / material_count DESC, s.name",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], map_node_card)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Root courses ordered newest-first for the hub's "Recently Added" section.
+pub fn recent_nodes(conn: &Connection) -> AppResult<Vec<NodeCard>> {
+    let sql = node_card_sql(
+        "{alias}.parent_id IS NULL",
+        "ORDER BY s.created_at DESC, s.id DESC",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], map_node_card)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Toggle a node's pinned flag (the Courses hub "Pin" control). Mirrors `set_bookmark`.
+pub fn set_node_pinned(conn: &Connection, node_id: i64, pinned: bool) -> AppResult<()> {
+    conn.execute(
+        "UPDATE nodes SET is_pinned = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![node_id, pinned as i64],
+    )?;
+    Ok(())
 }
 
 /// The ancestry chain of `node_id`, ROOT-FIRST (root … node), for the breadcrumb.
@@ -2696,5 +2778,68 @@ mod tests {
             second.materials_imported, 0,
             "unchanged rescan writes nothing"
         );
+    }
+
+    /// The v8 hub pin feature: nodes default to unpinned, `set_node_pinned` toggles the
+    /// flag, and `pinned_nodes` returns exactly the pinned set with the shared NodeCard
+    /// subtree rollup intact (child/material counts populated). rusqlite isn't
+    /// compile-checked, so this runs the real SQL end-to-end.
+    #[test]
+    fn set_node_pinned_toggles_and_pinned_nodes_lists_them() {
+        let conn = test_conn();
+        let a = upsert_root_node(&conn, "Alpha").unwrap();
+        let b = upsert_root_node(&conn, "Beta").unwrap();
+        insert_material(&conn, a, &file("/lib/a.mp4", "a.mp4", 1)).unwrap();
+
+        assert!(pinned_nodes(&conn).unwrap().is_empty(), "nothing pinned by default");
+
+        set_node_pinned(&conn, a, true).unwrap();
+        let pinned = pinned_nodes(&conn).unwrap();
+        assert_eq!(pinned.len(), 1, "one node pinned");
+        assert_eq!(pinned[0].id, a);
+        assert!(pinned[0].is_pinned, "card reflects pinned flag");
+        assert_eq!(pinned[0].material_count, 1, "subtree rollup still populated");
+
+        // Pinning a second node, then unpinning the first, leaves only the second.
+        set_node_pinned(&conn, b, true).unwrap();
+        set_node_pinned(&conn, a, false).unwrap();
+        let pinned = pinned_nodes(&conn).unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].id, b, "unpinned node dropped, pinned one remains");
+    }
+
+    /// `nodes_in_progress` returns only roots with 0 < completed < total; `recent_nodes`
+    /// returns roots newest-first. Guards the HAVING aggregate filter and the ordering.
+    #[test]
+    fn in_progress_and_recent_node_feeds() {
+        let conn = test_conn();
+        let done = upsert_root_node(&conn, "Done").unwrap();
+        let partial = upsert_root_node(&conn, "Partial").unwrap();
+        let untouched = upsert_root_node(&conn, "Untouched").unwrap();
+
+        // Done: 1/1 complete. Partial: 1/2 complete. Untouched: 0/1 complete.
+        for (node, path, done_flag) in [
+            (done, "/d/a.mp4", true),
+            (partial, "/p/a.mp4", true),
+            (partial, "/p/b.mp4", false),
+            (untouched, "/u/a.mp4", false),
+        ] {
+            insert_material(&conn, node, &file(path, "x.mp4", 1)).unwrap();
+            if done_flag {
+                conn.execute(
+                    "UPDATE materials SET is_completed = 1 WHERE file_path = ?1",
+                    [path],
+                )
+                .unwrap();
+            }
+        }
+
+        let in_progress = nodes_in_progress(&conn).unwrap();
+        assert_eq!(in_progress.len(), 1, "only the partially-complete root");
+        assert_eq!(in_progress[0].id, partial);
+
+        let recent = recent_nodes(&conn).unwrap();
+        assert_eq!(recent.len(), 3, "all roots appear in Recently Added");
+        assert_eq!(recent[0].id, untouched, "newest root first (highest id)");
     }
 }
