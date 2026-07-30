@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
-/// The default chapter for files that live directly in the registered root.
+/// Legacy default chapter name (pre-v6). Files in the import root now attach directly to
+/// the root node (no forced "General" level), so this is retained only as a fallback.
+#[allow(dead_code)]
 pub const DEFAULT_CHAPTER: &str = "General";
 
 /// A single file discovered by the scan, with just enough metadata to insert a
@@ -39,12 +41,17 @@ pub struct ScannedFile {
     pub size_bytes: i64,
 }
 
-/// One inferred chapter and the files that belong to it, in discovery order.
+/// One scanned folder mapped to its relative path segment chain (from the import root
+/// down to this folder) + the files that live DIRECTLY in it. `rel_segments` is empty for
+/// files sitting in the import root itself (they attach to the root node). Produced by
+/// [`scan_tree`], which mirrors an arbitrarily deep folder structure into the `nodes`
+/// tree (v6). Cleaned folder names via [`strip_chapter_prefix`].
 #[derive(Debug, Clone)]
-pub struct ChapterGroup {
-    /// Cleaned chapter name (folder name minus ordering prefix, or `"General"`).
-    pub chapter: String,
-    /// Files belonging to this chapter.
+pub struct ScannedNode {
+    /// Cleaned folder names from the import root down to (and including) this folder.
+    /// Empty = the import root itself.
+    pub rel_segments: Vec<String>,
+    /// Files directly in this folder (not its subfolders — those are their own nodes).
     pub files: Vec<ScannedFile>,
 }
 
@@ -140,16 +147,19 @@ fn strip_leading_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     }
 }
 
-/// Recursively scan `root`, returning files grouped by inferred chapter.
+/// Recursively scan `root`, mirroring its ENTIRE folder tree (any depth) into a flat list
+/// of [`ScannedNode`]s — one per folder that directly contains at least one supported
+/// file. `rel_segments` records the cleaned folder chain from the import root to that
+/// folder (empty = the root itself), so the importer can rebuild the tree in `nodes`.
 ///
-/// Groups preserve first-seen order (both of chapters and of files within them) so the
-/// library ordering is stable and predictable. Unreadable entries are skipped rather
-/// than aborting the whole scan — a single permission error shouldn't lose the folder.
-pub fn scan_dir(root: &Path) -> Vec<ChapterGroup> {
-    // Preserve insertion order without an extra dependency: a Vec of groups plus a
-    // parallel lookup of chapter-name -> index.
-    let mut groups: Vec<ChapterGroup> = Vec::new();
-    let mut index_of: Vec<(String, usize)> = Vec::new();
+/// Insertion order is preserved (first-seen folder, first-seen file) so the library
+/// ordering is stable and predictable. Unreadable entries are skipped rather than aborting
+/// the whole scan — a single permission error shouldn't lose the folder.
+pub fn scan_tree(root: &Path) -> Vec<ScannedNode> {
+    // Group files by their containing folder's relative segment chain. A Vec + parallel
+    // key lookup preserves first-seen order without pulling in an ordered-map dependency.
+    let mut nodes: Vec<ScannedNode> = Vec::new();
+    let mut index_of: Vec<(Vec<String>, usize)> = Vec::new();
 
     for entry in WalkDir::new(root)
         .follow_links(false)
@@ -163,21 +173,19 @@ pub fn scan_dir(root: &Path) -> Vec<ChapterGroup> {
 
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e,
-            None => continue, // no extension -> not a material we understand
+            None => continue,
         };
         let file_type = match classify_extension(ext) {
             Some(t) => t,
             None => continue,
         };
-
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
         };
 
-        let chapter = chapter_for(root, path);
+        let segments = folder_segments(root, path);
         let size_bytes = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
-
         let file = ScannedFile {
             path: path.to_string_lossy().to_string(),
             name,
@@ -186,39 +194,39 @@ pub fn scan_dir(root: &Path) -> Vec<ChapterGroup> {
             size_bytes,
         };
 
-        match index_of.iter().find(|(c, _)| c == &chapter) {
-            Some((_, i)) => groups[*i].files.push(file),
+        match index_of.iter().find(|(segs, _)| segs == &segments) {
+            Some((_, i)) => nodes[*i].files.push(file),
             None => {
-                index_of.push((chapter.clone(), groups.len()));
-                groups.push(ChapterGroup {
-                    chapter,
+                index_of.push((segments.clone(), nodes.len()));
+                nodes.push(ScannedNode {
+                    rel_segments: segments,
                     files: vec![file],
                 });
             }
         }
     }
 
-    groups
+    nodes
 }
 
-/// Determine the chapter name for `file_path` under `root`: the cleaned name of the
-/// first path segment below `root`, or [`DEFAULT_CHAPTER`] when the file is a direct
-/// child of the root.
-fn chapter_for(root: &Path, file_path: &Path) -> String {
+/// The cleaned folder-name chain from `root` down to the folder that contains
+/// `file_path` (excluding the file itself). Empty when the file sits directly in `root`.
+/// Each segment is run through [`strip_chapter_prefix`]; a segment that would clean to
+/// empty keeps its original name so no folder is ever nameless.
+fn folder_segments(root: &Path, file_path: &Path) -> Vec<String> {
     let rel = match file_path.strip_prefix(root) {
         Ok(r) => r,
-        Err(_) => return DEFAULT_CHAPTER.to_string(),
+        Err(_) => return Vec::new(),
     };
-
-    // Collect components; the last is the file name itself.
     let comps: Vec<PathBuf> = rel.iter().map(PathBuf::from).collect();
     if comps.len() <= 1 {
-        // File sits directly in root.
-        return DEFAULT_CHAPTER.to_string();
+        return Vec::new(); // file is a direct child of the import root
     }
-
-    let top = comps[0].to_string_lossy();
-    strip_chapter_prefix(&top)
+    // All components except the last (the file name) are folder segments.
+    comps[..comps.len() - 1]
+        .iter()
+        .map(|c| strip_chapter_prefix(&c.to_string_lossy()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -263,5 +271,60 @@ mod tests {
         // If stripping would empty it, keep the original.
         assert_eq!(strip_chapter_prefix("01"), "01");
         assert_eq!(strip_chapter_prefix("Chapter 1"), "Chapter 1");
+    }
+
+    #[test]
+    fn scan_tree_mirrors_arbitrary_depth() {
+        use std::fs;
+        // Build a deep folder tree in a temp dir:
+        //   root/root.mp4                                   → rel_segments []
+        //   root/GS2/Polity/intro.mp4                       → ["GS2","Polity"]
+        //   root/GS2/Polity/Topic/01 - Deep/note.pdf        → ["GS2","Polity","Topic","Deep"]
+        //   root/ignore.txtx (unsupported)                  → skipped
+        let base = std::env::temp_dir().join(format!("ple_scan_tree_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let deep = base.join("GS2").join("Polity").join("Topic").join("01 - Deep");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(base.join("root.mp4"), b"x").unwrap();
+        fs::write(base.join("GS2").join("Polity").join("intro.mp4"), b"x").unwrap();
+        fs::write(deep.join("note.pdf"), b"x").unwrap();
+        fs::write(base.join("ignore.xyz"), b"x").unwrap();
+
+        let nodes = scan_tree(&base);
+
+        // Root file → empty segments.
+        let root_node = nodes.iter().find(|n| n.rel_segments.is_empty()).unwrap();
+        assert_eq!(root_node.files.len(), 1);
+        assert_eq!(root_node.files[0].name, "root.mp4");
+
+        // Depth-2 folder.
+        let polity = nodes
+            .iter()
+            .find(|n| n.rel_segments == vec!["GS2".to_string(), "Polity".to_string()])
+            .unwrap();
+        assert_eq!(polity.files.len(), 1);
+
+        // Depth-4 folder, with the "01 - " ordering prefix stripped to "Deep".
+        let deep_node = nodes
+            .iter()
+            .find(|n| {
+                n.rel_segments
+                    == vec![
+                        "GS2".to_string(),
+                        "Polity".to_string(),
+                        "Topic".to_string(),
+                        "Deep".to_string(),
+                    ]
+            })
+            .unwrap();
+        assert_eq!(deep_node.files.len(), 1);
+        assert_eq!(deep_node.files[0].file_type, "pdf");
+
+        // Unsupported extension skipped entirely.
+        assert!(nodes
+            .iter()
+            .all(|n| n.files.iter().all(|f| f.name != "ignore.xyz")));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

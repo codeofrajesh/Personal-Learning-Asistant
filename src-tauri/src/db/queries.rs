@@ -7,7 +7,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::scanner::walker::{ChapterGroup, ScannedFile};
+use crate::scanner::walker::{ScannedFile, ScannedNode};
 use crate::utils::errors::AppResult;
 
 /// Round-trip proof: write a key into `settings`, read it back, return it.
@@ -43,62 +43,66 @@ pub fn count_rows(conn: &Connection, table: &str) -> AppResult<i64> {
 // helper INSERTs, or on conflict bumps `updated_at` and returns the existing id, so
 // re-importing the same folder is idempotent and never duplicates rows.
 
-/// Get-or-create a goal by name, returning its id.
-pub fn upsert_goal(conn: &Connection, name: &str) -> AppResult<i64> {
+/// Get-or-create a ROOT node ("Goal") by name, returning its id. Roots have
+/// `parent_id IS NULL`, `depth = 0`, `kind = 'root'`.
+pub fn upsert_root_node(conn: &Connection, name: &str) -> AppResult<i64> {
+    // UNIQUE(parent_id, name) treats NULL parents as distinct in SQLite, so we can't rely
+    // on ON CONFLICT here — look up an existing root by name first.
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM nodes WHERE parent_id IS NULL AND name = ?1",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
     conn.execute(
-        "INSERT INTO goals(name) VALUES(?1)
-         ON CONFLICT(name) DO UPDATE SET updated_at = datetime('now')",
+        "INSERT INTO nodes(parent_id, name, kind, depth) VALUES(NULL, ?1, 'root', 0)",
         [name],
     )?;
-    let id: i64 = conn.query_row("SELECT id FROM goals WHERE name = ?1", [name], |r| r.get(0))?;
-    Ok(id)
+    Ok(conn.last_insert_rowid())
 }
 
-/// Get-or-create a subject within a goal, returning its id.
-pub fn upsert_subject(conn: &Connection, goal_id: i64, name: &str) -> AppResult<i64> {
+/// Get-or-create a child node named `name` under `parent_id`, returning its id. Depth is
+/// derived from the parent (`parent.depth + 1`). Idempotent on `UNIQUE(parent_id, name)`.
+pub fn upsert_child_node(conn: &Connection, parent_id: i64, name: &str) -> AppResult<i64> {
+    let parent_depth: i64 = conn
+        .query_row("SELECT depth FROM nodes WHERE id = ?1", [parent_id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .unwrap_or(0);
     conn.execute(
-        "INSERT INTO subjects(goal_id, name) VALUES(?1, ?2)
-         ON CONFLICT(goal_id, name) DO UPDATE SET updated_at = datetime('now')",
-        rusqlite::params![goal_id, name],
+        "INSERT INTO nodes(parent_id, name, kind, depth) VALUES(?1, ?2, 'folder', ?3)
+         ON CONFLICT(parent_id, name) DO UPDATE SET updated_at = datetime('now')",
+        rusqlite::params![parent_id, name, parent_depth + 1],
     )?;
     let id: i64 = conn.query_row(
-        "SELECT id FROM subjects WHERE goal_id = ?1 AND name = ?2",
-        rusqlite::params![goal_id, name],
+        "SELECT id FROM nodes WHERE parent_id = ?1 AND name = ?2",
+        rusqlite::params![parent_id, name],
         |r| r.get(0),
     )?;
     Ok(id)
 }
 
-/// Get-or-create a chapter within a subject, returning its id.
-pub fn upsert_chapter(conn: &Connection, subject_id: i64, name: &str) -> AppResult<i64> {
+/// Insert (or refresh) a single material row under `node_id`. Keyed on the UNIQUE
+/// `file_path` so a rescan updates the existing row instead of erroring or duplicating.
+pub fn insert_material(conn: &Connection, node_id: i64, file: &ScannedFile) -> AppResult<()> {
     conn.execute(
-        "INSERT INTO chapters(subject_id, name) VALUES(?1, ?2)
-         ON CONFLICT(subject_id, name) DO UPDATE SET updated_at = datetime('now')",
-        rusqlite::params![subject_id, name],
-    )?;
-    let id: i64 = conn.query_row(
-        "SELECT id FROM chapters WHERE subject_id = ?1 AND name = ?2",
-        rusqlite::params![subject_id, name],
-        |r| r.get(0),
-    )?;
-    Ok(id)
-}
-
-/// Insert (or refresh) a single material row. Keyed on the UNIQUE `file_path` so a
-/// rescan updates the existing row instead of erroring or duplicating.
-pub fn insert_material(conn: &Connection, chapter_id: i64, file: &ScannedFile) -> AppResult<()> {
-    conn.execute(
-        "INSERT INTO materials(chapter_id, file_path, file_name, file_type, file_extension, file_size_bytes)
+        "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension, file_size_bytes)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(file_path) DO UPDATE SET
-             chapter_id      = excluded.chapter_id,
+             node_id         = excluded.node_id,
              file_name       = excluded.file_name,
              file_type       = excluded.file_type,
              file_extension  = excluded.file_extension,
              file_size_bytes = excluded.file_size_bytes,
+             status          = 'active',
              updated_at      = datetime('now')",
         rusqlite::params![
-            chapter_id,
+            node_id,
             file.path,
             file.name,
             file.file_type,
@@ -116,56 +120,66 @@ pub struct ImportCounts {
     pub materials_imported: i64,
 }
 
-/// Persist all scanned chapter groups under `subject_id` in a **single transaction**
-/// (Section 3: batched inserts are ~50x faster than autocommit-per-row). A closure
-/// `on_chapter` is invoked after each chapter's files are written so the caller can
-/// emit progress without holding scan state here.
-pub fn import_chapter_groups(
+/// Persist a scanned folder tree under `root_node_id` in a **single transaction**. Each
+/// `ScannedNode`'s `rel_segments` are upserted as a chain of child nodes (cached so each
+/// folder is created once), then its files inserted under the deepest node. `on_progress`
+/// fires per folder group with the running material count.
+pub fn import_tree(
     conn: &mut Connection,
-    subject_id: i64,
-    groups: &[ChapterGroup],
-    mut on_chapter: impl FnMut(&str, i64),
+    root_node_id: i64,
+    nodes: &[ScannedNode],
+    mut on_progress: impl FnMut(&str, i64),
 ) -> AppResult<ImportCounts> {
+    use std::collections::HashMap;
     let tx = conn.transaction()?;
-    let mut chapters_created = 0i64;
+    let mut folders_created = 0i64;
     let mut materials_imported = 0i64;
+    // Cache "rel-path-key" → node_id so a folder shared by many files is upserted once.
+    let mut node_cache: HashMap<String, i64> = HashMap::new();
 
-    for group in groups {
-        let chapter_id = upsert_chapter(&tx, subject_id, &group.chapter)?;
-        chapters_created += 1;
+    for group in nodes {
+        // Resolve (creating as needed) the node chain for this folder's segments.
+        let mut parent = root_node_id;
+        let mut key = String::new();
+        for seg in &group.rel_segments {
+            key.push('/');
+            key.push_str(seg);
+            let node_id = if let Some(&cached) = node_cache.get(&key) {
+                cached
+            } else {
+                let id = upsert_child_node(&tx, parent, seg)?;
+                node_cache.insert(key.clone(), id);
+                folders_created += 1;
+                id
+            };
+            parent = node_id;
+        }
+        let label = group.rel_segments.last().cloned().unwrap_or_default();
         for file in &group.files {
-            insert_material(&tx, chapter_id, file)?;
+            insert_material(&tx, parent, file)?;
             materials_imported += 1;
         }
-        on_chapter(&group.chapter, materials_imported);
+        on_progress(&label, materials_imported);
     }
 
     tx.commit()?;
     Ok(ImportCounts {
-        chapters_created,
+        chapters_created: folders_created,
         materials_imported,
     })
 }
 
-/// Record a registered directory so we know it was imported (and, later, can watch
-/// or rescan it). Idempotent on the UNIQUE `path`. Returns the row id.
-pub fn insert_registered_dir(
-    conn: &Connection,
-    path: &str,
-    category_level: &str,
-    goal_id: i64,
-    subject_id: i64,
-) -> AppResult<i64> {
+/// Record a registered directory rooted at `root_node_id`. Idempotent on the UNIQUE
+/// `path`. Returns the row id.
+pub fn insert_registered_dir(conn: &Connection, path: &str, root_node_id: i64) -> AppResult<i64> {
     conn.execute(
-        "INSERT INTO registered_dirs(path, category_level, goal_id, subject_id, scan_status, last_scanned_at)
-         VALUES(?1, ?2, ?3, ?4, 'done', datetime('now'))
+        "INSERT INTO registered_dirs(path, root_node_id, scan_status, last_scanned_at)
+         VALUES(?1, ?2, 'done', datetime('now'))
          ON CONFLICT(path) DO UPDATE SET
-             category_level  = excluded.category_level,
-             goal_id         = excluded.goal_id,
-             subject_id      = excluded.subject_id,
+             root_node_id    = excluded.root_node_id,
              scan_status     = 'done',
              last_scanned_at = datetime('now')",
-        rusqlite::params![path, category_level, goal_id, subject_id],
+        rusqlite::params![path, root_node_id],
     )?;
     let id: i64 = conn.query_row(
         "SELECT id FROM registered_dirs WHERE path = ?1",
@@ -174,6 +188,40 @@ pub fn insert_registered_dir(
     )?;
     Ok(id)
 }
+
+// ── Node tree helpers (v6) ───────────────────────────────────────────────────
+//
+// A shared recursive-ancestor CTE resolves, for any material, its immediate parent node
+// (its "chapter"), its root ancestor (its "goal"), and its depth-1 ancestor (its
+// "subject"). This lets the existing dashboard/library DTOs keep their goal/subject/
+// chapter field names while the underlying store is an infinite-depth tree. For shallow
+// trees (a casual learner's single root with files directly under it) the root doubles as
+// the subject, so cards still render sensibly.
+
+/// SQL fragment (a set of CTEs) exposing per-material ancestry columns, usable by any
+/// query that then `JOIN mat_anc ON mat_anc.mid = m.id`. Columns:
+///   mid, chapter_id (parent node), chapter_name, subject_id, subject_name,
+///   goal_id, goal_name, root_id.
+pub const MAT_ANC_CTE: &str = "
+mat_anc AS (
+    WITH RECURSIVE up(mid, aid, aparent, aname, adepth) AS (
+        SELECT m.id, n.id, n.parent_id, n.name, n.depth
+        FROM materials m JOIN nodes n ON n.id = m.node_id
+        UNION ALL
+        SELECT up.mid, n.id, n.parent_id, n.name, n.depth
+        FROM up JOIN nodes n ON n.id = up.aparent
+    )
+    SELECT
+        m.id AS mid,
+        pn.id AS chapter_id, pn.name AS chapter_name,
+        COALESCE(sub.aid, root.aid) AS subject_id,
+        COALESCE(sub.aname, root.aname) AS subject_name,
+        root.aid AS goal_id, root.aname AS goal_name, root.aid AS root_id
+    FROM materials m
+    JOIN nodes pn ON pn.id = m.node_id
+    LEFT JOIN up root ON root.mid = m.id AND root.adepth = 0
+    LEFT JOIN up sub  ON sub.mid  = m.id AND sub.adepth  = 1
+)";
 
 /// A goal row plus rolled-up counts, for the Library grid.
 #[derive(Debug, serde::Serialize)]
@@ -190,19 +238,27 @@ pub struct GoalSummary {
 /// List every goal with rolled-up subject / material / completed counts, newest goal
 /// first. Powers the Library page grid.
 pub fn list_goals_with_counts(conn: &Connection) -> AppResult<Vec<GoalSummary>> {
+    // For each root node (goal): its direct-child count (≈ "subjects") and the rolled-up
+    // material counts across its ENTIRE subtree, via a recursive descendants CTE.
     let mut stmt = conn.prepare(
-        "SELECT
+        "WITH RECURSIVE
+         subtree(root_id, id) AS (
+             SELECT id, id FROM nodes WHERE parent_id IS NULL
+             UNION ALL
+             SELECT st.root_id, n.id FROM nodes n JOIN subtree st ON n.parent_id = st.id
+         )
+         SELECT
             g.id,
             g.name,
-            g.icon,
-            g.color,
-            COUNT(DISTINCT s.id)                              AS subject_count,
-            COUNT(m.id)                                       AS material_count,
+            COALESCE(g.icon, '🎯') AS icon,
+            COALESCE(g.color, '#AAFF00') AS color,
+            (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = g.id) AS subject_count,
+            COUNT(m.id) AS material_count,
             COALESCE(SUM(CASE WHEN m.is_completed = 1 THEN 1 ELSE 0 END), 0) AS completed_count
-         FROM goals g
-         LEFT JOIN subjects s ON s.goal_id = g.id
-         LEFT JOIN chapters c ON c.subject_id = s.id
-         LEFT JOIN materials m ON m.chapter_id = c.id
+         FROM nodes g
+         LEFT JOIN subtree st ON st.root_id = g.id
+         LEFT JOIN materials m ON m.node_id = st.id AND m.status = 'active'
+         WHERE g.parent_id IS NULL
          GROUP BY g.id
          ORDER BY g.id DESC",
     )?;
@@ -351,27 +407,22 @@ pub fn progress_stats(conn: &Connection) -> AppResult<ProgressStats> {
 /// Shared SELECT that joins a material up to its goal and its watch progress.
 /// Carries `subject_id` / `goal_id` (for the Courses "Continue Learning" card's
 /// "To the course" link + active-goal-pill highlight) and a subject cover thumbnail.
-const RECENT_SELECT: &str = "SELECT
-        m.id, m.file_name, m.file_type, m.chapter_id,
-        c.name, s.name, g.name,
-        COALESCE(CAST(wp.completion_pct AS INTEGER), 0),
-        m.is_completed, m.is_bookmarked,
-        s.id, g.id,
-        (SELECT m2.thumbnail_path
-           FROM materials m2
-           JOIN chapters c2 ON c2.id = m2.chapter_id
-           WHERE c2.subject_id = s.id
-             AND m2.file_type = 'video'
-             AND m2.thumbnail_path IS NOT NULL
-             AND m2.status = 'active'
-           ORDER BY RANDOM()
-           LIMIT 1) AS thumbnail_path
-     FROM materials m
-     JOIN chapters c ON c.id = m.chapter_id
-     JOIN subjects s ON s.id = c.subject_id
-     JOIN goals g ON g.id = s.goal_id
-     LEFT JOIN watch_progress wp ON wp.material_id = m.id
-     WHERE m.status = 'active'";
+fn recent_select() -> String {
+    format!(
+        "WITH {MAT_ANC_CTE}
+         SELECT
+            m.id, m.file_name, m.file_type, a.chapter_id,
+            a.chapter_name, a.subject_name, a.goal_name,
+            COALESCE(CAST(wp.completion_pct AS INTEGER), 0),
+            m.is_completed, m.is_bookmarked,
+            a.subject_id, a.goal_id,
+            m.thumbnail_path
+         FROM materials m
+         JOIN mat_anc a ON a.mid = m.id
+         LEFT JOIN watch_progress wp ON wp.material_id = m.id
+         WHERE m.status = 'active'"
+    )
+}
 
 fn map_recent(r: &rusqlite::Row) -> rusqlite::Result<RecentMaterial> {
     Ok(RecentMaterial {
@@ -395,10 +446,11 @@ fn map_recent(r: &rusqlite::Row) -> rusqlite::Result<RecentMaterial> {
 /// Falls back to newest-added when nothing has been opened yet.
 pub fn continue_learning(conn: &Connection, limit: i64) -> AppResult<Vec<RecentMaterial>> {
     let sql = format!(
-        "{RECENT_SELECT}
+        "{}
            AND m.last_opened_at IS NOT NULL
          ORDER BY m.last_opened_at DESC
-         LIMIT ?1"
+         LIMIT ?1",
+        recent_select()
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([limit], map_recent)?;
@@ -412,10 +464,11 @@ pub fn continue_learning(conn: &Connection, limit: i64) -> AppResult<Vec<RecentM
 /// Bookmarked materials for the Quick Access list (most recent first).
 pub fn bookmarked(conn: &Connection, limit: i64) -> AppResult<Vec<RecentMaterial>> {
     let sql = format!(
-        "{RECENT_SELECT}
+        "{}
            AND m.is_bookmarked = 1
          ORDER BY m.updated_at DESC
-         LIMIT ?1"
+         LIMIT ?1",
+        recent_select()
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([limit], map_recent)?;
@@ -493,42 +546,35 @@ pub fn next_up(conn: &Connection, limit: i64) -> AppResult<Vec<NextUpItem>> {
     // Per subject: the next lesson = the min-ordered active, not-completed material.
     // We rank materials within each subject by course order and take rank 1, then order
     // subjects by their latest `last_opened_at` (active courses first), then by newest.
-    let mut stmt = conn.prepare(
-        "WITH ranked AS (
+    let sql = format!(
+        "WITH {MAT_ANC_CTE},
+         ranked AS (
             SELECT
                 m.id, m.file_name, m.file_type,
-                c.name AS chapter_name,
-                s.id AS subject_id, s.name AS subject_name, g.name AS goal_name,
+                a.chapter_name AS chapter_name,
+                a.subject_id AS subject_id, a.subject_name AS subject_name,
+                a.goal_name AS goal_name,
                 ROW_NUMBER() OVER (
-                    PARTITION BY s.id
-                    ORDER BY c.sort_order, c.name, m.sort_order, m.file_name
+                    PARTITION BY a.subject_id
+                    ORDER BY m.sort_order, m.file_name
                 ) AS rn,
-                COUNT(*) OVER (PARTITION BY s.id) AS remaining,
+                COUNT(*) OVER (PARTITION BY a.subject_id) AS remaining,
                 (SELECT MAX(m3.last_opened_at)
-                   FROM materials m3
-                   JOIN chapters c3 ON c3.id = m3.chapter_id
-                   WHERE c3.subject_id = s.id) AS subject_last_opened,
-                (SELECT m2.thumbnail_path
-                   FROM materials m2
-                   JOIN chapters c2 ON c2.id = m2.chapter_id
-                   WHERE c2.subject_id = s.id
-                     AND m2.file_type = 'video'
-                     AND m2.thumbnail_path IS NOT NULL
-                     AND m2.status = 'active'
-                   ORDER BY RANDOM() LIMIT 1) AS thumbnail_path
+                   FROM materials m3 JOIN mat_anc a3 ON a3.mid = m3.id
+                   WHERE a3.subject_id = a.subject_id) AS subject_last_opened,
+                m.thumbnail_path AS thumbnail_path
             FROM materials m
-            JOIN chapters c ON c.id = m.chapter_id
-            JOIN subjects s ON s.id = c.subject_id
-            JOIN goals g ON g.id = s.goal_id
+            JOIN mat_anc a ON a.mid = m.id
             WHERE m.status = 'active' AND m.is_completed = 0
-        )
-        SELECT id, file_name, file_type, chapter_name,
-               subject_id, subject_name, goal_name, thumbnail_path, remaining
-        FROM ranked
-        WHERE rn = 1
-        ORDER BY (subject_last_opened IS NULL), subject_last_opened DESC, subject_id DESC
-        LIMIT ?1",
-    )?;
+         )
+         SELECT id, file_name, file_type, chapter_name,
+                subject_id, subject_name, goal_name, thumbnail_path, remaining
+         FROM ranked
+         WHERE rn = 1
+         ORDER BY (subject_last_opened IS NULL), subject_last_opened DESC, subject_id DESC
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([limit], |r| {
         Ok(NextUpItem {
             id: r.get(0)?,
@@ -642,7 +688,7 @@ pub struct MaterialRow {
 /// Fetch a goal's header fields. `NotFound` if the id doesn't exist.
 pub fn goal_detail(conn: &Connection, goal_id: i64) -> AppResult<GoalDetail> {
     conn.query_row(
-        "SELECT id, name, icon, color FROM goals WHERE id = ?1",
+        "SELECT id, name, COALESCE(icon, '🎯'), COALESCE(color, '#AAFF00') FROM nodes WHERE id = ?1",
         [goal_id],
         |r| {
             Ok(GoalDetail {
@@ -668,25 +714,33 @@ pub fn goal_detail(conn: &Connection, goal_id: i64) -> AppResult<GoalDetail> {
 /// independent of the outer aggregate join. Subjects per goal are few, so the per-row
 /// subquery is cheap; NULL when the subject has no video materials with thumbnails.
 pub fn list_subjects(conn: &Connection, goal_id: i64) -> AppResult<Vec<SubjectSummary>> {
+    // Each direct child of the goal node is a "subject". Its `chapter_count` is its own
+    // direct-child count; material/completed counts roll up its whole subtree; the cover
+    // is one video material's own thumbnail from anywhere in that subtree.
     let mut stmt = conn.prepare(
-        "SELECT
-            s.id, s.name, s.icon,
-            COUNT(DISTINCT c.id)                                            AS chapter_count,
-            COUNT(m.id)                                                     AS material_count,
+        "WITH RECURSIVE
+         subtree(sub_id, id) AS (
+             SELECT id, id FROM nodes WHERE parent_id = ?1
+             UNION ALL
+             SELECT st.sub_id, n.id FROM nodes n JOIN subtree st ON n.parent_id = st.id
+         )
+         SELECT
+            s.id, s.name, COALESCE(s.icon, '📚') AS icon,
+            (SELECT COUNT(*) FROM nodes cc WHERE cc.parent_id = s.id) AS chapter_count,
+            COUNT(m.id) AS material_count,
             COALESCE(SUM(CASE WHEN m.is_completed = 1 THEN 1 ELSE 0 END), 0) AS completed_count,
             (SELECT m2.thumbnail_path
                FROM materials m2
-               JOIN chapters c2 ON c2.id = m2.chapter_id
-               WHERE c2.subject_id = s.id
+               JOIN subtree st2 ON st2.id = m2.node_id
+               WHERE st2.sub_id = s.id
                  AND m2.file_type = 'video'
                  AND m2.thumbnail_path IS NOT NULL
                  AND m2.status = 'active'
-               ORDER BY RANDOM()
-               LIMIT 1)                                                     AS thumbnail_path
-         FROM subjects s
-         LEFT JOIN chapters c ON c.subject_id = s.id
-         LEFT JOIN materials m ON m.chapter_id = c.id AND m.status = 'active'
-         WHERE s.goal_id = ?1
+               ORDER BY RANDOM() LIMIT 1) AS thumbnail_path
+         FROM nodes s
+         LEFT JOIN subtree st ON st.sub_id = s.id
+         LEFT JOIN materials m ON m.node_id = st.id AND m.status = 'active'
+         WHERE s.parent_id = ?1
          GROUP BY s.id
          ORDER BY s.sort_order, s.name",
     )?;
@@ -710,17 +764,25 @@ pub fn list_subjects(conn: &Connection, goal_id: i64) -> AppResult<Vec<SubjectSu
 
 /// Fetch a subject's header + its parent goal. `NotFound` if absent.
 pub fn subject_detail(conn: &Connection, subject_id: i64) -> AppResult<SubjectDetail> {
+    // The node's root ancestor is its "goal". For a depth-1 node the parent IS the root;
+    // a recursive climb handles deeper nodes too (and a root asked as a subject → itself).
     conn.query_row(
-        "SELECT s.id, s.name, g.id, g.name
-         FROM subjects s JOIN goals g ON g.id = s.goal_id
-         WHERE s.id = ?1",
+        "WITH RECURSIVE up(id, parent_id, name, depth) AS (
+             SELECT id, parent_id, name, depth FROM nodes WHERE id = ?1
+             UNION ALL
+             SELECT n.id, n.parent_id, n.name, n.depth FROM nodes n JOIN up ON n.id = up.parent_id
+         )
+         SELECT
+            (SELECT name FROM nodes WHERE id = ?1),
+            (SELECT id FROM up WHERE depth = 0),
+            (SELECT name FROM up WHERE depth = 0)",
         [subject_id],
         |r| {
             Ok(SubjectDetail {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                goal_id: r.get(2)?,
-                goal_name: r.get(3)?,
+                id: subject_id,
+                name: r.get(0)?,
+                goal_id: r.get::<_, Option<i64>>(1)?.unwrap_or(subject_id),
+                goal_name: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
             })
         },
     )
@@ -734,14 +796,23 @@ pub fn subject_detail(conn: &Connection, subject_id: i64) -> AppResult<SubjectDe
 
 /// Chapters of a subject with material / completed counts.
 pub fn list_chapters(conn: &Connection, subject_id: i64) -> AppResult<Vec<ChapterSummary>> {
+    // Direct child nodes of the subject node = its "chapters"; counts roll up each
+    // chapter's subtree.
     let mut stmt = conn.prepare(
-        "SELECT
+        "WITH RECURSIVE
+         subtree(chap_id, id) AS (
+             SELECT id, id FROM nodes WHERE parent_id = ?1
+             UNION ALL
+             SELECT st.chap_id, n.id FROM nodes n JOIN subtree st ON n.parent_id = st.id
+         )
+         SELECT
             c.id, c.name,
-            COUNT(m.id)                                                     AS material_count,
+            COUNT(m.id) AS material_count,
             COALESCE(SUM(CASE WHEN m.is_completed = 1 THEN 1 ELSE 0 END), 0) AS completed_count
-         FROM chapters c
-         LEFT JOIN materials m ON m.chapter_id = c.id AND m.status = 'active'
-         WHERE c.subject_id = ?1
+         FROM nodes c
+         LEFT JOIN subtree st ON st.chap_id = c.id
+         LEFT JOIN materials m ON m.node_id = st.id AND m.status = 'active'
+         WHERE c.parent_id = ?1
          GROUP BY c.id
          ORDER BY c.sort_order, c.name",
     )?;
@@ -762,21 +833,34 @@ pub fn list_chapters(conn: &Connection, subject_id: i64) -> AppResult<Vec<Chapte
 
 /// Fetch a chapter's header + its full ancestry (subject + goal). `NotFound` if absent.
 pub fn chapter_detail(conn: &Connection, chapter_id: i64) -> AppResult<ChapterDetail> {
+    // Climb from this node to its root; the immediate parent is the "subject", the
+    // depth-0 ancestor is the "goal". Shallow trees fall back sensibly to the parent.
     conn.query_row(
-        "SELECT c.id, c.name, s.id, s.name, g.id, g.name
-         FROM chapters c
-         JOIN subjects s ON s.id = c.subject_id
-         JOIN goals g ON g.id = s.goal_id
-         WHERE c.id = ?1",
+        "WITH RECURSIVE up(id, parent_id, name, depth) AS (
+             SELECT id, parent_id, name, depth FROM nodes WHERE id = ?1
+             UNION ALL
+             SELECT n.id, n.parent_id, n.name, n.depth FROM nodes n JOIN up ON n.id = up.parent_id
+         )
+         SELECT
+            (SELECT name FROM nodes WHERE id = ?1),
+            (SELECT parent_id FROM nodes WHERE id = ?1),
+            (SELECT name FROM nodes WHERE id = (SELECT parent_id FROM nodes WHERE id = ?1)),
+            (SELECT id FROM up WHERE depth = 0),
+            (SELECT name FROM up WHERE depth = 0)",
         [chapter_id],
         |r| {
+            let name: String = r.get(0)?;
+            let subject_id: Option<i64> = r.get(1)?;
+            let subject_name: Option<String> = r.get(2)?;
+            let goal_id: Option<i64> = r.get(3)?;
+            let goal_name: Option<String> = r.get(4)?;
             Ok(ChapterDetail {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                subject_id: r.get(2)?,
-                subject_name: r.get(3)?,
-                goal_id: r.get(4)?,
-                goal_name: r.get(5)?,
+                id: chapter_id,
+                name,
+                subject_id: subject_id.unwrap_or(chapter_id),
+                subject_name: subject_name.unwrap_or_default(),
+                goal_id: goal_id.unwrap_or(chapter_id),
+                goal_name: goal_name.unwrap_or_default(),
             })
         },
     )
@@ -800,7 +884,7 @@ pub fn list_materials(conn: &Connection, chapter_id: i64) -> AppResult<Vec<Mater
             m.is_bookmarked, m.is_completed, m.status
          FROM materials m
          LEFT JOIN watch_progress wp ON wp.material_id = m.id
-         WHERE m.chapter_id = ?1 AND m.status IN ('active', 'missing')
+         WHERE m.node_id = ?1 AND m.status IN ('active', 'missing')
          ORDER BY (m.status = 'missing'), m.sort_order, m.file_name",
     )?;
     let rows = stmt.query_map([chapter_id], |r| {
@@ -859,18 +943,35 @@ pub struct CourseLesson {
 /// sequence then material sequence (missing files sort last within their chapter, so
 /// the ⚠️ badge stays grouped but doesn't displace available lessons).
 pub fn course_lessons(conn: &Connection, subject_id: i64) -> AppResult<Vec<CourseLesson>> {
+    // Walk the subject's subtree, tagging every descendant node with the "chapter" it
+    // rolls up to = the direct child of `subject_id` that is its ancestor-or-self. A
+    // material directly under the subject uses the subject itself as its chapter.
     let mut stmt = conn.prepare(
-        "SELECT
+        "WITH RECURSIVE tagged(id, chap_id, chap_name, chap_sort) AS (
+             -- Seed: the subject's direct children are their own chapter.
+             SELECT id, id, name, sort_order FROM nodes WHERE parent_id = ?1
+             UNION ALL
+             -- Descend: children inherit their parent's chapter tag.
+             SELECT n.id, t.chap_id, t.chap_name, t.chap_sort
+             FROM nodes n JOIN tagged t ON n.parent_id = t.id
+         ),
+         chap_map(id, chap_id, chap_name, chap_sort) AS (
+             SELECT id, chap_id, chap_name, chap_sort FROM tagged
+             UNION ALL
+             -- Materials directly under the subject node → chapter = the subject itself.
+             SELECT ?1, ?1, (SELECT name FROM nodes WHERE id = ?1), -1
+         )
+         SELECT
             m.id, m.file_name, m.file_type, m.file_extension,
             m.duration_secs, m.thumbnail_path,
             COALESCE(CAST(wp.completion_pct AS INTEGER), 0),
             m.is_bookmarked, m.is_completed, m.status,
-            c.id, c.name, c.sort_order, m.sort_order
+            cm.chap_id, cm.chap_name, cm.chap_sort, m.sort_order
          FROM materials m
-         JOIN chapters c ON c.id = m.chapter_id
+         JOIN chap_map cm ON cm.id = m.node_id
          LEFT JOIN watch_progress wp ON wp.material_id = m.id
-         WHERE c.subject_id = ?1 AND m.status IN ('active', 'missing')
-         ORDER BY c.sort_order, c.name, (m.status = 'missing'), m.sort_order, m.file_name",
+         WHERE m.status IN ('active', 'missing')
+         ORDER BY cm.chap_sort, cm.chap_name, (m.status = 'missing'), m.sort_order, m.file_name",
     )?;
     let rows = stmt.query_map([subject_id], |r| {
         Ok(CourseLesson {
@@ -924,46 +1025,47 @@ pub fn recommended_materials(
     material_id: i64,
     limit: i64,
 ) -> AppResult<Vec<Recommendation>> {
-    let mut stmt = conn.prepare(
-        "WITH cur AS (
-            SELECT m.id AS mid, m.chapter_id, m.sort_order, c.subject_id, s.goal_id
-            FROM materials m
-            JOIN chapters c ON c.id = m.chapter_id
-            JOIN subjects s ON s.id = c.subject_id
+    // "chapter" = the material's parent node, "subject" = its depth-1 ancestor, "goal" =
+    // its root. `cur` captures those for the current material; candidates are ranked by
+    // how closely they share that ancestry.
+    let sql = format!(
+        "WITH {MAT_ANC_CTE},
+         cur AS (
+            SELECT a.mid, a.chapter_id, m.sort_order, a.subject_id, a.goal_id
+            FROM materials m JOIN mat_anc a ON a.mid = m.id
             WHERE m.id = ?1
          )
          SELECT
             m.id, m.file_name, m.file_type, m.thumbnail_path, m.duration_secs,
             COALESCE(CAST(wp.completion_pct AS INTEGER), 0) AS progress_pct,
             m.is_completed,
-            s.id AS subject_id, s.name AS subject_name,
+            a.subject_id AS subject_id, a.subject_name AS subject_name,
             CASE
-                WHEN m.chapter_id = cur.chapter_id THEN 'next'
-                WHEN c.subject_id = cur.subject_id THEN 'course'
+                WHEN a.chapter_id = cur.chapter_id THEN 'next'
+                WHEN a.subject_id = cur.subject_id THEN 'course'
                 ELSE 'goal'
             END AS reason,
             CASE
-                WHEN m.chapter_id = cur.chapter_id THEN 0
-                WHEN c.subject_id = cur.subject_id THEN 1
+                WHEN a.chapter_id = cur.chapter_id THEN 0
+                WHEN a.subject_id = cur.subject_id THEN 1
                 ELSE 2
             END AS rank_bucket
          FROM materials m
-         JOIN chapters c ON c.id = m.chapter_id
-         JOIN subjects s ON s.id = c.subject_id
+         JOIN mat_anc a ON a.mid = m.id
          JOIN cur
          LEFT JOIN watch_progress wp ON wp.material_id = m.id
          WHERE m.status = 'active'
            AND m.id <> cur.mid
-           AND s.goal_id = cur.goal_id
+           AND a.goal_id = cur.goal_id
            AND m.is_completed = 0
-           -- 'next' bucket only counts lessons AFTER the current one in the chapter
-           AND NOT (m.chapter_id = cur.chapter_id AND m.sort_order < cur.sort_order)
+           AND NOT (a.chapter_id = cur.chapter_id AND m.sort_order < cur.sort_order)
          ORDER BY rank_bucket,
-                  CASE WHEN m.chapter_id = cur.chapter_id THEN m.sort_order ELSE 0 END,
-                  m.last_opened_at IS NOT NULL,   -- prefer unstarted within a bucket
+                  CASE WHEN a.chapter_id = cur.chapter_id THEN m.sort_order ELSE 0 END,
+                  m.last_opened_at IS NOT NULL,
                   m.sort_order, m.file_name
-         LIMIT ?2",
-    )?;
+         LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![material_id, limit], |r| {
         Ok(Recommendation {
             id: r.get(0)?,
@@ -989,15 +1091,15 @@ pub fn recommended_materials(
 /// or `None` if nothing has been opened yet. Used by the Courses page to default the
 /// goal pill tab to the learner's currently active goal.
 pub fn get_recent_goal(conn: &Connection) -> AppResult<Option<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.goal_id
-         FROM materials m
-         JOIN chapters c ON c.id = m.chapter_id
-         JOIN subjects s ON s.id = c.subject_id
+    let sql = format!(
+        "WITH {MAT_ANC_CTE}
+         SELECT a.goal_id
+         FROM materials m JOIN mat_anc a ON a.mid = m.id
          WHERE m.last_opened_at IS NOT NULL AND m.status = 'active'
          ORDER BY m.last_opened_at DESC
-         LIMIT 1",
-    )?;
+         LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
     match rows.next() {
         Some(v) => Ok(Some(v?)),
@@ -1040,20 +1142,23 @@ pub struct PlayerMaterial {
 /// Fetch everything a player needs to open + resume a material. Also stamps
 /// `last_opened_at = now` so Continue-Learning orders correctly. `NotFound` on bad id.
 pub fn material_for_player(conn: &Connection, material_id: i64) -> AppResult<PlayerMaterial> {
-    let material = conn
-        .query_row(
-            "SELECT
+    let sql = format!(
+        "WITH {MAT_ANC_CTE}
+             SELECT
                 m.id, m.file_path, m.file_name, m.file_type, m.file_extension,
                 m.duration_secs, m.thumbnail_path,
-                c.id, c.name, s.id, s.name, g.id, g.name,
+                a.chapter_id, a.chapter_name, a.subject_id, a.subject_name,
+                a.goal_id, a.goal_name,
                 COALESCE(wp.position_secs, 0.0),
                 m.is_completed, m.is_bookmarked
              FROM materials m
-             JOIN chapters c ON c.id = m.chapter_id
-             JOIN subjects s ON s.id = c.subject_id
-             JOIN goals g ON g.id = s.goal_id
+             JOIN mat_anc a ON a.mid = m.id
              LEFT JOIN watch_progress wp ON wp.material_id = m.id
-             WHERE m.id = ?1",
+             WHERE m.id = ?1"
+    );
+    let material = conn
+        .query_row(
+            &sql,
             [material_id],
             |r| {
                 Ok(PlayerMaterial {
@@ -1333,23 +1438,24 @@ pub fn search_materials(
     };
 
     // snippet() markers:  /  wrap the matched terms; "…" for ellipsis.
-    let sql = "SELECT
+    let sql = format!(
+        "WITH {MAT_ANC_CTE}
+         SELECT
             m.id, m.file_name, m.file_type,
-            c.id, c.name, s.name, g.name,
+            a.chapter_id, a.chapter_name, a.subject_name, a.goal_name,
             m.is_completed,
             snippet(materials_fts, 0, char(1), char(2), '…', 24)
          FROM materials_fts
          JOIN materials m ON m.id = materials_fts.rowid
-         JOIN chapters c ON c.id = m.chapter_id
-         JOIN subjects s ON s.id = c.subject_id
-         JOIN goals g ON g.id = s.goal_id
+         JOIN mat_anc a ON a.mid = m.id
          WHERE materials_fts MATCH ?1 AND m.status = 'active'
          ORDER BY bm25(materials_fts)
-         LIMIT 50";
+         LIMIT 50"
+    );
 
     let mut stmt = if let Some(ft) = file_type {
         if ft.eq_ignore_ascii_case("all") || ft.is_empty() {
-            conn.prepare(sql)?
+            conn.prepare(&sql)?
         } else {
             // Re-prepare with the type filter appended. (Prepared-statement cache key
             // differs by SQL text, so this is fine to do per-call.)
@@ -1360,7 +1466,7 @@ pub fn search_materials(
             conn.prepare(&filtered)?
         }
     } else {
-        conn.prepare(sql)?
+        conn.prepare(&sql)?
     };
 
     let rows = if let Some(ft) = file_type {
@@ -1467,18 +1573,18 @@ pub fn list_registered_dirs(conn: &Connection) -> AppResult<Vec<RegisteredDir>> 
 /// Internal row with the ids a rescan needs (not serialized).
 struct RegisteredDirRef {
     path: String,
-    subject_id: i64,
+    root_node_id: i64,
 }
 
 /// Look up a registered directory by id for rescanning. `NotFound` if absent.
 fn registered_dir_ref(conn: &Connection, id: i64) -> AppResult<RegisteredDirRef> {
     conn.query_row(
-        "SELECT path, subject_id FROM registered_dirs WHERE id = ?1",
+        "SELECT path, COALESCE(root_node_id, 0) FROM registered_dirs WHERE id = ?1",
         [id],
         |r| {
             Ok(RegisteredDirRef {
                 path: r.get(0)?,
-                subject_id: r.get(1)?,
+                root_node_id: r.get(1)?,
             })
         },
     )
@@ -1502,7 +1608,7 @@ pub fn remove_registered_dir(conn: &Connection, id: i64) -> AppResult<()> {
 /// subject id the caller needs; the actual walk+import happens in the command layer.
 pub fn registered_dir_for_rescan(conn: &Connection, id: i64) -> AppResult<(String, i64)> {
     let r = registered_dir_ref(conn, id)?;
-    Ok((r.path, r.subject_id))
+    Ok((r.path, r.root_node_id))
 }
 
 /// Stamp a registered dir's scan status after a rescan.
@@ -1515,11 +1621,11 @@ pub fn mark_dir_scanned(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// A watch root for the live watcher: (registered_dir id, absolute path, subject_id).
+/// A watch root for the live watcher: (registered_dir id, absolute path, root_node_id).
 pub fn active_watch_roots(conn: &Connection) -> AppResult<Vec<(i64, String, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, subject_id FROM registered_dirs
-         WHERE is_active = 1 AND subject_id IS NOT NULL
+        "SELECT id, path, root_node_id FROM registered_dirs
+         WHERE is_active = 1 AND root_node_id IS NOT NULL
          ORDER BY id",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -1536,33 +1642,42 @@ pub fn active_watch_roots(conn: &Connection) -> AppResult<Vec<(i64, String, i64)
     Ok(out)
 }
 
-/// Mark a subject's materials whose `file_path` is NOT in `seen` as `status='missing'`
-/// (Section 3: don't hard-delete — show "File not found" in the UI). Materials already
-/// missing stay missing; active ones not seen on disk flip to missing.
+/// Mark materials in a registered root's subtree whose `file_path` is NOT in `seen` as
+/// `status='missing'` (Section 3: don't hard-delete — show "File not found" in the UI).
+/// Materials already missing stay missing; active ones not seen on disk flip to missing.
+/// `root_node_id` is the registered dir's root node; the subtree CTE covers all depths.
 pub fn mark_subject_missing_except(
     conn: &Connection,
-    subject_id: i64,
+    root_node_id: i64,
     seen: &std::collections::HashSet<String>,
 ) -> AppResult<()> {
+    const SUBTREE_CTE: &str = "WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT n.id FROM nodes n JOIN subtree st ON n.parent_id = st.id
+        )";
     if seen.is_empty() {
-        // No files on disk at all → mark every active material of the subject missing.
+        // No files on disk at all → mark every active material in the subtree missing.
         conn.execute(
-            "UPDATE materials SET status='missing', updated_at=datetime('now')
-             WHERE chapter_id IN (SELECT id FROM chapters WHERE subject_id = ?1)
-               AND status='active'",
-            [subject_id],
+            &format!(
+                "{SUBTREE_CTE}
+                 UPDATE materials SET status='missing', updated_at=datetime('now')
+                 WHERE node_id IN (SELECT id FROM subtree) AND status='active'"
+            ),
+            [root_node_id],
         )?;
         return Ok(());
     }
 
     let placeholders = (0..seen.len()).map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "UPDATE materials SET status='missing', updated_at=datetime('now')
-         WHERE chapter_id IN (SELECT id FROM chapters WHERE subject_id = ?1)
+        "{SUBTREE_CTE}
+         UPDATE materials SET status='missing', updated_at=datetime('now')
+         WHERE node_id IN (SELECT id FROM subtree)
            AND status='active'
            AND file_path NOT IN ({placeholders})"
     );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(subject_id)];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(root_node_id)];
     for p in seen {
         params.push(Box::new(p.clone()));
     }
@@ -2024,7 +2139,15 @@ pub struct ExportPayload {
 pub fn build_export(conn: &Connection) -> AppResult<ExportPayload> {
     let mut goals_out: Vec<ExportGoal> = Vec::new();
 
-    let mut g_stmt = conn.prepare("SELECT id, name, icon, color FROM goals ORDER BY name")?;
+    // Export walks the tree's top THREE levels into the legacy goal/subject/chapter JSON
+    // shape (roots → children → grandchildren). Materials at any depth are attached to
+    // the nearest of those three ancestors so nothing is lost; deeper folder names beyond
+    // depth 2 are flattened into their depth-2 ancestor's chapter. (Round-trips the common
+    // case exactly; a full tree export format is a later enhancement.)
+    let mut g_stmt = conn.prepare(
+        "SELECT id, name, COALESCE(icon,'🎯'), COALESCE(color,'#AAFF00')
+         FROM nodes WHERE parent_id IS NULL ORDER BY name",
+    )?;
     let g_rows = g_stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -2037,8 +2160,9 @@ pub fn build_export(conn: &Connection) -> AppResult<ExportPayload> {
         let (gid, gname, gicon, gcolor) = g?;
         let mut subjects_out: Vec<ExportSubject> = Vec::new();
 
-        let mut s_stmt =
-            conn.prepare("SELECT id, name, icon FROM subjects WHERE goal_id = ?1 ORDER BY name")?;
+        let mut s_stmt = conn.prepare(
+            "SELECT id, name, COALESCE(icon,'📚') FROM nodes WHERE parent_id = ?1 ORDER BY name",
+        )?;
         let s_rows = s_stmt.query_map([gid], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -2051,21 +2175,26 @@ pub fn build_export(conn: &Connection) -> AppResult<ExportPayload> {
             let mut chapters_out: Vec<ExportChapter> = Vec::new();
 
             let mut c_stmt =
-                conn.prepare("SELECT id, name FROM chapters WHERE subject_id = ?1 ORDER BY name")?;
+                conn.prepare("SELECT id, name FROM nodes WHERE parent_id = ?1 ORDER BY name")?;
             let c_rows =
                 c_stmt.query_map([sid], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
             for c in c_rows {
                 let (cid, cname) = c?;
                 let mut mats_out: Vec<ExportMaterial> = Vec::new();
 
+                // Materials in this chapter node's whole subtree (covers depth >2 too).
                 let mut m_stmt = conn.prepare(
-                    "SELECT
+                    "WITH RECURSIVE subtree(id) AS (
+                        SELECT ?1 UNION ALL
+                        SELECT n.id FROM nodes n JOIN subtree st ON n.parent_id = st.id
+                     )
+                     SELECT
                         m.file_path, m.file_name, m.file_type, m.file_extension, m.file_size_bytes,
                         m.is_bookmarked, m.is_completed,
                         COALESCE(wp.position_secs, 0.0), COALESCE(wp.duration_secs, 0.0)
                      FROM materials m
                      LEFT JOIN watch_progress wp ON wp.material_id = m.id
-                     WHERE m.chapter_id = ?1 AND m.status = 'active'
+                     WHERE m.node_id IN (SELECT id FROM subtree) AND m.status = 'active'
                      ORDER BY m.file_name",
                 )?;
                 let m_rows = m_stmt.query_map([cid], |r| {
@@ -2139,27 +2268,39 @@ pub fn merge_import(conn: &mut Connection, payload: &ExportPayload) -> AppResult
     let mut counts = ImportSummary::default();
 
     for g in &payload.goals {
-        // Preserve the goal's icon/color on insert; on conflict keep existing (the
-        // user may have customized it locally).
-        tx.execute(
-            "INSERT INTO goals(name, icon, color) VALUES(?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET updated_at = datetime('now')",
-            rusqlite::params![g.name, g.icon, g.color],
-        )?;
-        let goal_id: i64 =
-            tx.query_row("SELECT id FROM goals WHERE name = ?1", [&g.name], |r| {
-                r.get(0)
-            })?;
+        // Goal → root node. Roots use NULL parent, so we can't ON CONFLICT — look up first.
+        let goal_id: i64 = if let Some(id) = tx
+            .query_row(
+                "SELECT id FROM nodes WHERE parent_id IS NULL AND name = ?1",
+                [&g.name],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            tx.execute(
+                "UPDATE nodes SET icon = COALESCE(icon, ?2), color = COALESCE(color, ?3),
+                     updated_at = datetime('now') WHERE id = ?1",
+                rusqlite::params![id, g.icon, g.color],
+            )?;
+            id
+        } else {
+            tx.execute(
+                "INSERT INTO nodes(parent_id, name, kind, icon, color, depth)
+                 VALUES(NULL, ?1, 'root', ?2, ?3, 0)",
+                rusqlite::params![g.name, g.icon, g.color],
+            )?;
+            tx.last_insert_rowid()
+        };
         counts.goals += 1;
 
         for s in &g.subjects {
             tx.execute(
-                "INSERT INTO subjects(goal_id, name, icon) VALUES(?1, ?2, ?3)
-                 ON CONFLICT(goal_id, name) DO UPDATE SET updated_at = datetime('now')",
+                "INSERT INTO nodes(parent_id, name, kind, icon, depth) VALUES(?1, ?2, 'folder', ?3, 1)
+                 ON CONFLICT(parent_id, name) DO UPDATE SET updated_at = datetime('now')",
                 rusqlite::params![goal_id, s.name, s.icon],
             )?;
             let subject_id: i64 = tx.query_row(
-                "SELECT id FROM subjects WHERE goal_id = ?1 AND name = ?2",
+                "SELECT id FROM nodes WHERE parent_id = ?1 AND name = ?2",
                 rusqlite::params![goal_id, s.name],
                 |r| r.get(0),
             )?;
@@ -2167,12 +2308,12 @@ pub fn merge_import(conn: &mut Connection, payload: &ExportPayload) -> AppResult
 
             for c in &s.chapters {
                 tx.execute(
-                    "INSERT INTO chapters(subject_id, name) VALUES(?1, ?2)
-                     ON CONFLICT(subject_id, name) DO UPDATE SET updated_at = datetime('now')",
+                    "INSERT INTO nodes(parent_id, name, kind, depth) VALUES(?1, ?2, 'folder', 2)
+                     ON CONFLICT(parent_id, name) DO UPDATE SET updated_at = datetime('now')",
                     rusqlite::params![subject_id, c.name],
                 )?;
                 let chapter_id: i64 = tx.query_row(
-                    "SELECT id FROM chapters WHERE subject_id = ?1 AND name = ?2",
+                    "SELECT id FROM nodes WHERE parent_id = ?1 AND name = ?2",
                     rusqlite::params![subject_id, c.name],
                     |r| r.get(0),
                 )?;
@@ -2181,11 +2322,11 @@ pub fn merge_import(conn: &mut Connection, payload: &ExportPayload) -> AppResult
                 for m in &c.materials {
                     tx.execute(
                         "INSERT INTO materials(
-                            chapter_id, file_path, file_name, file_type, file_extension,
+                            node_id, file_path, file_name, file_type, file_extension,
                             file_size_bytes, is_bookmarked, is_completed
                          ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                          ON CONFLICT(file_path) DO UPDATE SET
-                            chapter_id      = excluded.chapter_id,
+                            node_id         = excluded.node_id,
                             file_name       = excluded.file_name,
                             file_type       = excluded.file_type,
                             file_extension  = excluded.file_extension,

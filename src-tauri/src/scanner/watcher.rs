@@ -38,7 +38,7 @@ const LIBRARY_CHANGED_EVENT: &str = "library://changed";
 struct WatchRoot {
     dir_id: i64,
     path: String,
-    subject_id: i64,
+    root_node_id: i64,
 }
 
 /// Owns the `notify` watcher + the bookkeeping needed to map events to watch roots.
@@ -58,10 +58,10 @@ impl WatcherManager {
             .state::<Db>()
             .with(|conn| queries::active_watch_roots(conn))?
             .into_iter()
-            .map(|(id, path, subject_id)| WatchRoot {
+            .map(|(id, path, root_node_id)| WatchRoot {
                 dir_id: id,
                 path,
-                subject_id,
+                root_node_id,
             })
             .collect();
 
@@ -95,7 +95,7 @@ impl WatcherManager {
 
     /// Add a watch for a newly registered folder (called from `scan_and_import`).
     /// Idempotent — adding an already-watched path is a no-op at the notify level.
-    pub fn add_watch(app: &AppHandle, dir_id: i64, path: &str, subject_id: i64) {
+    pub fn add_watch(app: &AppHandle, dir_id: i64, path: &str, root_node_id: i64) {
         // Record the root (skip if the watcher isn't installed or the dir is already
         // tracked). Each `try_state` borrow is kept short to satisfy the borrow checker.
         let already_present = app
@@ -108,7 +108,7 @@ impl WatcherManager {
                 roots.push(WatchRoot {
                     dir_id,
                     path: path.to_string(),
-                    subject_id,
+                    root_node_id,
                 });
                 false
             })
@@ -191,21 +191,21 @@ fn rescan(app: &AppHandle, root: &WatchRoot) {
     if !dir.exists() {
         // Folder gone (drive disconnected / deleted) — mark its materials missing.
         let _ = app.state::<Db>().with(|conn| {
-            queries::mark_subject_missing_except(conn, root.subject_id, &HashSet::new())
+            queries::mark_subject_missing_except(conn, root.root_node_id, &HashSet::new())
         });
         let _ = app.emit(LIBRARY_CHANGED_EVENT, root.dir_id);
         return;
     }
 
-    let groups = walker::scan_dir(dir);
-    let seen: HashSet<String> = groups
+    let nodes = walker::scan_tree(dir);
+    let seen: HashSet<String> = nodes
         .iter()
         .flat_map(|g| g.files.iter().map(|f| f.path.clone()))
         .collect();
 
     let result: AppResult<()> = app.state::<Db>().with_mut(|conn| {
-        queries::import_chapter_groups(conn, root.subject_id, &groups, |_, _| {})?;
-        queries::mark_subject_missing_except(conn, root.subject_id, &seen)?;
+        queries::import_tree(conn, root.root_node_id, &nodes, |_, _| {})?;
+        queries::mark_subject_missing_except(conn, root.root_node_id, &seen)?;
         queries::mark_dir_scanned(conn, root.dir_id)?;
         Ok(())
     });

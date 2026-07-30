@@ -53,7 +53,7 @@ pub fn remove_registered_dir(app: AppHandle, db: State<'_, Db>, id: i64) -> AppR
 /// scanner's `ImportCounts` (chapters touched + materials imported).
 #[tauri::command]
 pub fn rescan_folder(app: AppHandle, db: State<'_, Db>, id: i64) -> AppResult<ImportCounts> {
-    let (path, subject_id) = db.with(|conn| queries::registered_dir_for_rescan(conn, id))?;
+    let (path, root_node_id) = db.with(|conn| queries::registered_dir_for_rescan(conn, id))?;
 
     let dir = Path::new(&path);
     if !dir.exists() {
@@ -71,16 +71,16 @@ pub fn rescan_folder(app: AppHandle, db: State<'_, Db>, id: i64) -> AppResult<Im
             done: false,
         },
     );
-    let groups = walker::scan_dir(dir);
-    let files_total: i64 = groups.iter().map(|g| g.files.len() as i64).sum();
+    let nodes = walker::scan_tree(dir);
+    let files_total: i64 = nodes.iter().map(|g| g.files.len() as i64).sum();
 
     let app_for_cb = app.clone();
     let counts = db.with_mut(|conn| {
-        queries::import_chapter_groups(conn, subject_id, &groups, |chapter, imported| {
+        queries::import_tree(conn, root_node_id, &nodes, |folder, imported| {
             let _ = app_for_cb.emit(
                 SCAN_PROGRESS_EVENT,
                 ScanProgress {
-                    stage: chapter.to_string(),
+                    stage: folder.to_string(),
                     files_imported: imported,
                     files_total,
                     done: false,
