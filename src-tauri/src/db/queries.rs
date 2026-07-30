@@ -257,9 +257,17 @@ pub fn insert_registered_dir(conn: &Connection, path: &str, root_node_id: i64) -
 ///   mid, chapter_id (parent node), chapter_name, subject_id, subject_name,
 ///   goal_id, goal_name, root_id.
 pub const MAT_ANC_CTE: &str = "
+mat_nodes(id) AS (
+    SELECT DISTINCT node_id FROM materials WHERE status = 'active'
+),
 node_anc AS (
+    -- Seed the ancestry climb ONLY from nodes that actually hold materials, not from every
+    -- node in the tree. `mat_anc` below only ever joins on material-bearing nodes, so the
+    -- ancestry of empty folders was pure waste — computing it for every node made
+    -- dashboard_data O(all-nodes * depth) on the UI hot path. Now it's O(material-nodes *
+    -- depth). The recursive climb still visits each seed node's parents up to its root.
     WITH RECURSIVE up(base_node, curr_node, parent, name, depth) AS (
-        SELECT id, id, parent_id, name, depth FROM nodes
+        SELECT id, id, parent_id, name, depth FROM nodes WHERE id IN (SELECT id FROM mat_nodes)
         UNION ALL
         SELECT up.base_node, n.id, n.parent_id, n.name, n.depth
         FROM up JOIN nodes n ON n.id = up.parent
@@ -275,6 +283,7 @@ node_anc AS (
     FROM nodes n
     LEFT JOIN up root ON root.base_node = n.id AND root.depth = 0
     LEFT JOIN up sub  ON sub.base_node = n.id AND sub.depth = 1
+    WHERE n.id IN (SELECT id FROM mat_nodes)
 ),
 mat_anc AS (
     SELECT m.id AS mid, a.chapter_id, a.chapter_name, a.subject_id, a.subject_name, a.goal_id, a.goal_name, a.goal_id AS root_id
@@ -2638,6 +2647,34 @@ mod tests {
             !insert_material(&conn, root, &changed).unwrap(),
             "then settles to a no-op again"
         );
+    }
+
+    /// The material-seeded MAT_ANC_CTE still resolves each material to its chapter/subject/
+    /// goal ancestry. Guards the nested-CTE scoping (inner `up` referencing outer
+    /// `mat_nodes`) and the shallow-tree fallback (root doubles as subject). rusqlite isn't
+    /// compile-checked, so this runs the real SQL.
+    #[test]
+    fn mat_anc_cte_resolves_ancestry_for_material_nodes() {
+        let mut conn = test_conn();
+        let root = upsert_root_node(&conn, "UPSC").unwrap();
+        // Nested tree: UPSC > Polity > Topic, with a file in Topic.
+        let nodes = vec![ScannedNode {
+            rel_segments: vec!["Polity".to_string(), "Topic".to_string()],
+            files: vec![file("/lib/Polity/Topic/x.mp4", "x.mp4", 1)],
+        }];
+        import_tree(&mut conn, root, &nodes, |_, _| {}).unwrap();
+
+        let sql = format!(
+            "WITH {MAT_ANC_CTE}
+             SELECT a.chapter_name, a.subject_name, a.goal_name
+             FROM materials m JOIN mat_anc a ON a.mid = m.id"
+        );
+        let (chapter, subject, goal): (String, String, String) = conn
+            .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("MAT_ANC_CTE query runs and returns a row");
+        assert_eq!(chapter, "Topic", "immediate parent node = chapter");
+        assert_eq!(subject, "Polity", "depth-1 ancestor = subject");
+        assert_eq!(goal, "UPSC", "root ancestor = goal");
     }
 
     /// import_tree reports only rows that actually changed, so an unchanged rescan of a

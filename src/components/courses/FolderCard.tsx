@@ -31,7 +31,7 @@ function FolderCardView({ node }: { node: NodeCardData }) {
   return (
     <Link
       to={`/courses/${id}`}
-      className="course-card group flex flex-col overflow-hidden rounded-card border border-white/[0.05] bg-white/[0.02] shadow-2xl backdrop-blur-md transition-all duration-200 hover:scale-[1.02] hover:border-white/10 hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+      className="course-card perf-card group flex flex-col overflow-hidden rounded-card border border-white/[0.05] bg-white/[0.02] shadow-2xl backdrop-blur-md transition-all duration-200 hover:scale-[1.02] hover:border-white/10 hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
     >
       <div className="relative aspect-video w-full overflow-hidden">
         <CoverArt

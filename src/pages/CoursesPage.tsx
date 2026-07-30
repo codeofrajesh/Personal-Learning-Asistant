@@ -22,7 +22,7 @@
  * cards + file rows re-stagger on each drill.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { gsap } from "gsap";
 import { Play, Plus, Bookmark, Check, ChevronRight, FileVideo, FileText, FileAudio, FileImage, File as FileLucide } from "lucide-react";
@@ -122,6 +122,31 @@ export default function CoursesPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Optimistic bookmark: flip the single row's state in place instead of refetching the
+  // whole node (the old `load()` replaced children/materials → full re-render + GSAP
+  // re-stagger + re-blur of every card just to toggle one star). Roll back on error.
+  const toggleBookmark = useCallback(async (materialId: number) => {
+    let nextValue = false;
+    setMaterials((prev) => {
+      if (!prev) return prev;
+      return prev.map((m) => {
+        if (m.id !== materialId) return m;
+        nextValue = !m.is_bookmarked;
+        return { ...m, is_bookmarked: nextValue };
+      });
+    });
+    try {
+      await ipc.setBookmark(materialId, nextValue);
+    } catch {
+      // Roll back the optimistic flip.
+      setMaterials((prev) =>
+        prev
+          ? prev.map((m) => (m.id === materialId ? { ...m, is_bookmarked: !nextValue } : m))
+          : prev,
+      );
+    }
+  }, []);
 
   // Live-refresh when a watched folder changes (new imports / rescans).
   useEffect(() => {
@@ -342,17 +367,12 @@ export default function CoursesPage() {
             <div className="flex flex-col gap-2.5">
               {materials!.map((m, i) => (
                 <div key={m.id} className="cv-row">
-                  <LessonRow 
-                    lesson={m} 
-                    idxLabel={String(i + 1).padStart(2, "0")} 
+                  <LessonRow
+                    lesson={m}
+                    idxLabel={String(i + 1).padStart(2, "0")}
                     missing={m.status === "missing"}
                     onOpen={() => navigate(`/library/material/${m.id}`, withSource("courses"))}
-                    onToggleBookmark={async () => {
-                      try {
-                        await ipc.setBookmark(m.id, !m.is_bookmarked);
-                        void load(); // Refresh data immediately
-                      } catch (e) {}
-                    }}
+                    onToggleBookmark={() => void toggleBookmark(m.id)}
                   />
                 </div>
               ))}
@@ -417,8 +437,13 @@ export default function CoursesPage() {
 /**
  * One lesson row: 3D numbered circle · title + muted metadata · bookmark · status.
  * Transparent background, faint bottom separator + 3D hover glow, no neon.
+ *
+ * Memoized: on a large folder, bookmarking one row previously re-rendered every row (the
+ * page refetched + replaced the whole list). With the optimistic in-place update + memo,
+ * only the toggled row re-renders. `onOpen`/`onToggleBookmark` are cheap inline closures;
+ * `lesson` is a stable object reference except for the row that actually changed.
  */
-function LessonRow({
+const LessonRow = memo(function LessonRow({
   lesson,
   idxLabel,
   missing,
@@ -533,7 +558,7 @@ function LessonRow({
       )}
     </div>
   );
-}
+});
 
 /** Seconds → `H:MM:SS` / `M:SS`. */
 function formatShortDuration(secs: number): string {
