@@ -465,10 +465,25 @@ function SoftwareUpdate() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState("Unknown");
+  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
 
   useEffect(() => {
     if (isTauri()) {
-      void import("@tauri-apps/api/app").then(m => m.getVersion().then(v => setVersion(v)));
+      void import("@tauri-apps/api/app").then(m => m.getVersion().then(v => {
+        setVersion(v);
+        // Track when this version was first seen to display as "Last updated"
+        const savedVersion = localStorage.getItem("ple_app_version");
+        const savedDate = localStorage.getItem("ple_last_updated");
+        
+        if (savedVersion !== v) {
+          const now = new Date().toLocaleString();
+          localStorage.setItem("ple_app_version", v);
+          localStorage.setItem("ple_last_updated", now);
+          setLastUpdated(now);
+        } else if (savedDate) {
+          setLastUpdated(savedDate);
+        }
+      }));
     }
   }, []);
 
@@ -488,7 +503,14 @@ function SoftwareUpdate() {
         setUpdateInfo("up-to-date");
       }
     } catch (e) {
-      setError(errMsg(e));
+      const msg = errMsg(e);
+      // If we get a 404 for latest.json, it means the release doesn't have an updater manifest yet.
+      // We can gracefully fall back to saying we're up to date.
+      if (msg.includes("404") || msg.includes("Could not fetch a valid release JSON")) {
+        setUpdateInfo("up-to-date");
+      } else {
+        setError(msg);
+      }
     } finally {
       setChecking(false);
     }
@@ -530,7 +552,10 @@ function SoftwareUpdate() {
         <div className="flex items-center justify-between rounded-btn bg-white/[0.03] px-4 py-3">
           <div>
             <p className="text-sm font-semibold text-content-primary">Current Version</p>
-            <p className="text-xs text-content-muted">v{version}</p>
+            <p className="text-xs text-content-muted">
+              v{version}
+              {lastUpdated && <span className="ml-2 text-[0.7rem] opacity-70">· Last updated: {lastUpdated}</span>}
+            </p>
           </div>
           <button
             type="button"
