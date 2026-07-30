@@ -649,11 +649,45 @@ so all gating is pure CSS (zero JS in the render/paint path):
   ensure_dir_root_node, tests), `db/schema.rs` (v7), `db/connection.rs` (v7 ALTER +
   `test_conn`), `scanner/metadata.rs`, `scanner/watcher.rs`.
 
-### 12.7 Still owed / next session
-- **LIVE SMOKE TEST (needs `npm run tauri dev`):** fullscreen enter/exit (no black frame /
-  lag), mini-player dock/undock, scan into a NEW goal + into an EXISTING node, drill the
-  browser, open a file; confirm rescan works from Settings and that the v7 migration applies
-  cleanly to a real pre-v7 DB. The node queries + scan flow are still only compile/test-checked.
-- `commands/mod.rs` `health_check` already points at `nodes` (fixed in 11.6).
+### 12.7 Tier refinement + draggable mini-player (session 2)
+Live testing on weak hardware showed **lite still stuttered**. Root cause: the tier was
+**CSS-only** — it scaled the glass finish but never touched JS motion or CSS hover/transition
+motion, so lite ran the *same* animation workload as high. Fixed the leak + built the
+requested resizable/draggable mini-player. Both phases committed; `npm run build` +
+`cargo build && cargo test --lib` (**12/12**) green.
+
+- **Motion is now tier-gated, not just reduced-motion-gated.** New `motionAllowed()` +
+  `currentTier()` in `perfStore.ts` (read `data-perf` synchronously; also honors
+  `prefers-reduced-motion`). Every GSAP entrance early-returns on `!motionAllowed()`:
+  `CoursesPage`, `Dashboard`, `CourseDetailPage`, `PlanningHub`, `CalendarTimeline`,
+  `ConsistencyHeatmap`. On **lite** the staggers don't run — folder cards / file rows /
+  widgets appear **instantly** (the drill/navigation stagger was the felt lag).
+- **Lite CSS motion kill-switch (`index.css`):** one sweep zeroes all transition/animation
+  duration+delay and cancels `:hover`/`:focus-visible` transforms app-wide — no `hover:scale`
+  repaint churn, no transition delays, instant cards (VLC / native-explorer feel), without
+  editing 25+ components. High/balanced keep the flair.
+- **`perf-card` content-visibility reserve corrected** 220px → **288px** (matches real card
+  height) so the scrollbar stops jumping as off-screen estimates are swapped for real cards.
+- **`FolderCard`** `transition-all` → scoped `transition-[transform,border-color,background-color]`
+  (helps balanced too; stops animating *every* property on hover).
+- **Draggable + resizable mini-player** (`MiniPlayer.tsx` + `miniPlayerStore.ts`): drag by
+  the video area, resize by the bottom-right grip. Architecture that keeps a weak CPU cool:
+  the gesture runs entirely on a **DOM ref inside a rAF loop** (pointermove writes a ref; one
+  rAF applies `transform: translate3d()` + width) — **zero React/zustand writes per move**.
+  mpv is **never repositioned mid-gesture**: on first travel the clip-path cutout is dropped
+  (`setRect(null)`) and a **freeze-frame placeholder** shows, so the decoder isn't asked to
+  move (no lag / no rapid-IPC crash). On release, **one** `setVideoMarginRatio` + one
+  `setRect` snaps mpv to the new rect. Frame (x/y/w; height derived 16:9 + strip) is
+  clamped on-screen (width 240–640), persisted to localStorage, re-clamped on window resize.
+  A no-travel click still expands to the full player (4px drag threshold).
+
+### 12.8 Still owed / next session
+- **LIVE SMOKE TEST (needs `npm run tauri dev`):** (a) tier feel — switch to **Lite** and
+  confirm buttery navigation (no entrance stagger, no hover scale, instant cards) vs **High**
+  restoring the full finish; (b) **mini-player drag + resize** — drag stays 60fps with the
+  freeze-frame during the gesture, snaps back to live video on release, survives navigation,
+  can't go off-screen; (c) still-open v6/v7 items from 12.7: fullscreen enter/exit, scan into
+  NEW + EXISTING node, drill browser, open file, rescan from Settings, v7 migration on a real
+  pre-v7 DB. Node queries + scan flow + v7 migration remain compile/test-checked only.
 - Consider surfacing the resolved tier + a "reduce effects" hint the first time a `lite`
   device is detected.
