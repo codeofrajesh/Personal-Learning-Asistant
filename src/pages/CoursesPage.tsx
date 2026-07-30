@@ -25,10 +25,11 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { gsap } from "gsap";
-import { Play, Plus, Bookmark, Check, ChevronRight, FileVideo, FileText, FileAudio, FileImage, File as FileLucide } from "lucide-react";
+import { Play, Plus, Bookmark, Check, ChevronRight, FileVideo, FileText, FileAudio, FileImage, File as FileLucide, Pin, Activity, Sparkles, LibraryBig } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
 import FolderCard from "../components/courses/FolderCard";
+import CourseHubSection from "../components/courses/CourseHubSection";
 
 import ProgressRing from "../components/courses/ProgressRing";
 import CoverArt from "../components/ui/CoverArt";
@@ -50,6 +51,15 @@ type Boot =
   | { kind: "ready" }
   | { kind: "preview" }
   | { kind: "error"; message: string };
+
+/** Data backing the root hub's sections (fetched only at `/courses`). */
+interface HubData {
+  all: NodeCard[];
+  pinned: NodeCard[];
+  inProgress: NodeCard[];
+  recent: NodeCard[];
+  continueLearning: RecentMaterial[];
+}
 
 const TYPE_GLYPH: Record<string, string> = {
   video: "🎬",
@@ -82,7 +92,10 @@ export default function CoursesPage() {
   const [children, setChildren] = useState<NodeCard[] | null>(null);
   const [materials, setMaterials] = useState<MaterialRowData[] | null>(null);
   const [crumbs, setCrumbs] = useState<NodeCrumb[]>([]);
-  const [recent, setRecent] = useState<RecentMaterial | null>(null);
+  const [hub, setHub] = useState<HubData | null>(null);
+  // Ids optimistically pinned/unpinned this session (overrides node.is_pinned in cards
+  // so a toggle doesn't need a hub refetch + GSAP re-stagger).
+  const [pinnedIds, setPinnedIds] = useState<Set<number>>(new Set());
   const openAddFolder = useMaterialManager((s) => s.openAddFolder);
   const importNonce = useMaterialManager((s) => s.importNonce);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -94,7 +107,9 @@ export default function CoursesPage() {
         ? err.message
         : String(err);
 
-  // ── load the current node: children + files + breadcrumb (+ continue card at root) ──
+  // ── load: at the root we build the multi-section HUB (Continue Learning, Pinned,
+  // In Progress, Recently Added, All Courses); inside a node we're the tree EXPLORER
+  // (child folders + files + breadcrumb). Two disjoint fetch sets keyed on isRoot. ──
   const load = useCallback(async () => {
     if (!isTauri()) {
       setBoot({ kind: "preview" });
@@ -104,21 +119,72 @@ export default function CoursesPage() {
     setChildren(null);
     setMaterials(null);
     try {
-      const [kids, files, ancestry, dash] = await Promise.all([
-        ipc.nodeChildren(nodeId),
-        isRoot ? Promise.resolve<MaterialRowData[]>([]) : ipc.nodeMaterials(nodeId),
-        isRoot ? Promise.resolve<NodeCrumb[]>([]) : ipc.nodeAncestors(nodeId),
-        isRoot ? ipc.dashboardData() : Promise.resolve(null),
-      ]);
-      setChildren(kids);
-      setMaterials(files);
-      setCrumbs(ancestry);
-      setRecent(dash ? (dash.continue_learning[0] ?? null) : null);
+      if (isRoot) {
+        const [all, pinned, inProgress, recent, dash] = await Promise.all([
+          ipc.nodeChildren(null),
+          ipc.pinnedNodes(),
+          ipc.nodesInProgress(),
+          ipc.recentNodes(),
+          ipc.dashboardData(),
+        ]);
+        setHub({
+          all,
+          pinned,
+          inProgress,
+          recent,
+          continueLearning: dash.continue_learning ?? [],
+        });
+        // Seed optimistic pin state from the server truth on every (re)load.
+        setPinnedIds(new Set(pinned.map((n) => n.id)));
+      } else {
+        const [kids, files, ancestry] = await Promise.all([
+          ipc.nodeChildren(nodeId),
+          ipc.nodeMaterials(nodeId),
+          ipc.nodeAncestors(nodeId),
+        ]);
+        setChildren(kids);
+        setMaterials(files);
+        setCrumbs(ancestry);
+      }
       setBoot({ kind: "ready" });
     } catch (err) {
       setBoot({ kind: "error", message: errMsg(err) });
     }
   }, [nodeId, isRoot]);
+
+  // Pin/unpin a node from the hub. Optimistically flip local state (no refetch → no GSAP
+  // re-stagger), then persist; roll back on error. Mirrors the bookmark toggle pattern.
+  const togglePin = useCallback(async (node: NodeCard) => {
+    const next = !(pinnedIds.has(node.id));
+    setPinnedIds((prev) => {
+      const copy = new Set(prev);
+      if (next) copy.add(node.id);
+      else copy.delete(node.id);
+      return copy;
+    });
+    try {
+      await ipc.setNodePinned(node.id, next);
+      // Keep the Pinned section's membership in sync without a full reload: add/remove
+      // this card from hub.pinned so it appears/disappears there immediately.
+      setHub((prev) => {
+        if (!prev) return prev;
+        const pinned = next
+          ? prev.pinned.some((n) => n.id === node.id)
+            ? prev.pinned
+            : [...prev.pinned, { ...node, is_pinned: true }]
+          : prev.pinned.filter((n) => n.id !== node.id);
+        return { ...prev, pinned };
+      });
+    } catch {
+      // Roll back the optimistic flip.
+      setPinnedIds((prev) => {
+        const copy = new Set(prev);
+        if (next) copy.delete(node.id);
+        else copy.add(node.id);
+        return copy;
+      });
+    }
+  }, [pinnedIds]);
 
   useEffect(() => {
     void load();
@@ -176,6 +242,16 @@ export default function CoursesPage() {
       if (document.querySelector(".continue-card")) {
         tl.from(".continue-card", { y: 24, opacity: 0 });
       }
+      // Hub: sections rise in sequence; the cards inside share a light per-section
+      // stagger. Inside a node: the folder cards / file rows stagger as before.
+      if (document.querySelector(".hub-section")) {
+        tl.fromTo(
+          ".hub-section",
+          { y: 20, opacity: 0 },
+          { y: 0, opacity: 1, stagger: 0.08 },
+          "-=0.15",
+        );
+      }
       if (document.querySelector(".course-card")) {
         tl.fromTo(
           ".course-card",
@@ -211,33 +287,36 @@ export default function CoursesPage() {
     })),
   ];
 
-  const recentPct = recent ? Math.max(0, Math.min(100, recent.progress_pct)) : 0;
   const childCount = children?.length ?? 0;
   const fileCount = materials?.length ?? 0;
-  const isEmpty =
-    boot.kind === "ready" && childCount === 0 && fileCount === 0;
+  const nodeEmpty =
+    !isRoot && boot.kind === "ready" && childCount === 0 && fileCount === 0;
+  const recent = hub?.continueLearning[0] ?? null;
+  const recentPct = recent ? Math.max(0, Math.min(100, recent.progress_pct)) : 0;
+  const hubEmpty =
+    isRoot && boot.kind === "ready" && (hub?.all.length ?? 0) === 0;
 
   return (
-    <div className="relative min-h-full p-6">
-      <div ref={rootRef} className="mx-auto max-w-7xl">
-        {/* Breadcrumb (scrolls when deep) + optional back button */}
-        <div className="flex items-center gap-3">
-          {!isRoot && (
+    <div className="relative min-h-full p-6 lg:p-10 xl:p-14">
+      <div ref={rootRef} className="mx-auto max-w-[100rem]">
+        {/* Breadcrumb (scrolls when deep) + optional back button — explorer only */}
+        {!isRoot && (
+          <div className="flex items-center gap-3">
             <BackButton to={parentId != null ? `/courses/${parentId}` : "/courses"} />
-          )}
-          <div className="min-w-0 flex-1 overflow-x-auto">
-            <Breadcrumb items={breadcrumbItems} />
+            <div className="min-w-0 flex-1 overflow-x-auto">
+              <Breadcrumb items={breadcrumbItems} />
+            </div>
           </div>
-        </div>
+        )}
 
-        <header className="mb-6 mt-3 flex items-end justify-between gap-4">
+        <header className={cn("mb-8 flex items-end justify-between gap-4", !isRoot && "mt-3")}>
           <div className="min-w-0">
-            <h1 className="font-display truncate text-2xl font-bold text-content-primary">
+            <h1 className="font-display truncate text-3xl font-bold text-content-primary">
               {currentName}
             </h1>
-            <p className="mt-1 text-sm text-content-muted">
+            <p className="mt-1.5 text-sm text-content-muted">
               {isRoot
-                ? "Browse your goals, or start something new."
+                ? "Your learning hub — pick up where you left off, or explore your library."
                 : `${childCount} folder${childCount === 1 ? "" : "s"}${
                     fileCount > 0
                       ? ` · ${fileCount} file${fileCount === 1 ? "" : "s"}`
@@ -253,83 +332,18 @@ export default function CoursesPage() {
           )}
         </header>
 
-        {/* Depth-cap cue (non-blocking) */}
-        {boot.kind === "ready" && maxCrumbDepth > DEPTH_CAP && (
+        {/* Depth-cap cue (non-blocking) — explorer only */}
+        {!isRoot && boot.kind === "ready" && maxCrumbDepth > DEPTH_CAP && (
           <div className="mb-6 rounded-card border border-orange/25 bg-orange/[0.05] px-3.5 py-2 text-xs text-orange/90">
             You're {maxCrumbDepth} levels deep. Very deep trees are harder to browse —
             consider flattening some folders.
           </div>
         )}
 
-        {/* Continue Learning featured card — root only */}
-        {boot.kind === "ready" && isRoot && recent && (
-          <section className="continue-card mb-10 overflow-hidden rounded-panel border border-white/[0.05] bg-white/[0.02] shadow-2xl backdrop-blur-md">
-            <div className="grid md:grid-cols-2">
-              <div className="relative aspect-video w-full overflow-hidden md:aspect-auto md:min-h-[18rem]">
-                <CoverArt
-                  thumbnailPath={recent.thumbnail_path}
-                  seed={recent.subject_id}
-                  glyph={TYPE_GLYPH[recent.file_type] ?? "📚"}
-                  className="h-full w-full"
-                />
-                <div className="pointer-events-none absolute inset-0 z-10 bg-gradient-to-t from-ink-900/70 via-transparent to-transparent" />
-              </div>
-
-              <div className="flex flex-col justify-between gap-6 p-6 lg:p-8">
-                <div>
-                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-lime">
-                    Continue Learning
-                  </p>
-                  <h2 className="font-display mt-2 text-2xl font-bold text-content-primary lg:text-3xl">
-                    {recent.subject_name}
-                  </h2>
-                  <p className="mt-2 text-sm text-content-muted">
-                    Up next · <span className="text-content-secondary">{recent.file_name}</span>
-                  </p>
-                  <p className="mt-1 text-xs text-content-faint">
-                    {recent.goal_name} · {recent.chapter_name}
-                  </p>
-                </div>
-
-                <div className="flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-4">
-                    <ProgressRing
-                      pct={recentPct}
-                      size={92}
-                      strokeWidth={9}
-                      ariaLabel={`${recent.subject_name} progress`}
-                    />
-                    <div className="hidden sm:block">
-                      <p className="text-sm font-semibold text-content-primary">
-                        {recentPct}% complete
-                      </p>
-                      <p className="text-xs text-content-muted">Keep the streak going.</p>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col gap-2">
-                    <Link to={`/courses/${recent.subject_id}`} className={btnPrimary}>
-                      To the course
-                    </Link>
-                    <Link
-                      to={`/library/material/${recent.id}`}
-                      state={{ source: "courses" }}
-                      className={btnGhost}
-                    >
-                      <Play size={14} strokeWidth={2.5} aria-hidden />
-                      Resume lesson
-                    </Link>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </section>
-        )}
-
         {/* Loading skeleton */}
         {boot.kind === "loading" && (
-          <div className="grid grid-cols-1 gap-gutter sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {Array.from({ length: 8 }).map((_, i) => (
+          <div className="grid grid-cols-2 gap-gutter lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+            {Array.from({ length: 10 }).map((_, i) => (
               <div
                 key={i}
                 className="h-64 animate-pulse rounded-card border border-glass-border bg-ink-800"
@@ -339,15 +353,133 @@ export default function CoursesPage() {
           </div>
         )}
 
-        {/* Folder grid */}
-        {boot.kind === "ready" && childCount > 0 && (
-          <section className="mb-10">
-            {!isRoot && (
-              <h2 className="font-display mb-4 text-sm font-semibold uppercase tracking-wide text-content-secondary">
-                Folders <span className="ml-1 text-xs font-normal text-content-faint">{childCount}</span>
-              </h2>
+        {/* ── ROOT: the multi-section EdTech hub ── */}
+        {isRoot && boot.kind === "ready" && !hubEmpty && (
+          <div className="space-y-12">
+            {/* Continue Learning — featured resume card */}
+            {recent && (
+              <section className="continue-card overflow-hidden rounded-panel border border-white/[0.05] bg-white/[0.02] shadow-2xl backdrop-blur-md">
+                <div className="grid md:grid-cols-2">
+                  <div className="relative aspect-video w-full overflow-hidden md:aspect-auto md:min-h-[18rem]">
+                    <CoverArt
+                      thumbnailPath={recent.thumbnail_path}
+                      seed={recent.subject_id}
+                      glyph={TYPE_GLYPH[recent.file_type] ?? "📚"}
+                      className="h-full w-full"
+                    />
+                    <div className="pointer-events-none absolute inset-0 z-10 bg-gradient-to-t from-ink-900/70 via-transparent to-transparent" />
+                  </div>
+
+                  <div className="flex flex-col justify-between gap-6 p-6 lg:p-8">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-lime">
+                        Continue Learning
+                      </p>
+                      <h2 className="font-display mt-2 text-2xl font-bold text-content-primary lg:text-3xl">
+                        {recent.subject_name}
+                      </h2>
+                      <p className="mt-2 text-sm text-content-muted">
+                        Up next · <span className="text-content-secondary">{recent.file_name}</span>
+                      </p>
+                      <p className="mt-1 text-xs text-content-faint">
+                        {recent.goal_name} · {recent.chapter_name}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="flex items-center gap-4">
+                        <ProgressRing
+                          pct={recentPct}
+                          size={92}
+                          strokeWidth={9}
+                          ariaLabel={`${recent.subject_name} progress`}
+                        />
+                        <div className="hidden sm:block">
+                          <p className="text-sm font-semibold text-content-primary">
+                            {recentPct}% complete
+                          </p>
+                          <p className="text-xs text-content-muted">Keep the streak going.</p>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col gap-2">
+                        <Link to={`/courses/${recent.subject_id}`} className={btnPrimary}>
+                          To the course
+                        </Link>
+                        <Link
+                          to={`/library/material/${recent.id}`}
+                          state={{ source: "courses" }}
+                          className={btnGhost}
+                        >
+                          <Play size={14} strokeWidth={2.5} aria-hidden />
+                          Resume lesson
+                        </Link>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
             )}
-            <div className="grid grid-cols-1 gap-gutter sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+
+            {/* Pinned — hidden entirely when nothing is pinned */}
+            {hub && hub.pinned.length > 0 && (
+              <CourseHubSection
+                title="Pinned"
+                icon={Pin}
+                nodes={hub.pinned}
+                exploreTo="/explore/pinned"
+                pinnedIds={pinnedIds}
+                onTogglePin={togglePin}
+              />
+            )}
+
+            {/* In Progress */}
+            {hub && hub.inProgress.length > 0 && (
+              <CourseHubSection
+                title="In Progress"
+                icon={Activity}
+                nodes={hub.inProgress}
+                exploreTo="/explore/in-progress"
+                accent="#22d3ee"
+                pinnedIds={pinnedIds}
+                onTogglePin={togglePin}
+              />
+            )}
+
+            {/* Recently Added */}
+            {hub && hub.recent.length > 0 && (
+              <CourseHubSection
+                title="Recently Added"
+                icon={Sparkles}
+                nodes={hub.recent}
+                exploreTo="/explore/recent"
+                accent="#f59e0b"
+                pinnedIds={pinnedIds}
+                onTogglePin={togglePin}
+              />
+            )}
+
+            {/* All Courses — the root goals */}
+            {hub && hub.all.length > 0 && (
+              <CourseHubSection
+                title="All Courses"
+                icon={LibraryBig}
+                nodes={hub.all}
+                exploreTo="/explore/all"
+                pinnedIds={pinnedIds}
+                onTogglePin={togglePin}
+              />
+            )}
+          </div>
+        )}
+
+        {/* ── EXPLORER: folders + files inside a node ── */}
+        {!isRoot && boot.kind === "ready" && childCount > 0 && (
+          <section className="mb-10">
+            <h2 className="font-display mb-4 text-sm font-semibold uppercase tracking-wide text-content-secondary">
+              Folders <span className="ml-1 text-xs font-normal text-content-faint">{childCount}</span>
+            </h2>
+            <div className="grid grid-cols-2 gap-gutter lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
               {children!.map((node) => (
                 <FolderCard key={node.id} node={node} />
               ))}
@@ -355,8 +487,7 @@ export default function CoursesPage() {
           </section>
         )}
 
-        {/* Files directly on this node */}
-        {boot.kind === "ready" && fileCount > 0 && (
+        {!isRoot && boot.kind === "ready" && fileCount > 0 && (
           <section>
             <h2 className="font-display mb-4 text-sm font-semibold uppercase tracking-wide text-content-secondary">
               Files <span className="ml-1 text-xs font-normal text-content-faint">{fileCount}</span>
@@ -377,8 +508,8 @@ export default function CoursesPage() {
           </section>
         )}
 
-        {/* Empty state */}
-        {isEmpty && (
+        {/* Empty states */}
+        {(nodeEmpty || hubEmpty) && (
           <div className="glass flex min-h-52 flex-col items-center justify-center gap-3 rounded-card p-card text-center">
             <div className="text-4xl" aria-hidden>📚</div>
             <div>

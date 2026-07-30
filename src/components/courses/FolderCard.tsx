@@ -14,8 +14,19 @@ import { Link } from "react-router-dom";
 import { ChevronRight, FolderOpen } from "lucide-react";
 import type { NodeCard as NodeCardData } from "../../lib/types";
 import CoverArt from "../ui/CoverArt";
+import PinButton from "./PinButton";
 
-function FolderCardView({ node }: { node: NodeCardData }) {
+function FolderCardView({
+  node,
+  pinned,
+  onTogglePin,
+}: {
+  node: NodeCardData;
+  /** Current pinned state (parent-controlled for optimistic toggles). Omit to hide the pin. */
+  pinned?: boolean;
+  /** When provided, renders the hub Pin overlay wired to this handler. */
+  onTogglePin?: () => void;
+}) {
   const {
     id,
     name,
@@ -27,11 +38,12 @@ function FolderCardView({ node }: { node: NodeCardData }) {
   } = node;
   const pct =
     material_count > 0 ? Math.round((completed_count / material_count) * 100) : 0;
+  const showPin = onTogglePin != null;
 
   return (
     <Link
       to={`/courses/${id}`}
-      className="course-card perf-card group flex flex-col overflow-hidden rounded-card border border-white/[0.05] bg-white/[0.02] shadow-2xl backdrop-blur-md transition-[transform,border-color,background-color] duration-200 hover:scale-[1.02] hover:border-white/10 hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+      className="course-card perf-card group relative flex flex-col overflow-hidden rounded-card border border-white/[0.05] bg-white/[0.02] shadow-2xl backdrop-blur-md transition-[transform,border-color,background-color] duration-200 hover:scale-[1.02] hover:border-white/10 hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
     >
       <div className="relative aspect-video w-full overflow-hidden">
         <CoverArt
@@ -44,6 +56,13 @@ function FolderCardView({ node }: { node: NodeCardData }) {
           <div className="absolute bottom-2 left-2 z-10 rounded-full bg-black/55 px-2 py-0.5 text-[11px] font-medium text-content-primary backdrop-blur-sm">
             {pct}% done
           </div>
+        )}
+        {showPin && (
+          <PinButton
+            pinned={pinned ?? false}
+            onToggle={onTogglePin}
+            className="absolute right-2 top-2 z-10"
+          />
         )}
       </div>
 

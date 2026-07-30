@@ -437,6 +437,10 @@ export interface NodeCard {
   completed_count: number;
   /** Cover image: one random video material's thumbnail from the subtree (null if none). */
   thumbnail_path: string | null;
+  /** Whether the user pinned this node to the Courses hub (v8). */
+  is_pinned: boolean;
+  /** Node creation timestamp (drives the hub's "Recently Added" sort). */
+  created_at: string;
 }
 
 /** One breadcrumb rung from `node_ancestors`, root-first (backend `NodeCrumb`). */

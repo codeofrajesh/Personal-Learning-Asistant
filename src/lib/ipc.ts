@@ -132,6 +132,28 @@ export const ipc = {
     return call<MaterialRow[]>("node_materials", { nodeId });
   },
 
+  // ── Courses hub sections (v8) ───────────────────────────────────────────────
+
+  /** Nodes the user pinned to the Courses hub ("Pinned" section + Explore Pinned). */
+  pinnedNodes(): Promise<NodeCard[]> {
+    return call<NodeCard[]>("pinned_nodes");
+  },
+
+  /** Root courses partway done ("In Progress" section + Explore). */
+  nodesInProgress(): Promise<NodeCard[]> {
+    return call<NodeCard[]>("nodes_in_progress");
+  },
+
+  /** Root courses newest-first ("Recently Added" section + Explore). */
+  recentNodes(): Promise<NodeCard[]> {
+    return call<NodeCard[]>("recent_nodes");
+  },
+
+  /** Pin or unpin a node (the hub "Pin" control). Mirrors `setBookmark`. */
+  setNodePinned(nodeId: number, pinned: boolean): Promise<void> {
+    return call<void>("set_node_pinned", { nodeId, pinned });
+  },
+
   /** Player: the material to open + siblings for the chapter sidebar. */
   openMaterial(materialId: number): Promise<PlayerView> {
     return call<PlayerView>("open_material", { materialId });
