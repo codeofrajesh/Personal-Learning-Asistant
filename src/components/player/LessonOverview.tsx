@@ -61,7 +61,9 @@ function LessonOverviewView({ siblings, currentId, source, embedded = false }: P
 
   useGSAP(() => {
     // Smooth reveal for the expanded active card details whenever expandedId changes
-    gsap.fromTo(".expanded-stagger", 
+    const targets = containerRef.current?.querySelectorAll(".expanded-stagger");
+    if (!targets || targets.length === 0) return;
+    gsap.fromTo(targets, 
       { height: 0, opacity: 0, scale: 0.98 },
       { height: "auto", opacity: 1, scale: 1, duration: 0.4, stagger: 0.05, ease: "power2.out", clearProps: "all" }
     );

@@ -15,7 +15,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import {
   Eye, EyeOff, ArrowUp, ArrowDown, Timer, Coffee, Moon, RotateCcw,
-  Folder, Palette, Play, Database, Info,
+  Folder, Palette, Play, Database, Info, DownloadCloud,
 } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import { useTimerStore, TIMER_DEFAULTS, type Phase } from "../lib/timerStore";
@@ -456,6 +456,133 @@ function About() {
   );
 }
 
+// ── Software Update ──────────────────────────────────────────────────────────
+
+function SoftwareUpdate() {
+  const [checking, setChecking] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<any>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [version, setVersion] = useState("Unknown");
+
+  useEffect(() => {
+    if (isTauri()) {
+      void import("@tauri-apps/api/app").then(m => m.getVersion().then(v => setVersion(v)));
+    }
+  }, []);
+
+  const checkForUpdates = async () => {
+    if (!navigator.onLine) {
+      setError("No internet connection.");
+      return;
+    }
+    setChecking(true);
+    setError(null);
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (update) {
+        setUpdateInfo(update);
+      } else {
+        setUpdateInfo("up-to-date");
+      }
+    } catch (e) {
+      setError(errMsg(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const installUpdate = async () => {
+    if (!updateInfo || typeof updateInfo === "string") return;
+    setDownloading(true);
+    setError(null);
+    let downloaded = 0;
+    try {
+      await updateInfo.downloadAndInstall((event: any) => {
+        switch (event.event) {
+          case 'Started':
+            setProgress(0);
+            break;
+          case 'Progress':
+            downloaded += event.data.chunkLength;
+            if (event.data.contentLength) {
+              setProgress(Math.round((downloaded / event.data.contentLength) * 100));
+            }
+            break;
+          case 'Finished':
+            setProgress(100);
+            break;
+        }
+      });
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (e) {
+      setError(errMsg(e));
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <Section title="Software Update" description="Check for new versions and install updates seamlessly over-the-air.">
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center justify-between rounded-btn bg-white/[0.03] px-4 py-3">
+          <div>
+            <p className="text-sm font-semibold text-content-primary">Current Version</p>
+            <p className="text-xs text-content-muted">v{version}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void checkForUpdates()}
+            disabled={checking || downloading}
+            className="rounded-btn border border-white/10 px-4 py-2 text-sm font-medium text-content-secondary transition-colors hover:bg-white/[0.05] hover:text-content-primary disabled:opacity-50"
+          >
+            {checking ? "Checking..." : "Check for Updates"}
+          </button>
+        </div>
+
+        {updateInfo === "up-to-date" && (
+          <p className="text-sm text-lime">You are already on the latest version.</p>
+        )}
+
+        {updateInfo && typeof updateInfo !== "string" && (
+          <div className="rounded-card border border-lime/20 bg-lime/5 p-4 shadow-[inset_0_0_20px_rgba(170,255,0,0.05)]">
+            <h3 className="text-sm font-semibold text-lime">Update Available: v{updateInfo.version}</h3>
+            {updateInfo.body && (
+              <div className="mt-2 whitespace-pre-wrap text-xs text-content-secondary">
+                {updateInfo.body}
+              </div>
+            )}
+            
+            {downloading ? (
+              <div className="mt-4 flex flex-col gap-2">
+                <div className="flex justify-between text-xs font-medium text-lime">
+                  <span>Downloading & Installing...</span>
+                  <span>{progress}%</span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-black/20">
+                  <div className="h-full bg-lime shadow-glow-lime transition-all duration-200" style={{ width: `${progress}%` }} />
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void installUpdate()}
+                className="mt-4 rounded-btn bg-lime px-4 py-2 text-sm font-semibold text-ink-900 shadow-glow-lime transition-transform hover:scale-[1.02]"
+              >
+                Install Update & Restart
+              </button>
+            )}
+          </div>
+        )}
+
+        {error && <p className="text-sm text-orange">{error}</p>}
+      </div>
+    </Section>
+  );
+}
+
 // ── Consistency Tracking (Planning Hub) ──────────────────────────────────────
 
 const CONSISTENCY_KEY = "consistency.enabled";
@@ -751,7 +878,7 @@ function DashboardWidgets() {
 
 // ── Page (two-pane: left-nav tab rail + content panel) ───────────────────────
 
-type CategoryId = "library" | "appearance" | "focus" | "playback" | "data" | "about";
+type CategoryId = "library" | "appearance" | "focus" | "playback" | "data" | "update" | "about";
 
 interface Category {
   id: CategoryId;
@@ -806,6 +933,13 @@ const CATEGORIES: Category[] = [
     icon: Database,
     description: "Export, back up, or import your local data.",
     render: () => <DataManagement />,
+  },
+  {
+    id: "update",
+    label: "Software Update",
+    icon: DownloadCloud,
+    description: "Over-the-air app updates.",
+    render: () => <SoftwareUpdate />,
   },
   {
     id: "about",

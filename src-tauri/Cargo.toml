@@ -41,6 +41,8 @@ thiserror = "1"
 log = "0.4"
 tauri-plugin-libmpv = "0.3.2"
 tauri-plugin-shell = "2.3.5"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
 
 [profile.release]
 # Optimize for the small-binary / low-memory target (Section 1: 30-50MB idle).

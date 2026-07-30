@@ -100,36 +100,37 @@ export default function AppShell() {
   const floating = !isPlayerRoute;
 
   return (
-    <div className="relative flex h-full w-full overflow-hidden">
+    <div 
+      className="relative flex h-full w-full overflow-hidden"
+      style={
+        miniRect
+          ? {
+              clipPath: `polygon(
+                0% 0%, 
+                100% 0%, 
+                100% 100%, 
+                0% 100%, 
+                0% ${miniRect.y}px, 
+                ${miniRect.x}px ${miniRect.y}px, 
+                ${miniRect.x}px ${miniRect.y + miniRect.h}px, 
+                ${miniRect.x + miniRect.w}px ${miniRect.y + miniRect.h}px, 
+                ${miniRect.x + miniRect.w}px ${miniRect.y}px, 
+                0% ${miniRect.y}px
+              )`,
+            }
+          : undefined
+      }
+    >
       {/* ── Unified app canvas (non-player only) ──────────────────────────────
           One dark gradient + two cinematic lime/cyan blobs behind the whole app, so
           the floating sidebar + pages hover over a single continuous background. The
           player route omits this (its window stays transparent for the mpv overlay).
 
           When the docked mini-player is active, we punch a transparent notch through
-          this canvas (via clip-path) so MPV's native surface (behind the webview) shows
-          through the mini card. */}
+          the entire AppShell (via clip-path on the root) so MPV's native surface (behind
+          the webview) shows through the mini card, cutting out overlapping page content. */}
       {floating && !appFullscreen && (
-        <div
-          aria-hidden
-          className="pointer-events-none absolute inset-0 -z-10"
-          style={
-            miniRect
-              ? {
-                  clipPath: `polygon(
-                    0 0,
-                    100% 0,
-                    100% ${miniRect.y}px,
-                    ${miniRect.x + miniRect.w}px ${miniRect.y}px,
-                    ${miniRect.x + miniRect.w}px ${miniRect.y + miniRect.h}px,
-                    ${miniRect.x}px ${miniRect.y + miniRect.h}px,
-                    ${miniRect.x}px ${miniRect.y}px,
-                    0 ${miniRect.y}px
-                  )`,
-                }
-              : undefined
-          }
-        >
+        <div aria-hidden className="pointer-events-none absolute inset-0 -z-10">
           <div className="absolute inset-0 -z-20 bg-gradient-to-br from-[#0C0C0C] to-[#050505]" />
           <div className="absolute left-[-8%] top-[-12%] -z-10 h-[55%] w-[42%] rounded-full bg-lime/10 blur-[150px]" />
           <div className="absolute bottom-[-14%] right-[-6%] -z-10 h-[50%] w-[38%] rounded-full bg-cyan-400/10 blur-[140px]" />

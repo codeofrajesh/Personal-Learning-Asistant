@@ -58,8 +58,8 @@ export default function PlayerPage() {
   // Mirror the Tauri OS-window fullscreen state so the page can hide its chrome
   // (header, right panel, description) and fix the video anchor to fill the screen.
   const [isFullscreen, setIsFullscreen] = useState(false);
-  // Right-panel tab: the lesson list, or timestamped notes (video only).
-  const [rightTab, setRightTab] = useState<"lessons" | "notes">("lessons");
+  // Right-panel tab: the lesson list, timestamped notes (video only), or suggested lectures.
+  const [rightTab, setRightTab] = useState<"lessons" | "notes" | "suggested">("lessons");
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -252,7 +252,14 @@ export default function PlayerPage() {
             {state.kind === "ready" && material && material.file_type === "video" && (
               usingMpv ? (
                 <Suspense fallback={null}>
-                  <MpvVideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} fileName={material.file_name} onFail={onMpvFail} />
+                  <MpvVideoPlayer 
+                    path={material.file_path} 
+                    materialId={material.id} 
+                    startPosition={material.position_secs} 
+                    fileName={material.file_name} 
+                    onFail={onMpvFail} 
+                    onPip={() => navigate(playerParent, { state: { source } })}
+                  />
                 </Suspense>
               ) : (
                 <VideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
@@ -273,48 +280,61 @@ export default function PlayerPage() {
         <div className="flex min-h-0 flex-1">
           {/* Middle column — transparent, with opaque borders for breathing gaps */}
           <div className="flex min-w-0 flex-1 flex-col border-l-4 border-t-4 border-ink-900">
-            {/* Video frame — fluidly fills the space, native player handles aspect ratio natively */}
-            <div className="relative flex-1 w-full min-h-[400px] overflow-hidden shadow-2xl">
-              <div className={"absolute inset-0 " + (usingMpv ? "" : "bg-black")}>
-                {state.kind === "loading" && (
-                  <div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading…</div>
-                )}
-                {state.kind === "ready" && material && material.file_type === "video" && (
-                  usingMpv ? (
-                    <Suspense fallback={<div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading player…</div>}>
-                      <MpvVideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} fileName={material.file_name} onFail={onMpvFail} />
-                    </Suspense>
-                  ) : (
-                    <VideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
-                  )
-                )}
-                {state.kind === "ready" && material && material.file_type === "audio" && (
-                  <AudioPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
-                )}
-                {state.kind === "ready" && material && material.file_type === "pdf" && (
-                  <PdfViewer path={material.file_path} />
-                )}
-                {state.kind === "ready" && material && material.file_type === "image" && (
-                  <ImageViewer path={material.file_path} />
-                )}
-                {state.kind === "ready" && material && material.file_type === "note" && (
-                  <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-content-muted">Note preview arrives in a later milestone.</div>
-                )}
-                {state.kind === "preview" && (
-                  <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-content-muted">Preview mode — open inside the desktop app.</div>
-                )}
-                {state.kind === "error" && (
-                  <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-orange">
-                    {state.message}
-                    <button type="button" onClick={() => void load()} className="ml-3 rounded-btn border border-orange/40 px-2.5 py-1 text-xs text-orange hover:bg-orange/10">Retry</button>
-                  </div>
-                )}
+            {/* Video frame — flex space with min-h, centering the perfectly aspect-locked video box */}
+            <div className="relative flex-1 w-full min-h-[300px] overflow-hidden shadow-2xl flex items-center justify-center">
+              {/* Aspect Ratio lock container with shadow hack to draw pillarboxes while keeping the center transparent */}
+              <div 
+                className={"relative aspect-video max-w-full max-h-full shadow-[0_0_0_9999px_#000] " + (usingMpv ? "" : "bg-black")} 
+                style={{ height: "100%" }}
+              >
+                <div className="absolute inset-0">
+                  {state.kind === "loading" && (
+                    <div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading…</div>
+                  )}
+                  {state.kind === "ready" && material && material.file_type === "video" && (
+                    usingMpv ? (
+                      <Suspense fallback={<div className="grid h-full place-items-center bg-ink-900 text-sm text-content-muted">Loading player…</div>}>
+                        <MpvVideoPlayer 
+                          path={material.file_path} 
+                          materialId={material.id} 
+                          startPosition={material.position_secs} 
+                          fileName={material.file_name} 
+                          onFail={onMpvFail} 
+                          onPip={() => navigate(playerParent, { state: { source } })}
+                        />
+                      </Suspense>
+                    ) : (
+                      <VideoPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
+                    )
+                  )}
+                  {state.kind === "ready" && material && material.file_type === "audio" && (
+                    <AudioPlayer path={material.file_path} materialId={material.id} startPosition={material.position_secs} />
+                  )}
+                  {state.kind === "ready" && material && material.file_type === "pdf" && (
+                    <PdfViewer path={material.file_path} />
+                  )}
+                  {state.kind === "ready" && material && material.file_type === "image" && (
+                    <ImageViewer path={material.file_path} />
+                  )}
+                  {state.kind === "ready" && material && material.file_type === "note" && (
+                    <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-content-muted">Note preview arrives in a later milestone.</div>
+                  )}
+                  {state.kind === "preview" && (
+                    <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-content-muted">Preview mode — open inside the desktop app.</div>
+                  )}
+                  {state.kind === "error" && (
+                    <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-orange">
+                      {state.message}
+                      <button type="button" onClick={() => void load()} className="ml-3 rounded-btn border border-orange/40 px-2.5 py-1 text-xs text-orange hover:bg-orange/10">Retry</button>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
             {/* Description section (compact at the bottom) */}
             {state.kind === "ready" && material && (
-              <div className="shrink-0 overflow-y-auto bg-ink-900 px-6 pb-4 pt-5 scroll-thin border-t border-glass-border">
+              <div className="shrink-0 bg-ink-900 px-6 pb-4 pt-4 border-t border-glass-border">
                 <div className="flex items-center gap-2 text-sm text-content-muted">
                   <span>{TYPE_GLYPH[material.file_type] ?? "📁"}</span>
                   <span className="uppercase tracking-wide">{material.file_type}</span>
@@ -345,9 +365,6 @@ export default function PlayerPage() {
                 <p className="mt-2 text-xs text-content-faint">
                   File: {material.file_name} · Type: {material.file_type.toUpperCase()}
                 </p>
-
-                {/* Suggested lectures (next-in-series → same course → same goal). */}
-                <Recommendations materialId={material.id} source={source} />
               </div>
             )}
           </div>
@@ -359,7 +376,7 @@ export default function PlayerPage() {
                 <div className="flex min-h-0 w-[480px] flex-1 flex-col px-6 pb-6 pt-6">
                   {/* Tab switch */}
                   <div className="mb-4 flex shrink-0 items-center gap-1 self-start rounded-full border border-white/[0.06] bg-white/[0.02] p-1">
-                    {(["lessons", "notes"] as const).map((t) => (
+                    {(["lessons", "notes", "suggested"] as const).map((t) => (
                       <button
                         key={t}
                         type="button"
@@ -379,8 +396,12 @@ export default function PlayerPage() {
                   <div className="min-h-0 flex-1">
                     {rightTab === "lessons" ? (
                       <LessonOverview siblings={siblings} currentId={material.id} source={source} embedded />
-                    ) : (
+                    ) : rightTab === "notes" ? (
                       <NotesPanel materialId={material.id} />
+                    ) : (
+                      <div className="h-full overflow-y-auto scroll-thin pr-2">
+                        <Recommendations materialId={material.id} source={source} />
+                      </div>
                     )}
                   </div>
                 </div>

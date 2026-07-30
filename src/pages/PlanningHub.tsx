@@ -31,7 +31,10 @@ export default function PlanningHub() {
     if (!planning.loaded || planning.preview) return;
     if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
     const ctx = gsap.context(() => {
-      gsap.from(".plan-panel", { y: 20, opacity: 0, duration: 0.5, ease: "power2.out", stagger: 0.1 });
+      const targets = rootRef.current?.querySelectorAll(".plan-panel");
+      if (targets && targets.length > 0) {
+        gsap.from(targets, { y: 20, opacity: 0, duration: 0.5, ease: "power2.out", stagger: 0.1 });
+      }
     }, rootRef);
     return () => ctx.revert();
   }, [planning.loaded, planning.preview, tab]);

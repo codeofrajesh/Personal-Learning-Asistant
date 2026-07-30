@@ -21,6 +21,8 @@ pub fn run() {
         .plugin(tauri_plugin_libmpv::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Resolve the Tauri-managed app data dir and open `ple.db` there
             // (Section 1: store DB in app_data_dir).

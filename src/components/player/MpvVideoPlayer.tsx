@@ -16,6 +16,8 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { PictureInPicture2 } from "lucide-react";
 import {
   command,
   init,
@@ -81,9 +83,12 @@ interface Props {
   /** Called if mpv fails to initialize or playback doesn't start — PlayerPage falls
    *  back to the HTML5 player. */
   onFail?: () => void;
+  /** Custom navigation handler for PiP button, to avoid getting stuck in player history. */
+  onPip?: () => void;
 }
 
-export default function MpvVideoPlayer({ path, materialId, startPosition, fileName, onFail }: Props) {
+export default function MpvVideoPlayer({ path, materialId, startPosition, fileName, onFail, onPip }: Props) {
+  const navigate = useNavigate();
   const setMiniActive = useMiniPlayer((s) => s.setActive);
   // The transparent "anchor" div — mpv renders to the OS window behind the webview,
   // showing through this hole. ResizeObserver keeps mpv's bounding box pinned to it.
@@ -833,6 +838,17 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               </div>
             )}
           </div>
+
+          {/* Picture in Picture (Mini Player) */}
+          <button
+            type="button"
+            onClick={onPip || (() => navigate(-1))}
+            className="shrink-0 rounded-full p-2 text-content-secondary transition-colors hover:bg-white/[0.1] hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20"
+            aria-label="Enter mini player"
+            title="Mini Player"
+          >
+            <PictureInPicture2 size={18} />
+          </button>
 
           {/* Fullscreen */}
           <button

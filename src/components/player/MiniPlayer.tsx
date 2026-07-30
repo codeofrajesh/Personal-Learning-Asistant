@@ -103,7 +103,7 @@ export default function MiniPlayer() {
 
   return (
     <div className="pointer-events-none fixed bottom-5 right-5 z-[70] w-80">
-      <div className="pointer-events-auto overflow-hidden rounded-[16px] border border-white/[0.1] bg-ink-900/70 shadow-2xl backdrop-blur-xl [box-shadow:0_20px_50px_-12px_rgba(0,0,0,0.7),inset_0_1px_1px_rgba(255,255,255,0.08)]">
+      <div className="pointer-events-auto overflow-hidden rounded-[16px] border border-white/[0.1] shadow-2xl [box-shadow:0_20px_50px_-12px_rgba(0,0,0,0.7),inset_0_1px_1px_rgba(255,255,255,0.08)]">
         {/* Transparent video anchor — MPV draws through here (16:9). */}
         <div
           ref={anchorRef}
@@ -121,7 +121,7 @@ export default function MiniPlayer() {
         />
 
         {/* Control strip */}
-        <div className="flex items-center gap-2 px-2.5 py-2">
+        <div className="flex items-center gap-2 bg-ink-900/80 px-2.5 py-2 backdrop-blur-xl">
           <button
             type="button"
             onClick={togglePlay}
