@@ -16,6 +16,7 @@ import AppShell from "./components/layout/AppShell";
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const CoursesPage = lazy(() => import("./pages/CoursesPage"));
+const ExploreCategoryPage = lazy(() => import("./pages/ExploreCategoryPage"));
 const PlanningHub = lazy(() => import("./pages/PlanningHub"));
 const PlayerPage = lazy(() => import("./pages/PlayerPage"));
 const Settings = lazy(() => import("./pages/Settings"));
@@ -68,6 +69,15 @@ export default function App() {
             element={
               <Suspense fallback={<PageFallback />}>
                 <CoursesPage />
+              </Suspense>
+            }
+          />
+          {/* Courses hub "Explore ›" drill-downs — full category lists. */}
+          <Route
+            path="explore/:category"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <ExploreCategoryPage />
               </Suspense>
             }
           />
