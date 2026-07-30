@@ -560,3 +560,100 @@ unlimited in the DB).
 
 Verification at handoff: `cargo build` clean; `cargo test --lib` 9/9 green; `npm run build`
 green. All 4 phases committed (Phase 6, 4, 5 + this doc).
+
+---
+
+## 12. Low-End-PC Optimization & Bug-Fix Program
+
+Targeted at the core audience — students on **4GB-RAM / weak-CPU/GPU** machines browsing
+**600GB–1TB** offline libraries. The premium glassmorphism UI had started to lag on that
+hardware, and the v6 tree migration left a few regressions. Diagnosis: the lag wasn't slow
+logic, it was **the premium visual layer rendered at full weight on every machine**, plus
+post-migration bugs and event/CPU storms. Each phase committed separately; all verified with
+`npm run build` + (from `src-tauri`) `cargo build && cargo test --lib` (**12/12** green).
+
+### 12.1 Adaptive Performance Tier (the keystone) — `src/lib/perfStore.ts`
+`backdrop-filter: blur()` is ~O(surfaces × blurred-area) *per composited frame* and the
+Courses grid alone stacked 24–48 blur surfaces over two large ambient blur blobs. Rather
+than branch per-component, one tier is resolved and applied as **`data-perf` on `<html>`**,
+so all gating is pure CSS (zero JS in the render/paint path):
+- **high** — full finish (unchanged).
+- **balanced** — blur radius halved, ambient blobs shrunk, animated ring glows dropped.
+- **lite** — NO `backdrop-filter` (solid tinted surfaces), no ambient blobs, no filter
+  glows, `content-visibility` forced on cards.
+- **Auto-detect** from `deviceMemory`/`hardwareConcurrency` (≤4GB or ≤2 cores → lite; ≤8GB
+  or ≤4 cores → balanced). Persisted to the `settings` table (`perf.pref`) + a localStorage
+  mirror; `applyPerfClassEarly()` stamps `<html>` **before first paint** (no flash of the
+  heavy finish). User override in **Settings → Appearance → Performance**.
+- CSS lives in `index.css` (overrides Tailwind `backdrop-blur-*` utilities directly so all
+  existing markup responds); marker classes `perf-blob`, `perf-glow`, `perf-card`.
+
+### 12.2 Always-on compositor churn
+- The Pomodoro + `HeaderTimeBox` countdown rings animated `stroke-dashoffset` **plus a live
+  `filter: drop-shadow()`** every 1 Hz tick inside a blurred card → a steady per-second
+  hitch on every route while a timer ran. Tagged `perf-glow`; the glow is dropped on
+  balanced/lite (kept on high).
+- The mini-player recomputed a whole-app `clip-path` polygon + fired an mpv IPC on **every**
+  resize tick; now debounced (120ms), since the fixed-corner card only moves once resize
+  settles.
+
+### 12.3 Player: black screens & fullscreen lag
+- **Shared debounced fullscreen source** (`src/lib/fullscreen.ts`): AppShell, PlayerPage,
+  and MpvVideoPlayer each ran their own un-debounced `onResized → isFullscreen()` — three
+  IPC calls per tick during the DWM fullscreen animation (the lag). Now ONE app-wide,
+  debounced listener fans out; app-initiated toggles still broadcast `app-fullscreen-changed`
+  for instant response.
+- **No more mpv remount on fullscreen toggle:** `PlayerPage` used `isFullscreen ? A : B`,
+  rendering `MpvVideoPlayer` in two different DOM subtrees → unmount/remount → black frame +
+  full re-init every toggle. The media element is now rendered ONCE at a stable tree
+  position; only wrapper classNames change.
+- **Stale-metrics black band:** `alignViewport` now always refreshes window metrics before
+  measuring (was only when the cache was empty), so an anchor-only layout change can't align
+  mpv against stale window dimensions.
+
+### 12.4 Scanner unbroken + CPU spikes
+- **Scanner was fully broken (issue #3):** `list_registered_dirs` still `LEFT JOIN`ed the
+  dropped `goals`/`subjects` tables and read dropped columns → `no such table: goals` at
+  runtime → Settings → Manage Folders couldn't load → rescan unreachable. Rewritten against
+  v6 (`root_node_id` → `nodes`; struct/TS type updated). Legacy dirs with a NULL
+  `root_node_id` are **self-healed** on rescan (`ensure_dir_root_node`) instead of
+  `COALESCE(...,0)`, which inserted `materials.node_id = 0` and FK-failed the whole import.
+- **Diffing import:** `insert_material` now reads-first and only writes when a row is
+  genuinely new/changed (returns `bool`). The watcher re-imports the whole tree on any file
+  event, and the old UPSERT always bumped `updated_at`, so every rescan fired the
+  `materials_au` FTS triggers across the **entire library** — a big CPU spike on a large
+  tree. Unchanged rescans now do zero writes / zero FTS work. `import_tree` reports only
+  actually-changed rows.
+- **Metadata attempt cap (schema v7 `materials.metadata_attempts`):** the ffmpeg/ffprobe
+  engine excludes files that failed `MAX_METADATA_ATTEMPTS` (3) and increments the counter
+  each pass, so corrupt/unsupported files stop being re-ffmpeg'd on every boot/import (a
+  recurring random spike). Only emits `metadata://extracted` when new data was produced.
+- **Watcher root matching** is now path-boundary-aware (`path_within`) so an event under
+  `.../Math2` no longer mis-triggers a rescan of `.../Math`.
+
+### 12.5 Query scaling on a large tree
+- **`MAT_ANC_CTE` seed constraint:** the ancestry climb now seeds only from
+  material-bearing nodes (a `mat_nodes` CTE), not every node. `dashboard_data` was
+  O(all-nodes × depth) on the UI hot path; now O(material-nodes × depth). (Note: this builds
+  on 11.6, which already fixed Gemini's catastrophe of seeding from every *material*.)
+- **CoursesPage render:** optimistic bookmark toggle patches one row in local state instead
+  of refetching the node (which re-rendered the whole grid + replayed GSAP just to flip a
+  star); `LessonRow` memoized; folder/course cards tagged `perf-card`.
+
+### 12.6 Files touched
+- New: `src/lib/perfStore.ts`, `src/lib/fullscreen.ts`.
+- Frontend: `main.tsx`, `index.css`, `AppShell.tsx`, `PlayerPage.tsx`, `MpvVideoPlayer.tsx`,
+  `MiniPlayer.tsx`, `PomodoroWidget.tsx`, `HeaderTimeBox.tsx`, `Settings.tsx`,
+  `CoursesPage.tsx`, `FolderCard.tsx`, `CourseCard.tsx`, `types.ts`.
+- Backend: `db/queries.rs` (list_registered_dirs, insert_material diff, MAT_ANC_CTE,
+  ensure_dir_root_node, tests), `db/schema.rs` (v7), `db/connection.rs` (v7 ALTER +
+  `test_conn`), `scanner/metadata.rs`, `scanner/watcher.rs`.
+
+### 12.7 Still owed / next session
+- **LIVE SMOKE TEST (needs `npm run tauri dev`):** fullscreen enter/exit (no black frame /
+  lag), mini-player dock/undock, scan into a NEW goal + into an EXISTING node, drill the
+  browser, open a file; confirm rescan works from Settings and that the v7 migration applies
+  cleanly to a real pre-v7 DB. The node queries + scan flow are still only compile/test-checked.
+- `commands/mod.rs` `health_check` already points at `nodes` (fixed in 11.6).
+- Consider surfacing the resolved tier + a "reduce effects" hint the first time a `lite`
+  device is detected.
