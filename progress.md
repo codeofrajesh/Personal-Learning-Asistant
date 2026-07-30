@@ -553,5 +553,10 @@ unlimited in the DB).
   migrated DB, only type/compile-checked. Next session should smoke-test: import into a new
   goal, import into an existing node, drill the browser, open a file from a node.
 
+### 11.6 Optimizations & Regressions Fixed (Post-Update)
+- **`MAT_ANC_CTE` Performance Catastrophe:** The initial CTE recursively evaluated ancestry starting from *every material* in the DB, causing an `O(files * depth)` Cartesian explosion that locked the SQLite Mutex, freezing both the Dashboard load and the Video Player (which could no longer save progress). **Fix:** Rewrote the CTE to recursively climb starting from `nodes` (folders) instead, reducing the complexity to `O(folders * depth)`. The lock is eliminated and performance is completely restored.
+- **`CoursesPage` UI Restoration:** The previous phase accidentally replaced the premium 3D material list view with a generic one. **Fix:** Ported the `LessonRow` component from the dropped `CourseDetailPage.tsx` directly into the new `CoursesPage.tsx` file explorer, restoring the tactile numbered circles, cyan hover states, and sleek typography. Fixed the subsequent `TYPE_GLYPH` reference and map-index bugs that arose during the port.
+- **`health_check` crash:** Swapped the legacy `"goals"` table string for `"nodes"` in `commands/mod.rs` to prevent an IPC error when verifying the database state.
+
 Verification at handoff: `cargo build` clean; `cargo test --lib` 9/9 green; `npm run build`
 green. All 4 phases committed (Phase 6, 4, 5 + this doc).

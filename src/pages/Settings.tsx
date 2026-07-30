@@ -165,7 +165,7 @@ function ManageFolders() {
                   {d.path}
                 </p>
                 <p className="mt-0.5 truncate text-xs text-content-muted">
-                  {d.goal_name ?? "—"} · {d.subject_name ?? "—"}
+                  {d.root_name ?? "—"}
                   {d.last_scanned_at && ` · scanned ${d.last_scanned_at.slice(0, 16).replace("T", " ")}`}
                 </p>
               </div>

@@ -397,12 +397,11 @@ export interface SearchResult {
 export interface RegisteredDir {
   id: number;
   path: string;
-  category_level: string;
   is_active: boolean;
   scan_status: string;
   last_scanned_at: string | null;
-  goal_name: string | null;
-  subject_name: string | null;
+  root_node_id: number | null;
+  root_name: string | null;
 }
 
 /** Counts from a JSON import/merge (backend `ImportSummary`). */

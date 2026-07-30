@@ -25,16 +25,18 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { gsap } from "gsap";
-import { Play, Plus } from "lucide-react";
+import { Play, Plus, Bookmark, Check, ChevronRight, FileVideo, FileText, FileAudio, FileImage, File as FileLucide } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
 import FolderCard from "../components/courses/FolderCard";
-import MaterialRow from "../components/library/MaterialRow";
+
 import ProgressRing from "../components/courses/ProgressRing";
 import CoverArt from "../components/ui/CoverArt";
 import { DEPTH_CAP } from "../components/wizard/FolderPreview";
 import { useMaterialManager } from "../lib/materialManagerStore";
 import { ipc, isTauri, NotInTauriError, onLibraryChanged } from "../lib/ipc";
+import { cn } from "../lib/utils";
+import { withSource } from "../lib/navigation";
 import type {
   MaterialRow as MaterialRowData,
   NodeCard,
@@ -54,6 +56,14 @@ const TYPE_GLYPH: Record<string, string> = {
   note: "📝",
   image: "🖼️",
   audio: "🎧",
+};
+
+const FILE_ICON: Record<string, typeof FileLucide> = {
+  video: FileVideo,
+  pdf: FileText,
+  note: FileText,
+  image: FileImage,
+  audio: FileAudio,
 };
 
 const btnPrimary =
@@ -330,9 +340,20 @@ export default function CoursesPage() {
               Files <span className="ml-1 text-xs font-normal text-content-faint">{fileCount}</span>
             </h2>
             <div className="flex flex-col gap-2.5">
-              {materials!.map((m) => (
-                <div key={m.id} className="cv-row-lg">
-                  <MaterialRow material={m} />
+              {materials!.map((m, i) => (
+                <div key={m.id} className="cv-row">
+                  <LessonRow 
+                    lesson={m} 
+                    idxLabel={String(i + 1).padStart(2, "0")} 
+                    missing={m.status === "missing"}
+                    onOpen={() => navigate(`/library/material/${m.id}`, withSource("courses"))}
+                    onToggleBookmark={async () => {
+                      try {
+                        await ipc.setBookmark(m.id, !m.is_bookmarked);
+                        void load(); // Refresh data immediately
+                      } catch (e) {}
+                    }}
+                  />
                 </div>
               ))}
             </div>
@@ -391,4 +412,135 @@ export default function CoursesPage() {
       </div>
     </div>
   );
+}
+
+/**
+ * One lesson row: 3D numbered circle · title + muted metadata · bookmark · status.
+ * Transparent background, faint bottom separator + 3D hover glow, no neon.
+ */
+function LessonRow({
+  lesson,
+  idxLabel,
+  missing,
+  onOpen,
+  onToggleBookmark,
+}: {
+  lesson: MaterialRowData;
+  idxLabel: string;
+  missing: boolean;
+  onOpen: () => void;
+  onToggleBookmark: () => void;
+}) {
+  const done = lesson.is_completed;
+  const dur = lesson.duration_secs;
+  const durLabel = dur != null && dur > 0 ? formatShortDuration(dur) : null;
+  const inLabel =
+    lesson.progress_pct > 0 && !done ? `${lesson.progress_pct}% in` : null;
+  const FileIcon = FILE_ICON[lesson.file_type] ?? FileLucide;
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+      aria-label={`Play lesson: ${lesson.file_name}`}
+      className={cn(
+        "lesson-row group flex cursor-pointer items-center gap-4 bg-transparent px-3 py-4 outline-none border-b border-white/[0.04] transition-all duration-300 hover:bg-gradient-to-r hover:from-white/[0.06] hover:to-transparent hover:border-white/[0.05] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] focus-visible:ring-1 focus-visible:ring-white/30",
+        missing && "opacity-60",
+      )}
+    >
+      {/* Numbered circle — 3D tactile, identical for every row; cyan accent on hover */}
+      <span
+        aria-hidden
+        className="w-9 h-9 rounded-full flex items-center justify-center bg-gradient-to-b from-white/[0.12] to-white/[0.02] border border-white/[0.15] shadow-[inset_0_1px_2px_rgba(255,255,255,0.2)] text-white/70 font-medium transition-all duration-300 group-hover:border-cyan-400/40 group-hover:text-cyan-400 group-hover:shadow-[inset_0_1px_3px_rgba(34,211,238,0.35)]"
+      >
+        {idxLabel}
+      </span>
+
+      {/* Title + muted metadata */}
+      <div className="min-w-0 flex-1">
+        <p
+          className={cn(
+            "truncate text-sm font-medium",
+            missing ? "text-content-muted" : "text-content-primary",
+          )}
+        >
+          {lesson.file_name}
+          {missing && (
+            <span className="ml-1.5 text-xs text-orange-400/80">· file missing</span>
+          )}
+        </p>
+        <p className="mt-1 flex items-center gap-1.5 truncate text-xs text-content-muted">
+          <FileIcon
+            size={12}
+            strokeWidth={2}
+            aria-hidden
+            className="shrink-0 text-content-muted"
+          />
+          {durLabel && <span>{durLabel}</span>}
+          {durLabel && inLabel && (
+            <span aria-hidden className="text-white/20">
+              ·
+            </span>
+          )}
+          {inLabel && (
+            <span className="text-content-secondary">{inLabel}</span>
+          )}
+        </p>
+      </div>
+
+      {/* Bookmark — faint gray default, solid lime only when active */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleBookmark();
+        }}
+        aria-label={lesson.is_bookmarked ? "Remove bookmark" : "Bookmark lesson"}
+        aria-pressed={lesson.is_bookmarked}
+        className={cn(
+          "grid h-8 w-8 shrink-0 place-items-center rounded-btn transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30",
+          lesson.is_bookmarked
+            ? "text-lime hover:bg-lime/10"
+            : "text-white/30 hover:bg-white/[0.05] hover:text-white/50",
+        )}
+      >
+        <Bookmark
+          size={16}
+          strokeWidth={2}
+          fill={lesson.is_bookmarked ? "currentColor" : "none"}
+          aria-hidden
+        />
+      </button>
+
+      {/* Status: subtle-green ✔ Done, or muted-orange Start › */}
+      {done ? (
+        <span className="flex shrink-0 items-center gap-1 text-xs font-semibold text-lime/70">
+          <Check size={14} strokeWidth={3} aria-hidden />
+          Done
+        </span>
+      ) : (
+        <span className="flex shrink-0 items-center gap-1 text-xs font-semibold text-cyan-400/90">
+          Start
+          <ChevronRight size={13} strokeWidth={2.5} aria-hidden />
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Seconds → `H:MM:SS` / `M:SS`. */
+function formatShortDuration(secs: number): string {
+  const total = Math.floor(secs);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }

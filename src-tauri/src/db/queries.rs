@@ -203,24 +203,29 @@ pub fn insert_registered_dir(conn: &Connection, path: &str, root_node_id: i64) -
 ///   mid, chapter_id (parent node), chapter_name, subject_id, subject_name,
 ///   goal_id, goal_name, root_id.
 pub const MAT_ANC_CTE: &str = "
-mat_anc AS (
-    WITH RECURSIVE up(mid, aid, aparent, aname, adepth) AS (
-        SELECT m.id, n.id, n.parent_id, n.name, n.depth
-        FROM materials m JOIN nodes n ON n.id = m.node_id
+node_anc AS (
+    WITH RECURSIVE up(base_node, curr_node, parent, name, depth) AS (
+        SELECT id, id, parent_id, name, depth FROM nodes
         UNION ALL
-        SELECT up.mid, n.id, n.parent_id, n.name, n.depth
-        FROM up JOIN nodes n ON n.id = up.aparent
+        SELECT up.base_node, n.id, n.parent_id, n.name, n.depth
+        FROM up JOIN nodes n ON n.id = up.parent
     )
     SELECT
-        m.id AS mid,
-        pn.id AS chapter_id, pn.name AS chapter_name,
-        COALESCE(sub.aid, root.aid) AS subject_id,
-        COALESCE(sub.aname, root.aname) AS subject_name,
-        root.aid AS goal_id, root.aname AS goal_name, root.aid AS root_id
+        n.id AS node_id,
+        n.id AS chapter_id,
+        n.name AS chapter_name,
+        COALESCE(sub.curr_node, root.curr_node) AS subject_id,
+        COALESCE(sub.name, root.name) AS subject_name,
+        root.curr_node AS goal_id,
+        root.name AS goal_name
+    FROM nodes n
+    LEFT JOIN up root ON root.base_node = n.id AND root.depth = 0
+    LEFT JOIN up sub  ON sub.base_node = n.id AND sub.depth = 1
+),
+mat_anc AS (
+    SELECT m.id AS mid, a.chapter_id, a.chapter_name, a.subject_id, a.subject_name, a.goal_id, a.goal_name, a.goal_id AS root_id
     FROM materials m
-    JOIN nodes pn ON pn.id = m.node_id
-    LEFT JOIN up root ON root.mid = m.id AND root.adepth = 0
-    LEFT JOIN up sub  ON sub.mid  = m.id AND sub.adepth  = 1
+    JOIN node_anc a ON a.node_id = m.node_id
 )";
 
 /// A goal row plus rolled-up counts, for the Library grid.
@@ -1658,35 +1663,34 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
 pub struct RegisteredDir {
     pub id: i64,
     pub path: String,
-    pub category_level: String,
     pub is_active: bool,
     pub scan_status: String,
     pub last_scanned_at: Option<String>,
-    pub goal_name: Option<String>,
-    pub subject_name: Option<String>,
+    /// Id of the root node this folder imports into (NULL only for un-repaired legacy rows).
+    pub root_node_id: Option<i64>,
+    /// Display name of the root node (the "Goal") this folder belongs to.
+    pub root_name: Option<String>,
 }
 
-/// List all registered directories newest-first, with goal/subject context.
+/// List all registered directories newest-first, with their root-node (v6) context.
 pub fn list_registered_dirs(conn: &Connection) -> AppResult<Vec<RegisteredDir>> {
     let mut stmt = conn.prepare(
         "SELECT
-            r.id, r.path, r.category_level, r.is_active, r.scan_status, r.last_scanned_at,
-            g.name, s.name
+            r.id, r.path, r.is_active, r.scan_status, r.last_scanned_at,
+            r.root_node_id, n.name
          FROM registered_dirs r
-         LEFT JOIN goals g ON g.id = r.goal_id
-         LEFT JOIN subjects s ON s.id = r.subject_id
+         LEFT JOIN nodes n ON n.id = r.root_node_id
          ORDER BY r.id DESC",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(RegisteredDir {
             id: r.get(0)?,
             path: r.get(1)?,
-            category_level: r.get(2)?,
-            is_active: r.get::<_, i64>(3)? != 0,
-            scan_status: r.get(4)?,
-            last_scanned_at: r.get(5)?,
-            goal_name: r.get(6)?,
-            subject_name: r.get(7)?,
+            is_active: r.get::<_, i64>(2)? != 0,
+            scan_status: r.get(3)?,
+            last_scanned_at: r.get(4)?,
+            root_node_id: r.get(5)?,
+            root_name: r.get(6)?,
         })
     })?;
     let mut out = Vec::new();
@@ -1699,13 +1703,13 @@ pub fn list_registered_dirs(conn: &Connection) -> AppResult<Vec<RegisteredDir>> 
 /// Internal row with the ids a rescan needs (not serialized).
 struct RegisteredDirRef {
     path: String,
-    root_node_id: i64,
+    root_node_id: Option<i64>,
 }
 
 /// Look up a registered directory by id for rescanning. `NotFound` if absent.
 fn registered_dir_ref(conn: &Connection, id: i64) -> AppResult<RegisteredDirRef> {
     conn.query_row(
-        "SELECT path, COALESCE(root_node_id, 0) FROM registered_dirs WHERE id = ?1",
+        "SELECT path, root_node_id FROM registered_dirs WHERE id = ?1",
         [id],
         |r| {
             Ok(RegisteredDirRef {
@@ -1722,6 +1726,25 @@ fn registered_dir_ref(conn: &Connection, id: i64) -> AppResult<RegisteredDirRef>
     })
 }
 
+/// Ensure a registered dir has a valid `root_node_id`. Legacy rows migrated from a pre-v6
+/// DB whose old `subject_id` didn't map keep a NULL `root_node_id`; rescanning those would
+/// try to import under a non-existent node and FK-fail. Self-heal by creating (or reusing)
+/// a root node named after the folder and persisting it back onto the row.
+fn ensure_dir_root_node(conn: &Connection, dir_id: i64, path: &str) -> AppResult<i64> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Imported")
+        .to_string();
+    let root_id = upsert_root_node(conn, &name)?;
+    conn.execute(
+        "UPDATE registered_dirs SET root_node_id = ?1 WHERE id = ?2",
+        rusqlite::params![root_id, dir_id],
+    )?;
+    Ok(root_id)
+}
+
 /// Unregister a folder (delete the `registered_dirs` row). Imported materials stay in
 /// the library — this only stops tracking/rescanning the folder.
 pub fn remove_registered_dir(conn: &Connection, id: i64) -> AppResult<()> {
@@ -1729,12 +1752,18 @@ pub fn remove_registered_dir(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// Re-scan a registered folder: walk it and upsert materials under its existing subject
+/// Re-scan a registered folder: walk it and upsert materials under its existing root node
 /// (idempotent, so new files are added and nothing duplicates). Returns the path + the
-/// subject id the caller needs; the actual walk+import happens in the command layer.
+/// root node id the caller needs; the actual walk+import happens in the command layer.
+/// Legacy rows with a NULL `root_node_id` are self-healed to a folder-named root so the
+/// rescan can't FK-fail.
 pub fn registered_dir_for_rescan(conn: &Connection, id: i64) -> AppResult<(String, i64)> {
     let r = registered_dir_ref(conn, id)?;
-    Ok((r.path, r.root_node_id))
+    let root_node_id = match r.root_node_id {
+        Some(root_id) => root_id,
+        None => ensure_dir_root_node(conn, id, &r.path)?,
+    };
+    Ok((r.path, root_node_id))
 }
 
 /// Stamp a registered dir's scan status after a rescan.

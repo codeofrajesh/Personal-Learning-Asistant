@@ -42,7 +42,7 @@ pub struct HealthReport {
 pub fn health_check(db: State<'_, Db>, token: String) -> AppResult<HealthReport> {
     db.with(|conn| {
         let echo = queries::health_check(conn, &token)?;
-        let goal_count = queries::count_rows(conn, "goals")?;
+        let goal_count = queries::count_rows(conn, "nodes")?;
         Ok(HealthReport {
             echo,
             goal_count,
