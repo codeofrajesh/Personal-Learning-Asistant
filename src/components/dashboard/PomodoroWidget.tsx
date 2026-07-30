@@ -108,7 +108,7 @@ function PomodoroWidgetView() {
               strokeLinecap="round"
               strokeDasharray={CIRCUMFERENCE}
               strokeDashoffset={dashOffset}
-              className="transition-[stroke-dashoffset] duration-1000 ease-linear"
+              className="perf-glow transition-[stroke-dashoffset] duration-1000 ease-linear"
               style={{ filter: color.glow }}
             />
           </svg>

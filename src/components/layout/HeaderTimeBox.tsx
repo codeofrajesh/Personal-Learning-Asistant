@@ -93,7 +93,7 @@ export function HeaderTimeBox() {
               strokeLinecap="round"
               strokeDasharray={CIRC}
               strokeDashoffset={dashOffset}
-              className="transition-[stroke-dashoffset] duration-1000 ease-linear"
+              className="perf-glow transition-[stroke-dashoffset] duration-1000 ease-linear"
               style={{ filter: `drop-shadow(0 0 4px ${stroke}88)` }}
             />
           </svg>

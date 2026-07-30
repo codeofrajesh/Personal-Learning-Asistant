@@ -66,15 +66,23 @@ export default function MiniPlayer() {
 
   // Dock: align MPV into the mini card; re-align on window resize. On undock, clear the
   // rect cutout (MpvVideoPlayer, if we returned to the player route, re-aligns to full).
+  // The card is fixed to the bottom-right, so it only moves once resize SETTLES — debounce
+  // the re-align so a drag-resize doesn't recompute the whole-app clip-path + fire an mpv
+  // IPC on every tick (that per-tick churn was a source of jank during resize).
   useEffect(() => {
     if (!shouldDock) {
       setRect(null);
       return;
     }
     void refreshWinMetrics().then(() => align());
-    const onResize = () => void refreshWinMetrics().then(() => align());
+    let t: number | undefined;
+    const onResize = () => {
+      if (t !== undefined) window.clearTimeout(t);
+      t = window.setTimeout(() => void refreshWinMetrics().then(() => align()), 120);
+    };
     window.addEventListener("resize", onResize);
     return () => {
+      if (t !== undefined) window.clearTimeout(t);
       window.removeEventListener("resize", onResize);
       setRect(null);
     };

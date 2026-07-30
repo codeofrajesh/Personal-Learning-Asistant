@@ -183,6 +183,9 @@ html[data-perf="balanced"] .backdrop-blur-lg,
 html[data-perf="balanced"] .backdrop-blur-xl { backdrop-filter: blur(10px) !important; -webkit-backdrop-filter: blur(10px) !important; }
 /* Shrink the ambient blobs' blur kernel (the large-radius blur is the pricey part). */
 html[data-perf="balanced"] .perf-blob { filter: blur(60px); }
+/* Drop the continuously-animated drop-shadow glow on the timer rings (it re-rasterizes the
+   filter every second inside a blurred card). High keeps it; balanced/lite don't. */
+html[data-perf="balanced"] .perf-glow { filter: none !important; }
 
 /* LITE — no backdrop-filter anywhere; solid tinted surfaces instead. */
 html[data-perf="lite"] .backdrop-blur-sm,
