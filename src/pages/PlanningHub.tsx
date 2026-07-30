@@ -18,6 +18,7 @@ import Breadcrumb from "../components/layout/Breadcrumb";
 import PlannerTab from "../components/planning/PlannerTab";
 import ViewTab from "../components/planning/ViewTab";
 import { usePlanningTasks } from "../components/planning/usePlanningTasks";
+import { motionAllowed } from "../lib/perfStore";
 import { cn } from "../lib/utils";
 
 type Tab = "planner" | "view";
@@ -29,7 +30,7 @@ export default function PlanningHub() {
 
   useLayoutEffect(() => {
     if (!planning.loaded || planning.preview) return;
-    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    if (!motionAllowed()) return;
     const ctx = gsap.context(() => {
       const targets = rootRef.current?.querySelectorAll(".plan-panel");
       if (targets && targets.length > 0) {

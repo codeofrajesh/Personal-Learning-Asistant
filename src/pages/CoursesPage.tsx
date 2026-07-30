@@ -34,6 +34,7 @@ import ProgressRing from "../components/courses/ProgressRing";
 import CoverArt from "../components/ui/CoverArt";
 import { DEPTH_CAP } from "../components/wizard/FolderPreview";
 import { useMaterialManager } from "../lib/materialManagerStore";
+import { motionAllowed } from "../lib/perfStore";
 import { ipc, isTauri, NotInTauriError, onLibraryChanged } from "../lib/ipc";
 import { cn } from "../lib/utils";
 import { withSource } from "../lib/navigation";
@@ -164,16 +165,12 @@ export default function CoursesPage() {
     if (importNonce > 0) void load();
   }, [importNonce, load]);
 
-  // ── GSAP entrances (Dashboard pattern: gsap.context + ctx.revert, reduced-motion) ──
-  const prefersReduced = useCallback(
-    () =>
-      typeof window !== "undefined" &&
-      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches,
-    [],
-  );
-
+  // ── GSAP entrances — gated on the performance tier (motionAllowed), not just
+  // reduced-motion. On `lite` this early-returns so folder cards + file rows appear
+  // instantly (no stagger tween on navigation/drill — the source of the drill lag on
+  // weak hardware). High/balanced keep the staggered entrance. ──
   useLayoutEffect(() => {
-    if (boot.kind !== "ready" || prefersReduced()) return;
+    if (boot.kind !== "ready" || !motionAllowed()) return;
     const ctx = gsap.context(() => {
       const tl = gsap.timeline({ defaults: { ease: "power3.out", duration: 0.45 } });
       if (document.querySelector(".continue-card")) {
@@ -197,7 +194,7 @@ export default function CoursesPage() {
       }
     }, rootRef);
     return () => ctx.revert();
-  }, [boot.kind, nodeId, prefersReduced]);
+  }, [boot.kind, nodeId]);
 
   // ── render helpers ──
   const currentName = isRoot

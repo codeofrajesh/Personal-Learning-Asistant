@@ -14,6 +14,7 @@
 
 import { memo, useLayoutEffect, useRef } from "react";
 import { gsap } from "gsap";
+import { motionAllowed } from "../../lib/perfStore";
 import type { ConsistencyDay } from "../../lib/types";
 
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -64,9 +65,7 @@ function ConsistencyHeatmapView({ days }: { days: ConsistencyDay[] }) {
   }
 
   useLayoutEffect(() => {
-    if (typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
-      return;
-    }
+    if (!motionAllowed()) return;
     const ctx = gsap.context(() => {
       gsap.from(".heat-cell", {
         opacity: 0,

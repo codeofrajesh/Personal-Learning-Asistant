@@ -57,6 +57,31 @@ function resolveTier(pref: PerfPreference): PerfTier {
   return pref === "auto" ? detectTier() : pref;
 }
 
+/**
+ * The tier currently applied to <html> (source of truth for non-React callers like the
+ * GSAP entrance hooks, which read this synchronously without subscribing to the store).
+ * Falls back to a fresh detect if the attribute isn't set yet.
+ */
+export function currentTier(): PerfTier {
+  const attr = document.documentElement.dataset.perf;
+  return isTier(attr) ? attr : detectTier();
+}
+
+/**
+ * Whether JS-driven entrance/stagger motion (GSAP) should run at all.
+ *
+ * The performance tier is otherwise CSS-only, so without this gate every GSAP entrance
+ * would run at full weight even on `lite` — exactly the leak that kept lite stuttering on
+ * weak hardware. Motion is allowed on `high`/`balanced`; suppressed on `lite` and whenever
+ * the user asks for reduced motion. Entrance hooks early-return on `!motionAllowed()`, so
+ * lite renders content at its final state instantly (VLC/native-explorer feel).
+ */
+export function motionAllowed(): boolean {
+  if (typeof window === "undefined") return false;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return false;
+  return currentTier() !== "lite";
+}
+
 function writeHtmlAttr(tier: PerfTier) {
   document.documentElement.dataset.perf = tier;
 }

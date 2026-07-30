@@ -218,8 +218,37 @@ html[data-perf="lite"] .backdrop-blur-xl.bg-white\/\[0\.04\] {
 html[data-perf="lite"] .perf-blob { display: none; }
 /* Kill the animated drop-shadow glows (compositor-killers when animated inside a blur). */
 html[data-perf="lite"] .perf-glow { filter: none !important; }
-/* Off-screen cards skip layout+paint (belt-and-braces with the .cv-row rows). */
-html[data-perf="lite"] .perf-card { content-visibility: auto; contain-intrinsic-size: auto 220px; }
+/* Off-screen cards skip layout+paint (belt-and-braces with the .cv-row rows).
+   The reserved size must match the real rendered card height (cover 16:9 + body ≈ 288px in
+   the 4-col grid) or the scrollbar jumps as estimates are replaced by real cards on scroll —
+   the previous 220px under-estimate caused visible scroll stutter. */
+html[data-perf="lite"] .perf-card { content-visibility: auto; contain-intrinsic-size: auto 288px; }
+
+/* ── LITE motion kill-switch ──────────────────────────────────────────────────
+   The tier is otherwise CSS-only for the glass finish; motion was still running at full
+   weight on lite (GSAP entrances are gated in JS via motionAllowed(); this handles all the
+   CSS transitions/animations + hover transforms in one sweep, without editing dozens of
+   components). Goal: the buttery, instant feel of VLC / native file explorer.
+     · zero transition + animation time  → cards/rows appear instantly, no fade/slide.
+     · zero hover magnification           → no hover:scale / group-hover:scale repaint churn.
+   Kept: opacity/color are still allowed to CHANGE (just instantly), so focus rings, active
+   states and hover tints still work — they simply don't animate. */
+html[data-perf="lite"] *,
+html[data-perf="lite"] *::before,
+html[data-perf="lite"] *::after {
+  transition-duration: 0.001ms !important;
+  transition-delay: 0s !important;
+  animation-duration: 0.001ms !important;
+  animation-delay: 0s !important;
+  animation-iteration-count: 1 !important;
+}
+/* Neutralise hover/focus magnification — a weak GPU promotes a layer + repaints on every
+   pointer move across the grid otherwise. Transforms already applied for layout (e.g. the
+   seek-fill width) are unaffected; only :hover/:focus scale cues are cancelled. */
+html[data-perf="lite"] *:hover,
+html[data-perf="lite"] *:focus-visible {
+  transform: none !important;
+}
 
 /* Reduced motion: disable all non-essential animation/transition. */
 @media (prefers-reduced-motion: reduce) {

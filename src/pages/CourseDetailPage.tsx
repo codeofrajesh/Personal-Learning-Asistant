@@ -50,6 +50,7 @@ import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
 import ProgressRing from "../components/courses/ProgressRing";
 import { ipc, isTauri, NotInTauriError } from "../lib/ipc";
+import { motionAllowed } from "../lib/perfStore";
 import { withSource } from "../lib/navigation";
 import { cn } from "../lib/utils";
 import type { CourseLesson, CourseView } from "../lib/types";
@@ -142,12 +143,7 @@ export default function CourseDetailPage() {
   // hover motion via CSS alone.
   useLayoutEffect(() => {
     if (state.kind !== "ready") return;
-    if (
-      typeof window !== "undefined" &&
-      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
-    ) {
-      return;
-    }
+    if (!motionAllowed()) return;
     const ctx = gsap.context(() => {
       const tl = gsap.timeline({ defaults: { ease: "power3.out", duration: 0.5 } });
       tl.from(".course-header", { y: 24, opacity: 0 }).from(

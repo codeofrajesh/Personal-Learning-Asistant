@@ -22,6 +22,7 @@ import {
 } from "./planningUtils";
 import TaskGlyph from "./TaskGlyph";
 import TimelineLegend from "./TimelineLegend";
+import { motionAllowed } from "../../lib/perfStore";
 import { cn } from "../../lib/utils";
 import type { Task } from "../../lib/types";
 
@@ -346,7 +347,7 @@ function MonthGrid({
   }, [tasks]);
 
   useLayoutEffect(() => {
-    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    if (!motionAllowed()) return;
     const ctx = gsap.context(() => {
       gsap.from(".cal-cell", { opacity: 0, y: 8, duration: 0.3, ease: "power2.out", stagger: 0.008 });
     }, rootRef);

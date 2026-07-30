@@ -29,6 +29,7 @@ import QuickAccess from "../components/dashboard/QuickAccess";
 import RecentStrip from "../components/dashboard/RecentStrip";
 import TasksWidget from "../components/dashboard/TasksWidget";
 import { ipc, isTauri, NotInTauriError, onLibraryChanged } from "../lib/ipc";
+import { motionAllowed } from "../lib/perfStore";
 import {
   defaultLayout,
   loadLayout,
@@ -139,7 +140,9 @@ export default function Dashboard() {
   // Reduced-motion safe. Re-runs when data becomes ready or the visible set changes.
   useLayoutEffect(() => {
     if (state.kind !== "ready") return;
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    // Gated on the tier (motionAllowed), not just reduced-motion: on `lite` the widgets
+    // appear instantly with no stagger tween — smoother first paint on weak hardware.
+    if (!motionAllowed()) return;
 
     const ctx = gsap.context(() => {
       gsap.from(".dash-widget", {
