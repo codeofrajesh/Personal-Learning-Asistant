@@ -6,28 +6,35 @@
  *
  * Mounted ONCE in AppShell. It docks only when: a video is active, the user isn't on the
  * player route (where the full MpvVideoPlayer owns MPV), it wasn't dismissed, and we're in
- * Tauri. It reports its live rect to `miniPlayerStore` so AppShell can cut a matching
+ * Tauri. It reports its VIDEO rect to `miniPlayerStore` so AppShell can cut a matching
  * transparent hole in the opaque ambient canvas (MPV renders behind the webview and is
  * only visible through transparent pixels).
  *
- * ── Drag + resize (60fps, no mpv thrash) ─────────────────────────────────────
- * The card is draggable (by its video area) and resizable (bottom-right grip). The gesture
- * is done ENTIRELY on a DOM ref inside a rAF loop — pointermove only writes the pending
- * frame to a ref; one rAF applies `transform: translate3d()` + width. There is NO React
- * state or zustand write per move, so a weak CPU never sees the "thousands of updates"
- * choke. mpv is NOT repositioned during the gesture: on drag start we drop the clip-path
- * hole (setRect(null)) and show a freeze-frame placeholder, so the decoder is never asked
- * to move mid-gesture (no lag / no rapid-IPC crash). On release we commit the frame once
- * (persisted + clamped) and fire exactly ONE setVideoMarginRatio + setRect to snap mpv to
- * the new rect. The two surfaces stay mutually exclusive: MpvVideoPlayer is unmounted
- * whenever this docks, so only one component ever calls `setVideoMarginRatio` at a time.
+ * ── Why the layout is the way it is (hard-won) ───────────────────────────────
+ * The card is NOT a normal floating panel: the video you see is the OS-level MPV surface
+ * showing through a clip-path hole punched in the whole app. That imposes strict rules the
+ * previous drag attempt violated (causing a phantom frame at 0,0, a flickering hole seam,
+ * and dead buttons):
+ *   1. The VIDEO area is only ever a clean transparent hole + click-to-expand. It is NEVER
+ *      a drag handle — dragging the surface fought the hole and produced the flicker.
+ *   2. Dragging is done by the CONTROL STRIP (grab cursor); resizing by a corner grip only.
+ *      Buttons inside the strip bail out of the gesture so they still click normally.
+ *   3. The strip is OPAQUE (no backdrop-blur): a blurred surface adjacent to the transparent
+ *      hole makes the compositor flicker the seam on every hover repaint.
+ *   4. MPV is NEVER repositioned mid-gesture. During a drag/resize we drop the hole
+ *      (setRect(null)) and show an opaque freeze placeholder, move only the webview card via
+ *      translate3d on a ref inside a rAF (zero React/store writes per move), and re-sync MPV
+ *      exactly ONCE on release — measuring the video rect INSIDE a rAF (after the transform
+ *      has committed) and skipping the call if the rect is degenerate (the 0,0 phantom-frame
+ *      guard).
+ * The two surfaces stay mutually exclusive: MpvVideoPlayer is unmounted whenever this docks.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { command, setProperty, setVideoMarginRatio } from "tauri-plugin-libmpv-api";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Play, Pause, X, Maximize2, GripVertical } from "lucide-react";
+import { Play, Pause, X, Maximize2, GripHorizontal } from "lucide-react";
 import {
   useMiniPlayer,
   clampFrame,
@@ -39,16 +46,12 @@ import {
 import { isTauri } from "../../lib/ipc";
 import { cn } from "../../lib/utils";
 
-/** Pointer travel (px) before a press on the video is treated as a drag (vs. a click). */
-const DRAG_THRESHOLD = 4;
-
 type GestureKind = "drag" | "resize";
 interface Gesture {
   kind: GestureKind;
   startX: number;
   startY: number;
   origin: MiniFrame;
-  moved: boolean;
 }
 
 export default function MiniPlayer() {
@@ -92,25 +95,32 @@ export default function MiniPlayer() {
     const c = clampFrame(f);
     el.style.transform = `translate3d(${c.x}px, ${c.y}px, 0)`;
     el.style.width = `${c.w}px`;
+    el.style.height = `${miniCardHeight(c.w)}px`;
   }, []);
 
-  // Align MPV's native surface to the card's current rect + report the rect for the
-  // ambient-canvas cutout. Called on dock, on resize settle, and ONCE on gesture release —
-  // never per move (that per-tick mpv IPC was the resize jank / decoder-lag risk).
+  // Align MPV's native surface to the VIDEO rect + report the rect for the ambient-canvas
+  // cutout. Runs inside a rAF so it measures AFTER any transform/width change has committed
+  // to layout (the previous synchronous measure could read a stale 0,0 rect → MPV painted a
+  // phantom frame in the top-left). Skips the IPC on a degenerate rect for the same reason.
   const align = useCallback(async () => {
-    const el = anchorRef.current;
-    if (!el) return;
     if (!winMetricsRef.current) await refreshWinMetrics();
     const m = winMetricsRef.current;
     if (!m) return;
-    const rect = el.getBoundingClientRect();
-    setRect({ x: rect.left, y: rect.top, w: rect.width, h: rect.height });
-    void setVideoMarginRatio({
-      left: Math.max(0, rect.left / m.w),
-      right: Math.max(0, (m.w - rect.right) / m.w),
-      top: Math.max(0, rect.top / m.h),
-      bottom: Math.max(0, (m.h - rect.bottom) / m.h),
-    }).catch(() => {});
+    requestAnimationFrame(() => {
+      const el = anchorRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      // Degenerate-rect guard: never send 0-size / off-screen coords to MPV (that's what
+      // painted the stray frame at the corner). Bail and leave the last good alignment.
+      if (rect.width < 20 || rect.height < 20) return;
+      setRect({ x: rect.left, y: rect.top, w: rect.width, h: rect.height });
+      void setVideoMarginRatio({
+        left: Math.max(0, rect.left / m.w),
+        right: Math.max(0, (m.w - rect.right) / m.w),
+        top: Math.max(0, rect.top / m.h),
+        bottom: Math.max(0, (m.h - rect.bottom) / m.h),
+      }).catch(() => {});
+    });
   }, [refreshWinMetrics, setRect]);
 
   // Keep the live ref in sync with the committed frame whenever it changes from the store.
@@ -178,17 +188,6 @@ export default function MiniPlayer() {
       if (!g) return;
       const dx = ev.clientX - g.startX;
       const dy = ev.clientY - g.startY;
-
-      // Defer the visible gesture (freeze-frame + drop the mpv hole) until the pointer has
-      // actually travelled — so a plain click on the video still expands to the full player
-      // without flashing the placeholder.
-      if (!g.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
-      if (!g.moved) {
-        g.moved = true;
-        setGesturing(true);
-        setRect(null); // drop the mpv cutout; the freeze-frame overlay takes over
-      }
-
       if (g.kind === "drag") {
         liveFrameRef.current = { x: g.origin.x + dx, y: g.origin.y + dy, w: g.origin.w };
       } else {
@@ -197,7 +196,7 @@ export default function MiniPlayer() {
       }
       scheduleApply();
     },
-    [scheduleApply, setRect],
+    [scheduleApply],
   );
 
   const onGestureEnd = useCallback(() => {
@@ -209,33 +208,28 @@ export default function MiniPlayer() {
       rafRef.current = null;
     }
     if (!g) return;
-    if (!g.moved) {
-      // No travel → it was a click on the video: expand to the full player.
-      if (g.kind === "drag") navigate(`/library/material/${materialId}`);
-      return;
-    }
     // Commit once (clamped + persisted); the frame effect re-applies the DOM + re-aligns
-    // mpv with a single setVideoMarginRatio + setRect.
+    // mpv with a single setVideoMarginRatio + setRect (measured in a rAF).
     setFrame(liveFrameRef.current);
     setGesturing(false);
-  }, [onGestureMove, navigate, materialId, setFrame]);
+  }, [onGestureMove, setFrame]);
 
   const beginGesture = useCallback(
     (kind: GestureKind, e: React.PointerEvent) => {
+      // Never start a gesture from an interactive control (play/expand/close) — let the
+      // click through. Only empty drag-handle / grip pixels start a move/resize.
+      if ((e.target as HTMLElement).closest("button")) return;
       e.preventDefault();
       gestureRef.current = {
         kind,
         startX: e.clientX,
         startY: e.clientY,
         origin: { ...liveFrameRef.current },
-        moved: false,
       };
-      // The resize grip has no click meaning, so start the visible gesture immediately.
-      if (kind === "resize") {
-        gestureRef.current.moved = true;
-        setGesturing(true);
-        setRect(null);
-      }
+      // Enter gesture mode immediately: drop the mpv hole + show the freeze placeholder so
+      // there is no transparent surface to misalign while the card moves.
+      setGesturing(true);
+      setRect(null);
       window.addEventListener("pointermove", onGestureMove);
       window.addEventListener("pointerup", onGestureEnd, { once: true });
     },
@@ -275,16 +269,13 @@ export default function MiniPlayer() {
         height: `${initialH}px`,
       }}
     >
-      <div className="relative overflow-hidden rounded-[16px] border border-white/[0.1] shadow-2xl [box-shadow:0_20px_50px_-12px_rgba(0,0,0,0.7),inset_0_1px_1px_rgba(255,255,255,0.08)]">
-        {/* Transparent video anchor — MPV draws through here (16:9). Doubles as the drag
-            handle: press-and-move drags the card; a plain click (no travel) expands. */}
+      <div className="relative flex h-full flex-col overflow-hidden rounded-[16px] border border-white/[0.1] shadow-2xl [box-shadow:0_20px_50px_-12px_rgba(0,0,0,0.7),inset_0_1px_1px_rgba(255,255,255,0.08)]">
+        {/* Transparent video anchor — MPV draws through here (16:9). Click to expand; it is
+            NOT a drag handle (dragging the surface fights the hole). */}
         <div
           ref={anchorRef}
-          className={cn(
-            "relative aspect-video w-full touch-none bg-transparent",
-            gesturing ? "cursor-grabbing" : "cursor-grab",
-          )}
-          onPointerDown={(e) => beginGesture("drag", e)}
+          className="relative aspect-video w-full cursor-pointer bg-transparent"
+          onClick={expand}
           role="button"
           tabIndex={0}
           onKeyDown={(e) => {
@@ -293,28 +284,36 @@ export default function MiniPlayer() {
               expand();
             }
           }}
-          aria-label="Drag to move, or press Enter to return to full player"
+          aria-label="Return to full player"
         >
           {/* Freeze-frame placeholder — shown only WHILE dragging/resizing, when the mpv
-              cutout is dropped so the surface isn't visible. Keeps the card looking solid
-              and intentional; the video keeps playing (audio) and snaps back on release. */}
+              cutout is dropped so the surface isn't visible. Opaque, so there's nothing to
+              misalign; the video keeps playing (audio) and snaps back on release. */}
           {gesturing && (
             <div className="absolute inset-0 grid place-items-center bg-ink-850 text-content-muted">
               <span className="flex items-center gap-1.5 text-xs">
-                <GripVertical size={13} strokeWidth={2} aria-hidden />
+                <GripHorizontal size={14} strokeWidth={2} aria-hidden />
                 {isPlaying ? "Playing…" : "Paused"}
               </span>
             </div>
           )}
         </div>
 
-        {/* Control strip */}
-        <div className="flex items-center gap-2 bg-ink-900/80 px-2.5 py-2 backdrop-blur-xl">
+        {/* Control strip — ALSO the drag handle (grab cursor on empty areas). OPAQUE (no
+            backdrop-blur) so it can't flicker against the transparent hole above it. Buttons
+            bail out of the gesture (beginGesture ignores presses that land on a button). */}
+        <div
+          onPointerDown={(e) => beginGesture("drag", e)}
+          className={cn(
+            "flex select-none items-center gap-2 bg-ink-900 px-2.5 py-2",
+            gesturing ? "cursor-grabbing" : "cursor-grab",
+          )}
+        >
           <button
             type="button"
             onClick={togglePlay}
             aria-label={isPlaying ? "Pause" : "Play"}
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-lime text-ink-900 transition-transform hover:scale-105"
+            className="grid h-8 w-8 shrink-0 cursor-pointer place-items-center rounded-full bg-lime text-ink-900 transition-transform hover:scale-105"
           >
             {isPlaying ? (
               <Pause size={15} strokeWidth={2.5} fill="currentColor" aria-hidden />
@@ -322,14 +321,17 @@ export default function MiniPlayer() {
               <Play size={15} strokeWidth={2.5} fill="currentColor" aria-hidden />
             )}
           </button>
-          <span className="min-w-0 flex-1 truncate text-xs text-content-secondary" title={fileName ?? ""}>
+          <span
+            className="min-w-0 flex-1 truncate text-xs text-content-secondary"
+            title={fileName ?? ""}
+          >
             {fileName ?? "Now playing"}
           </span>
           <button
             type="button"
             onClick={expand}
             aria-label="Expand to full player"
-            className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-content-secondary transition-colors hover:bg-white/[0.08] hover:text-content-primary"
+            className="grid h-7 w-7 shrink-0 cursor-pointer place-items-center rounded-full text-content-secondary transition-colors hover:bg-white/[0.08] hover:text-content-primary"
           >
             <Maximize2 size={14} strokeWidth={2} aria-hidden />
           </button>
@@ -337,9 +339,7 @@ export default function MiniPlayer() {
             type="button"
             onClick={close}
             aria-label="Close mini player"
-            className={cn(
-              "grid h-7 w-7 shrink-0 place-items-center rounded-full text-content-secondary transition-colors hover:bg-red-400/10 hover:text-red-400",
-            )}
+            className="grid h-7 w-7 shrink-0 cursor-pointer place-items-center rounded-full text-content-secondary transition-colors hover:bg-red-400/10 hover:text-red-400"
           >
             <X size={14} strokeWidth={2} aria-hidden />
           </button>
@@ -348,14 +348,14 @@ export default function MiniPlayer() {
         {/* Resize grip — bottom-right corner. Drags the width (height follows 16:9). */}
         <div
           onPointerDown={(e) => beginGesture("resize", e)}
-          className="absolute bottom-0 right-0 z-10 h-4 w-4 cursor-nwse-resize touch-none"
+          className="absolute bottom-0 right-0 z-10 h-5 w-5 cursor-nwse-resize touch-none"
           role="separator"
           aria-label="Resize mini player"
           aria-orientation="horizontal"
         >
           <span
             aria-hidden
-            className="pointer-events-none absolute bottom-1 right-1 h-2 w-2 border-b-2 border-r-2 border-white/40"
+            className="pointer-events-none absolute bottom-1 right-1 h-2.5 w-2.5 border-b-2 border-r-2 border-white/50"
           />
         </div>
       </div>
