@@ -909,6 +909,132 @@ pub fn list_materials(conn: &Connection, chapter_id: i64) -> AppResult<Vec<Mater
     Ok(out)
 }
 
+// ── Infinite-depth node tree browser (v6) ─────────────────────────────────────
+//
+// The unified file-explorer browser drills through the `nodes` tree directly (no
+// goal/subject/chapter shim): `node_children` lists a node's direct child folders with
+// rolled-up subtree counts + a cover, `node_ancestors` climbs to the root for the
+// breadcrumb, and `node_materials` lists the files directly under a node (an alias of
+// `list_materials`).
+
+/// A child folder node with rolled-up subtree counts + a cover, for the tree browser
+/// grid. `parent_id` is NULL for root goals.
+#[derive(Debug, serde::Serialize)]
+pub struct NodeCard {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+    pub icon: String,
+    pub color: String,
+    pub depth: i64,
+    /// Direct child folder count (not materials).
+    pub child_count: i64,
+    /// Materials rolled up across this node's whole subtree.
+    pub material_count: i64,
+    pub completed_count: i64,
+    /// One random video material's thumbnail from the subtree (null if none).
+    pub thumbnail_path: Option<String>,
+}
+
+/// One breadcrumb rung (root-first) for the tree browser.
+#[derive(Debug, serde::Serialize)]
+pub struct NodeCrumb {
+    pub id: i64,
+    pub name: String,
+    pub depth: i64,
+}
+
+/// Direct child folder nodes of `parent_id` (or the root goals when `None`), each with
+/// its direct-child count, whole-subtree material/completed rollups, and a cover
+/// thumbnail. Mirrors the count+cover pattern of `list_subjects`; the only difference is
+/// the root case keys on `parent_id IS NULL`.
+pub fn node_children(conn: &Connection, parent_id: Option<i64>) -> AppResult<Vec<NodeCard>> {
+    // Bind `parent_id` once as a nullable param and let `?1 IS NULL` pick the root set.
+    // The `subtree` CTE seeds from each candidate node and walks its descendants so
+    // material counts roll up the ENTIRE subtree (consistent with list_subjects/goals).
+    let sql = "WITH RECURSIVE
+         subtree(top_id, id) AS (
+             SELECT id, id FROM nodes
+              WHERE (?1 IS NULL AND parent_id IS NULL) OR (parent_id = ?1)
+             UNION ALL
+             SELECT st.top_id, n.id FROM nodes n JOIN subtree st ON n.parent_id = st.id
+         )
+         SELECT
+            s.id, s.parent_id, s.name,
+            COALESCE(s.icon, CASE WHEN s.parent_id IS NULL THEN '🎯' ELSE '📚' END) AS icon,
+            COALESCE(s.color, '#AAFF00') AS color,
+            s.depth,
+            (SELECT COUNT(*) FROM nodes cc WHERE cc.parent_id = s.id) AS child_count,
+            COUNT(m.id) AS material_count,
+            COALESCE(SUM(CASE WHEN m.is_completed = 1 THEN 1 ELSE 0 END), 0) AS completed_count,
+            (SELECT m2.thumbnail_path
+               FROM materials m2
+               JOIN subtree st2 ON st2.id = m2.node_id
+               WHERE st2.top_id = s.id
+                 AND m2.file_type = 'video'
+                 AND m2.thumbnail_path IS NOT NULL
+                 AND m2.status = 'active'
+               ORDER BY RANDOM() LIMIT 1) AS thumbnail_path
+         FROM nodes s
+         LEFT JOIN subtree st ON st.top_id = s.id
+         LEFT JOIN materials m ON m.node_id = st.id AND m.status = 'active'
+         WHERE (?1 IS NULL AND s.parent_id IS NULL) OR (s.parent_id = ?1)
+         GROUP BY s.id
+         ORDER BY s.sort_order, s.name";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([parent_id], |r| {
+        Ok(NodeCard {
+            id: r.get(0)?,
+            parent_id: r.get(1)?,
+            name: r.get(2)?,
+            icon: r.get(3)?,
+            color: r.get(4)?,
+            depth: r.get(5)?,
+            child_count: r.get(6)?,
+            material_count: r.get(7)?,
+            completed_count: r.get(8)?,
+            thumbnail_path: r.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The ancestry chain of `node_id`, ROOT-FIRST (root … node), for the breadcrumb.
+/// Empty if the node doesn't exist.
+pub fn node_ancestors(conn: &Connection, node_id: i64) -> AppResult<Vec<NodeCrumb>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE up(id, parent_id, name, depth) AS (
+             SELECT id, parent_id, name, depth FROM nodes WHERE id = ?1
+             UNION ALL
+             SELECT n.id, n.parent_id, n.name, n.depth
+               FROM nodes n JOIN up ON n.id = up.parent_id
+         )
+         SELECT id, name, depth FROM up ORDER BY depth ASC",
+    )?;
+    let rows = stmt.query_map([node_id], |r| {
+        Ok(NodeCrumb {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            depth: r.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Materials sitting directly under a node. Alias of [`list_materials`] (same shape and
+/// ordering) exposed under the tree-browser vocabulary.
+pub fn node_materials(conn: &Connection, node_id: i64) -> AppResult<Vec<MaterialRow>> {
+    list_materials(conn, node_id)
+}
+
 // ── Courses (LMS re-architecture) ─────────────────────────────────────────────
 //
 // `course_view` flattens every material across a subject's chapters into one

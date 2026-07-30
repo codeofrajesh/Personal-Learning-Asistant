@@ -19,6 +19,9 @@ import type {
   HealthReport,
   ImportResult,
   ImportSummary,
+  MaterialRow,
+  NodeCard,
+  NodeCrumb,
   Note,
   PlayerView,
   Recommendation,
@@ -109,6 +112,24 @@ export const ipc = {
    *  Used by the Courses page to default the goal pill tab to the active goal. */
   recentGoalId(): Promise<number | null> {
     return call<number | null>("get_recent_goal");
+  },
+
+  // ── Infinite-depth node tree (v6) ───────────────────────────────────────────
+
+  /** Direct child folder nodes of `parentId` (or the root goals when null), each with
+   *  rolled-up subtree counts + a cover thumbnail. Powers the tree-browser grid. */
+  nodeChildren(parentId: number | null): Promise<NodeCard[]> {
+    return call<NodeCard[]>("node_children", { parentId });
+  },
+
+  /** Ancestry chain for a node, root-first, for the breadcrumb. */
+  nodeAncestors(nodeId: number): Promise<NodeCrumb[]> {
+    return call<NodeCrumb[]>("node_ancestors", { nodeId });
+  },
+
+  /** Materials sitting directly under a node (opened in the player). */
+  nodeMaterials(nodeId: number): Promise<MaterialRow[]> {
+    return call<MaterialRow[]>("node_materials", { nodeId });
   },
 
   /** Player: the material to open + siblings for the chapter sidebar. */

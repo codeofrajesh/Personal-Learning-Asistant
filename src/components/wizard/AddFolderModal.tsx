@@ -107,8 +107,7 @@ export default function AddFolderModal() {
     try {
       const res = await ipc.scanAndImport({
         path,
-        goal_name: goalName.trim(),
-        subject_name: subjectName.trim(),
+        new_root_name: goalName.trim(),
       });
       setResult(res);
       setStep("done");

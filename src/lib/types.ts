@@ -18,19 +18,25 @@ export interface HealthReport {
 
 // ── Folder registration + scan (commands::scanner) ──────────────────────────
 
-/** Input to `scan_and_import` (backend `WizardImport`). */
+/** Input to `scan_and_import` (backend `WizardImport`). The picked folder attaches
+ *  EITHER under an existing node (`parent_node_id`) OR as a new root goal
+ *  (`new_root_name`). Exactly one should be set; if both are, `parent_node_id` wins. */
 export interface WizardImport {
   /** Absolute path of the picked folder. */
   path: string;
-  /** Goal to file this under (created if absent). */
-  goal_name: string;
-  /** Subject within the goal (created if absent). */
-  subject_name: string;
+  /** Existing node to nest the imported folder under (null/omitted → new root). */
+  parent_node_id?: number | null;
+  /** Name for a new root ("Goal") when `parent_node_id` is not set. */
+  new_root_name?: string;
 }
 
-/** One sub-folder → chapter mapping row (backend `ChapterMapping`). */
+/** One preview tree row: a folder that becomes a node at `depth` below the import
+ *  root, with the count of files directly inside it (backend `ChapterMapping`). */
 export interface ChapterMapping {
+  /** Cleaned folder name that becomes a node (the deepest segment). */
   chapter: string;
+  /** Nesting depth below the import root (0 = the import root itself). */
+  depth: number;
   file_count: number;
 }
 
@@ -46,6 +52,8 @@ export interface FolderPreview {
   suggested_subject: string;
   chapters: ChapterMapping[];
   total_files: number;
+  /** Deepest nesting level detected (drives the UI depth-cap warning). */
+  max_depth: number;
   type_counts: TypeCount[];
 }
 
@@ -58,10 +66,10 @@ export interface ScanProgress {
   done: boolean;
 }
 
-/** Outcome of a completed import (backend `ImportResult`). */
+/** Outcome of a completed import (backend `ImportResult`). `root_node_id` is the node
+ *  the folder was imported under (a new root, or the chosen existing parent). */
 export interface ImportResult {
-  goal_id: number;
-  subject_id: number;
+  root_node_id: number;
   chapters_created: number;
   materials_imported: number;
 }
@@ -409,4 +417,32 @@ export interface ImportSummary {
 export interface RescanCounts {
   chapters_created: number;
   materials_imported: number;
+}
+
+// ── Infinite-depth node tree (v6 — commands::nodes) ─────────────────────────
+
+/** A child folder node with rolled-up subtree counts + a cover, for the tree
+ *  browser grid (backend `NodeCard`). `parent_id` is null for root goals. */
+export interface NodeCard {
+  id: number;
+  parent_id: number | null;
+  name: string;
+  icon: string;
+  color: string;
+  /** Nesting depth (0 = root goal). Drives the depth-cap visual cue. */
+  depth: number;
+  /** Direct child folders (not counting materials). */
+  child_count: number;
+  /** Materials rolled up across this node's whole subtree. */
+  material_count: number;
+  completed_count: number;
+  /** Cover image: one random video material's thumbnail from the subtree (null if none). */
+  thumbnail_path: string | null;
+}
+
+/** One breadcrumb rung from `node_ancestors`, root-first (backend `NodeCrumb`). */
+export interface NodeCrumb {
+  id: number;
+  name: string;
+  depth: number;
 }
