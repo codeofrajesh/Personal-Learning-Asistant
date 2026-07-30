@@ -3,44 +3,48 @@
  * driven by `useMaterialManager`). Replaces the three separately-mounted
  * AddFolderWizard instances.
  *
- * Unlike the old wizard (which auto-opened the native picker on mount), this is a
- * deliberate, Goal-first stepper with a visible progress rail:
+ * With the v6 infinite-depth tree (Section 11), a picked disk folder is no longer forced
+ * into a Goal→Subject→Chapter shape. Instead its whole sub-folder tree is mirrored as
+ * nodes to ANY depth, under a destination the user chooses:
  *
- *   Step 1 · Folder   — a clear "Browse…" button (native picker); shows the picked path.
- *   Step 2 · Goal      — assign the folder to a Goal (existing or new). This is the one
- *                        categorization level not derived from disk, so it comes first.
- *   Step 3 · Subject   — editable Subject name (defaulted from the folder) beside a live
- *                        preview of the detected Chapter mapping + file-type tally.
- *   Step 4 · Review    — summary, then Import (progress via `scan://progress`).
- *   Done / Error       — success summary or a retry path.
+ *   Step 1 · Folder        — a clear "Browse…" button (native picker); shows the path.
+ *   Step 2 · Destination   — where should this live?
+ *                              (a) New goal     → free-text `new_root_name`
+ *                              (b) Add into…    → a drill-down node picker → `parent_node_id`
+ *   Step 3 · Review        — depth-aware tree preview + depth-cap warning, then Import
+ *                            (live progress via `scan://progress`).
+ *   Done / Error           — success summary or a retry path.
  *
- * Categorization model (single-level, per product decision): the picked folder = one
- * Subject under the chosen Goal; each top-level sub-folder = one Chapter; files = the
- * materials. Backend upserts by name, so Goal/Subject names are all this flow sends.
+ * The backend upserts nodes by name and derives the sub-folder tree from disk, so all
+ * this flow sends is the destination (a new root name OR an existing parent node id).
  *
  * Degrades cleanly outside the Tauri shell (Browse shows an explanatory error).
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FolderOpen, Check, ChevronLeft } from "lucide-react";
+import { FolderOpen, Check, ChevronLeft, Plus, FolderTree } from "lucide-react";
 import Modal from "../ui/Modal";
-import CategoryPicker from "./CategoryPicker";
 import FolderPreview from "./FolderPreview";
+import NodePicker from "./NodePicker";
+import ComboSelect from "./ComboSelect";
 import { useMaterialManager } from "../../lib/materialManagerStore";
 import { ipc, isTauri, pickFolder, onScanProgress } from "../../lib/ipc";
 import { cn } from "../../lib/utils";
 import type {
   FolderPreview as FolderPreviewDTO,
+  GoalSummary,
   ImportResult,
+  NodeCard,
   ScanProgress,
 } from "../../lib/types";
 
-type Step = "folder" | "goal" | "subject" | "review" | "scanning" | "done" | "error";
+type Step = "folder" | "destination" | "review" | "scanning" | "done" | "error";
+/** Which destination mode the user picked on the Destination step. */
+type DestMode = "new" | "existing";
 
 const STEPS: { id: Step; label: string }[] = [
   { id: "folder", label: "Folder" },
-  { id: "goal", label: "Goal" },
-  { id: "subject", label: "Subject" },
+  { id: "destination", label: "Destination" },
   { id: "review", label: "Review" },
 ];
 
@@ -59,8 +63,10 @@ export default function AddFolderModal() {
   const [step, setStep] = useState<Step>("folder");
   const [path, setPath] = useState<string | null>(null);
   const [preview, setPreview] = useState<FolderPreviewDTO | null>(null);
-  const [goalName, setGoalName] = useState("");
-  const [subjectName, setSubjectName] = useState("");
+  const [destMode, setDestMode] = useState<DestMode>("new");
+  const [newRootName, setNewRootName] = useState("");
+  const [parentNode, setParentNode] = useState<NodeCard | null>(null);
+  const [goals, setGoals] = useState<GoalSummary[]>([]);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [error, setError] = useState<string>("");
@@ -71,11 +77,29 @@ export default function AddFolderModal() {
     setStep("folder");
     setPath(null);
     setPreview(null);
-    setGoalName("");
-    setSubjectName("");
+    setDestMode("new");
+    setNewRootName("");
+    setParentNode(null);
     setProgress(null);
     setResult(null);
     setError("");
+  }, [open]);
+
+  // Load existing goals once (names power the "new goal" reuse hint + combo).
+  useEffect(() => {
+    if (!open || !isTauri()) return;
+    let cancelled = false;
+    ipc
+      .listLibrary()
+      .then((g) => {
+        if (!cancelled) setGoals(g);
+      })
+      .catch(() => {
+        /* empty list is fine */
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open]);
 
   const browse = useCallback(async () => {
@@ -88,11 +112,11 @@ export default function AddFolderModal() {
       const folder = await pickFolder();
       if (!folder) return; // cancelled — stay on the Folder step
       setPath(folder);
-      // Read the folder preview in the background; seed the subject name from it.
+      // Read the folder preview in the background; seed a suggested new-goal name.
       const p = await ipc.previewFolder(folder);
       setPreview(p);
-      setSubjectName((s) => s || p.suggested_subject);
-      setStep("goal");
+      setNewRootName((s) => s || p.suggested_subject);
+      setStep("destination");
     } catch (err) {
       setError(errMsg(err));
       setStep("error");
@@ -105,10 +129,11 @@ export default function AddFolderModal() {
     setProgress(null);
     const unlisten = await onScanProgress((p) => setProgress(p));
     try {
-      const res = await ipc.scanAndImport({
-        path,
-        new_root_name: goalName.trim(),
-      });
+      const res = await ipc.scanAndImport(
+        destMode === "existing" && parentNode
+          ? { path, parent_node_id: parentNode.id }
+          : { path, new_root_name: newRootName.trim() },
+      );
       setResult(res);
       setStep("done");
       notifyImported(res);
@@ -118,37 +143,44 @@ export default function AddFolderModal() {
     } finally {
       unlisten();
     }
-  }, [path, goalName, subjectName, notifyImported]);
+  }, [path, destMode, parentNode, newRootName, notifyImported]);
 
   const activeStepIndex = STEPS.findIndex((s) => s.id === step);
-  const showRail = activeStepIndex >= 0; // folder/goal/subject/review
+  const showRail = activeStepIndex >= 0; // folder/destination/review
+
+  const destinationReady =
+    destMode === "new" ? newRootName.trim().length > 0 : parentNode != null;
 
   const canContinue = useMemo(() => {
     switch (step) {
       case "folder":
         return path != null;
-      case "goal":
-        return goalName.trim().length > 0;
-      case "subject":
-        return subjectName.trim().length > 0 && (preview?.total_files ?? 0) > 0;
+      case "destination":
+        return destinationReady;
       case "review":
-        return goalName.trim().length > 0 && subjectName.trim().length > 0 && (preview?.total_files ?? 0) > 0;
+        return destinationReady && (preview?.total_files ?? 0) > 0;
       default:
         return false;
     }
-  }, [step, path, goalName, subjectName, preview]);
+  }, [step, path, destinationReady, preview]);
 
   const goBack = () => {
-    if (step === "goal") setStep("folder");
-    else if (step === "subject") setStep("goal");
-    else if (step === "review") setStep("subject");
+    if (step === "destination") setStep("folder");
+    else if (step === "review") setStep("destination");
   };
   const goNext = () => {
-    if (step === "folder") setStep("goal");
-    else if (step === "goal") setStep("subject");
-    else if (step === "subject") setStep("review");
+    if (step === "folder") setStep("destination");
+    else if (step === "destination") setStep("review");
     else if (step === "review") void runImport();
   };
+
+  // A human label for the chosen destination (Review step + summary).
+  const destinationLabel =
+    destMode === "existing" && parentNode
+      ? parentNode.name
+      : newRootName.trim() || "—";
+  const reusesExistingGoal =
+    destMode === "new" && goals.some((g) => g.name === newRootName.trim());
 
   // ── Footer ──
   let footer: React.ReactNode = null;
@@ -236,36 +268,54 @@ export default function AddFolderModal() {
           </button>
           {path && <p className="mt-4 truncate text-xs text-content-muted" title={path}>{path}</p>}
           <p className="mx-auto mt-4 max-w-sm text-xs text-content-faint">
-            Pick a folder of videos and documents. It becomes a Subject; its sub-folders become Chapters.
+            Pick a folder of videos and documents. Its sub-folders (at any depth) are mirrored as a browsable tree.
           </p>
         </div>
       )}
 
-      {step === "goal" && (
+      {step === "destination" && (
         <div className="space-y-4">
           <div className="rounded-card border border-glass-border bg-white/[0.02] px-3.5 py-2.5 text-xs text-content-secondary">
-            Assign this folder to a <span className="text-content-primary">Goal</span> — pick an existing one or create a new one.
+            Where should this folder live?
           </div>
-          <CategoryPicker
-            goalName={goalName}
-            subjectName={subjectName}
-            onGoalChange={setGoalName}
-            onSubjectChange={setSubjectName}
-            showSubject={false}
-          />
-        </div>
-      )}
 
-      {step === "subject" && preview && (
-        <div className="grid gap-6 md:grid-cols-2">
-          <CategoryPicker
-            goalName={goalName}
-            subjectName={subjectName}
-            onGoalChange={setGoalName}
-            onSubjectChange={setSubjectName}
-            showGoal={false}
-          />
-          <FolderPreview preview={preview} />
+          {/* Destination mode toggle */}
+          <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Destination">
+            <DestOption
+              active={destMode === "new"}
+              onClick={() => setDestMode("new")}
+              icon={<Plus size={16} strokeWidth={2.5} aria-hidden />}
+              label="New goal"
+              hint="Start a fresh top-level goal"
+            />
+            <DestOption
+              active={destMode === "existing"}
+              onClick={() => setDestMode("existing")}
+              icon={<FolderTree size={16} strokeWidth={2} aria-hidden />}
+              label="Add into existing"
+              hint="Nest inside a folder you already have"
+            />
+          </div>
+
+          {destMode === "new" ? (
+            <ComboSelect
+              id="wizard-new-root"
+              label="Goal name"
+              value={newRootName}
+              onChange={setNewRootName}
+              options={goals.map((g) => ({ id: g.id, name: g.name }))}
+              forceTextFallback={!isTauri()}
+              placeholder="Pick a goal…"
+              createNewPlaceholder="e.g. Become a Full-Stack Developer"
+              helperText="Reused if a goal with this name already exists."
+              emptyHint="No goals yet — create your first one."
+            />
+          ) : (
+            <NodePicker
+              selectedId={parentNode?.id ?? null}
+              onSelect={setParentNode}
+            />
+          )}
         </div>
       )}
 
@@ -273,14 +323,23 @@ export default function AddFolderModal() {
         <div className="space-y-4">
           <div className="rounded-card border border-glass-border bg-white/[0.02] p-4">
             <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
-              <dt className="text-content-muted">Goal</dt>
-              <dd className="truncate font-medium text-content-primary">{goalName}</dd>
-              <dt className="text-content-muted">Subject</dt>
-              <dd className="truncate font-medium text-content-primary">{subjectName}</dd>
+              <dt className="text-content-muted">Destination</dt>
+              <dd className="flex min-w-0 items-center gap-2 truncate font-medium text-content-primary">
+                <span className="truncate">{destinationLabel}</span>
+                <span className="shrink-0 rounded-full bg-white/[0.06] px-2 py-0.5 text-[0.65rem] font-semibold uppercase tracking-wide text-content-muted">
+                  {destMode === "existing"
+                    ? "existing folder"
+                    : reusesExistingGoal
+                      ? "existing goal"
+                      : "new goal"}
+                </span>
+              </dd>
               <dt className="text-content-muted">Files</dt>
               <dd className="font-medium text-lime">{preview.total_files}</dd>
-              <dt className="text-content-muted">Chapters</dt>
+              <dt className="text-content-muted">Folders</dt>
               <dd className="font-medium text-lime">{preview.chapters.length}</dd>
+              <dt className="text-content-muted">Max depth</dt>
+              <dd className="font-medium text-content-primary">{preview.max_depth}</dd>
             </dl>
           </div>
           <FolderPreview preview={preview} />
@@ -295,7 +354,7 @@ export default function AddFolderModal() {
           <p className="text-content-primary">
             Imported <span className="font-semibold text-lime">{result.materials_imported}</span> file
             {result.materials_imported === 1 ? "" : "s"} across{" "}
-            <span className="font-semibold text-lime">{result.chapters_created}</span> chapter
+            <span className="font-semibold text-lime">{result.chapters_created}</span> folder
             {result.chapters_created === 1 ? "" : "s"}.
           </p>
           <p className="mt-2 text-xs text-content-faint">Thumbnails are generating in the background.</p>
@@ -306,6 +365,42 @@ export default function AddFolderModal() {
         <div className="rounded-card border border-orange/30 bg-orange/[0.06] p-4 text-sm text-orange">{error}</div>
       )}
     </Modal>
+  );
+}
+
+/** A destination-mode radio card (New goal | Add into existing). */
+function DestOption({
+  active,
+  onClick,
+  icon,
+  label,
+  hint,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  label: string;
+  hint: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={active}
+      onClick={onClick}
+      className={cn(
+        "flex flex-col items-start gap-1 rounded-card border px-3.5 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-lime/40",
+        active
+          ? "border-lime/50 bg-lime/[0.06]"
+          : "border-glass-border bg-white/[0.02] hover:bg-white/[0.04]",
+      )}
+    >
+      <span className={cn("flex items-center gap-2 text-sm font-semibold", active ? "text-lime" : "text-content-primary")}>
+        {icon}
+        {label}
+      </span>
+      <span className="text-xs text-content-muted">{hint}</span>
+    </button>
   );
 }
 
