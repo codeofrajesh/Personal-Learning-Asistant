@@ -147,6 +147,13 @@ impl WatcherManager {
     }
 }
 
+/// True if `path` is `root` itself or lies inside it, compared on path components (not raw
+/// string prefix) so `.../Math` never matches an event under `.../Math2`.
+fn path_within(path: &Path, root: &str) -> bool {
+    let root = Path::new(root);
+    path == root || path.starts_with(root)
+}
+
 /// Map a notify event to its watch root and schedule a debounced rescan.
 fn handle_event(
     app: &AppHandle,
@@ -154,13 +161,15 @@ fn handle_event(
     roots: &Arc<Mutex<Vec<WatchRoot>>>,
     pending: &Arc<Mutex<HashSet<i64>>>,
 ) {
-    // Find the watch root whose path is a prefix of any event path.
+    // Find the watch root that actually CONTAINS an event path. A raw string `starts_with`
+    // would mis-route sibling folders that share a name prefix (".../Math" vs ".../Math2"),
+    // triggering a needless rescan of the wrong root — use a path-boundary-aware check.
     let root = {
         let rs = roots.lock().unwrap();
-        event.paths.iter().find_map(|p| {
-            let pstr = p.to_string_lossy();
-            rs.iter().find(|r| pstr.starts_with(&r.path)).cloned()
-        })
+        event
+            .paths
+            .iter()
+            .find_map(|p| rs.iter().find(|r| path_within(p, &r.path)).cloned())
     };
     let Some(root) = root else { return };
 

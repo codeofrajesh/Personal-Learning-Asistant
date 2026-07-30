@@ -38,6 +38,10 @@ static EXTRACTING: AtomicBool = AtomicBool::new(false);
 
 /// Hard ceiling on simultaneous ffmpeg/ffprobe processes (keeps the CPU calm).
 const MAX_CONCURRENT: usize = 2;
+/// Give up on a file after this many failed metadata passes. Corrupt/unsupported files
+/// otherwise stay NULL forever and get re-ffmpeg'd on every boot/import — a recurring CPU
+/// spike. After this many tries the row is excluded from future passes (v7).
+const MAX_METADATA_ATTEMPTS: i64 = 3;
 /// Thumbnail width in px; height auto (`-2` keeps aspect + even dimension).
 const THUMB_WIDTH: u32 = 640;
 /// LRU cap on the thumbnail cache (4GB / 10-15GB-free-SSD target). At ~40KB per
@@ -98,14 +102,17 @@ pub async fn extract_missing_metadata(app: AppHandle) -> AppResult<()> {
 
     let db = app.state::<Db>();
     let pending = db.with(|conn| {
+        // Exclude files that have already failed MAX_METADATA_ATTEMPTS times, so a corrupt
+        // or unsupported file is not re-ffmpeg'd on every boot/import forever.
         let mut stmt = conn.prepare(
             "SELECT id, file_path, file_type
              FROM materials
              WHERE status = 'active'
                AND file_type IN ('video', 'audio')
+               AND metadata_attempts < ?1
                AND (duration_secs IS NULL OR (file_type = 'video' AND thumbnail_path IS NULL))",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([MAX_METADATA_ATTEMPTS], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -234,32 +241,35 @@ async fn process_one(
         }
     }
 
-    // Persist + notify (only if we learned something).
-    if duration.is_some() || thumb_path.is_some() {
-        let d = duration;
-        let t = thumb_path.clone();
-        let db = app.state::<Db>();
-        let res = db.with_mut(move |conn| {
-            let count = conn.execute(
-                "UPDATE materials
-                 SET duration_secs = COALESCE(?1, duration_secs),
-                     thumbnail_path = COALESCE(?2, thumbnail_path),
-                     updated_at = datetime('now')
-                 WHERE id = ?3",
-                rusqlite::params![d, t, id],
-            )?;
-            Ok(count)
-        });
+    // Always bump metadata_attempts (so repeated failures eventually exhaust the cap and
+    // the file drops out of future passes), and fill in whatever we learned this pass.
+    let learned = duration.is_some() || thumb_path.is_some();
+    let d = duration;
+    let t = thumb_path.clone();
+    let db = app.state::<Db>();
+    let res = db.with_mut(move |conn| {
+        let count = conn.execute(
+            "UPDATE materials
+             SET duration_secs     = COALESCE(?1, duration_secs),
+                 thumbnail_path    = COALESCE(?2, thumbnail_path),
+                 metadata_attempts = metadata_attempts + 1,
+                 updated_at        = CASE WHEN ?1 IS NOT NULL OR ?2 IS NOT NULL
+                                          THEN datetime('now') ELSE updated_at END
+             WHERE id = ?3",
+            rusqlite::params![d, t, id],
+        )?;
+        Ok(count)
+    });
 
-        if res.is_ok() {
-            let _ = app.emit(
-                "metadata://extracted",
-                MetadataExtractedEvent {
-                    material_id: id,
-                    duration_secs: duration,
-                    thumbnail_path: thumb_path,
-                },
-            );
-        }
+    // Only notify the UI when we actually produced new metadata.
+    if learned && res.is_ok() {
+        let _ = app.emit(
+            "metadata://extracted",
+            MetadataExtractedEvent {
+                material_id: id,
+                duration_secs: duration,
+                thumbnail_path: thumb_path,
+            },
+        );
     }
 }

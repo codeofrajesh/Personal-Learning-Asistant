@@ -88,19 +88,70 @@ pub fn upsert_child_node(conn: &Connection, parent_id: i64, name: &str) -> AppRe
 }
 
 /// Insert (or refresh) a single material row under `node_id`. Keyed on the UNIQUE
-/// `file_path` so a rescan updates the existing row instead of erroring or duplicating.
-pub fn insert_material(conn: &Connection, node_id: i64, file: &ScannedFile) -> AppResult<()> {
+/// `file_path`. Returns `true` if a row was actually written (inserted or genuinely
+/// changed), `false` if the existing row already matched and was left untouched.
+///
+/// **Why the read-first diff:** the watcher re-walks + re-imports the whole tree on any
+/// file event, and a plain `ON CONFLICT ... DO UPDATE` always bumps `updated_at`, so every
+/// rescan "changed" every row and fired the `materials_au` FTS triggers across the ENTIRE
+/// library each time — a major CPU spike on a large tree. By skipping the UPDATE when the
+/// scanned fields already match, an unchanged rescan performs zero writes and zero FTS work.
+pub fn insert_material(conn: &Connection, node_id: i64, file: &ScannedFile) -> AppResult<bool> {
+    // Existing row's scan-relevant fields (if any), keyed on the UNIQUE file_path.
+    let existing: Option<(i64, String, String, String, i64, String)> = conn
+        .query_row(
+            "SELECT node_id, file_name, file_type, file_extension, file_size_bytes, status
+             FROM materials WHERE file_path = ?1",
+            [&file.path],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    if let Some((e_node, e_name, e_type, e_ext, e_size, e_status)) = existing {
+        // Unchanged (and already active) → no write, so the FTS triggers never fire.
+        if e_node == node_id
+            && e_name == file.name
+            && e_type == file.file_type
+            && e_ext == file.extension
+            && e_size == file.size_bytes
+            && e_status == "active"
+        {
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE materials SET
+                 node_id         = ?1,
+                 file_name       = ?2,
+                 file_type       = ?3,
+                 file_extension  = ?4,
+                 file_size_bytes = ?5,
+                 status          = 'active',
+                 updated_at      = datetime('now')
+             WHERE file_path = ?6",
+            rusqlite::params![
+                node_id,
+                file.name,
+                file.file_type,
+                file.extension,
+                file.size_bytes,
+                file.path,
+            ],
+        )?;
+        return Ok(true);
+    }
+
     conn.execute(
         "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension, file_size_bytes)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(file_path) DO UPDATE SET
-             node_id         = excluded.node_id,
-             file_name       = excluded.file_name,
-             file_type       = excluded.file_type,
-             file_extension  = excluded.file_extension,
-             file_size_bytes = excluded.file_size_bytes,
-             status          = 'active',
-             updated_at      = datetime('now')",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             node_id,
             file.path,
@@ -110,7 +161,7 @@ pub fn insert_material(conn: &Connection, node_id: i64, file: &ScannedFile) -> A
             file.size_bytes,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 /// Number of materials imported.
@@ -156,8 +207,11 @@ pub fn import_tree(
         }
         let label = group.rel_segments.last().cloned().unwrap_or_default();
         for file in &group.files {
-            insert_material(&tx, parent, file)?;
-            materials_imported += 1;
+            // Only count rows that were actually inserted/changed — an unchanged rescan
+            // now writes (and reports) nothing instead of churning the whole library.
+            if insert_material(&tx, parent, file)? {
+                materials_imported += 1;
+            }
         }
         on_progress(&label, materials_imported);
     }
@@ -2542,4 +2596,68 @@ pub fn merge_import(conn: &mut Connection, payload: &ExportPayload) -> AppResult
 
     tx.commit()?;
     Ok(counts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::connection::test_conn;
+    use crate::scanner::walker::{ScannedFile, ScannedNode};
+
+    fn file(path: &str, name: &str, size: i64) -> ScannedFile {
+        ScannedFile {
+            path: path.to_string(),
+            name: name.to_string(),
+            file_type: "video".to_string(),
+            extension: "mp4".to_string(),
+            size_bytes: size,
+        }
+    }
+
+    /// insert_material diffs: a first import writes the row, a byte-identical re-import
+    /// writes NOTHING (returns false), and a genuine change writes again (returns true).
+    /// This is what stops the watcher's re-import from churning the whole FTS index.
+    #[test]
+    fn insert_material_skips_unchanged_rows() {
+        let conn = test_conn();
+        let root = upsert_root_node(&conn, "Course").unwrap();
+
+        let f = file("/lib/a.mp4", "a.mp4", 100);
+        assert!(insert_material(&conn, root, &f).unwrap(), "first insert writes");
+        assert!(
+            !insert_material(&conn, root, &f).unwrap(),
+            "identical re-import must be a no-op (no FTS churn)"
+        );
+
+        let changed = file("/lib/a.mp4", "a.mp4", 200); // size changed
+        assert!(
+            insert_material(&conn, root, &changed).unwrap(),
+            "a real change writes"
+        );
+        assert!(
+            !insert_material(&conn, root, &changed).unwrap(),
+            "then settles to a no-op again"
+        );
+    }
+
+    /// import_tree reports only rows that actually changed, so an unchanged rescan of a
+    /// large library reports 0 imported (and does 0 writes) instead of the full count.
+    #[test]
+    fn import_tree_counts_only_changed_on_rescan() {
+        let mut conn = test_conn();
+        let root = upsert_root_node(&conn, "Course").unwrap();
+        let nodes = vec![ScannedNode {
+            rel_segments: vec!["Ch1".to_string()],
+            files: vec![file("/lib/Ch1/a.mp4", "a.mp4", 1), file("/lib/Ch1/b.mp4", "b.mp4", 2)],
+        }];
+
+        let first = import_tree(&mut conn, root, &nodes, |_, _| {}).unwrap();
+        assert_eq!(first.materials_imported, 2);
+
+        let second = import_tree(&mut conn, root, &nodes, |_, _| {}).unwrap();
+        assert_eq!(
+            second.materials_imported, 0,
+            "unchanged rescan writes nothing"
+        );
+    }
 }

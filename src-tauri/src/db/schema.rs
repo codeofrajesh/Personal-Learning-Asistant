@@ -15,7 +15,10 @@
 ///     `materials.node_id` replaces `chapter_id`; `registered_dirs.root_node_id`
 ///     replaces goal_id/subject_id/chapter_id. Legacy goals/subjects/chapters tables
 ///     are migrated into `nodes` then dropped. See `migrate_v6_tree` in connection.rs.
-pub const SCHEMA_VERSION: i64 = 6;
+/// v7: added `materials.metadata_attempts` — a counter so the thumbnail/duration engine
+///     stops re-running ffmpeg on files that repeatedly fail to yield metadata (corrupt /
+///     unsupported), which otherwise re-spawned ffmpeg for them on every boot/import.
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The complete v1 schema. Every statement is `IF NOT EXISTS` where SQLite allows,
 /// so re-application is a no-op.
@@ -64,6 +67,7 @@ CREATE TABLE IF NOT EXISTS materials (
     is_completed    INTEGER DEFAULT 0,
     last_opened_at  TEXT,
     sort_order      INTEGER DEFAULT 0,
+    metadata_attempts INTEGER NOT NULL DEFAULT 0,  -- times the metadata engine tried this file (v7)
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );

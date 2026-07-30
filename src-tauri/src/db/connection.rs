@@ -68,6 +68,16 @@ impl Db {
     }
 }
 
+/// A fully-migrated in-memory connection for unit tests in other db modules
+/// (e.g. `queries::tests`). Panics on failure — tests want a hard stop.
+#[cfg(test)]
+pub(crate) fn test_conn() -> Connection {
+    let conn = Connection::open_in_memory().expect("open in-memory db");
+    configure_pragmas(&conn).expect("pragmas");
+    migrate(&conn).expect("migrate");
+    conn
+}
+
 /// Apply connection-level pragmas. WAL + a generous busy timeout is the spec's
 /// answer to "database locked" (Section 3 error table).
 fn configure_pragmas(conn: &Connection) -> AppResult<()> {
@@ -137,6 +147,13 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         // tasks table (the consistency_log table is created by SCHEMA_SQL above).
         if !column_exists(conn, "tasks", "estimated_mins")? {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN estimated_mins INTEGER")?;
+        }
+        // v7: materials.metadata_attempts — add it to pre-v7 databases that already have the
+        // materials table (fresh installs get it from CREATE TABLE above).
+        if !column_exists(conn, "materials", "metadata_attempts")? {
+            conn.execute_batch(
+                "ALTER TABLE materials ADD COLUMN metadata_attempts INTEGER NOT NULL DEFAULT 0",
+            )?;
         }
         Ok(())
     })();
