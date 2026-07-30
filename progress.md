@@ -424,3 +424,137 @@ npm run release
 Once pushed, **GitHub Actions** will automatically compile the app in the cloud, sign the installer, and publish it. Within ~15 minutes, anyone using the app can click "Check for Updates" to receive the new version!
 
 *(Note: You can also specify the bump type by running `npm run release minor` or `npm run release major`)*
+
+---
+
+## 11. Infinite-Depth Categorization Tree (IN PROGRESS — backend done, frontend remaining)
+
+Replacing the rigid **Goal → Subject → Chapter → Material** hierarchy with a single
+self-referencing **`nodes`** adjacency-list tree so a folder can nest to ANY depth (UPSC:
+Goal→GS2→Polity→Topic→Sub-topic→Material) OR stay flat (casual learner: one Goal with files
+dumped directly in it). Approved decisions: **(1) in-place v6 migration** (preserve
+progress/notes), **(2) unified tree browser** replaces the old `/library/*` pages, **(3)
+depth-cap WARNING** in the UI past a threshold (breadcrumb still scrolls; nesting stays
+unlimited in the DB).
+
+### 11.1 Architecture (the model)
+- **`nodes` table** (adjacency list): `id, parent_id (NULL = root/"Goal"), name, kind
+  ('root'|'folder'), description, icon, color, depth (denormalized = parent.depth+1),
+  path, sort_order, created_at, updated_at`, `UNIQUE(parent_id, name)`. Indexes on
+  `parent_id`, `depth`, `path`.
+- **`materials.node_id`** replaces `chapter_id` (FK → nodes, ON DELETE CASCADE). Material
+  `id`s are PRESERVED by the migration, so `watch_progress` / `notes` / `study_sessions` /
+  `tasks.material_id` all stay valid.
+- **`registered_dirs.root_node_id`** replaces `goal_id`/`subject_id`/`chapter_id`/
+  `category_level`. The watcher keys on it.
+- **Legacy tables dropped** (`goals`, `subjects`, `chapters`) after migration.
+- **Tree reads use `WITH RECURSIVE`.** Direct children = plain
+  `WHERE parent_id = ?` (index-backed). Subtree rollups + ancestry via recursive CTEs.
+- **Backward-compat shim — `MAT_ANC_CTE`** (a `pub const` in `queries.rs`): a reusable set
+  of CTEs that, for any material, resolves its immediate parent node (its "chapter"), its
+  **depth-1 ancestor** (its "subject"), and its **root ancestor** (its "goal"). This lets
+  every existing DTO (`RecentMaterial`, `NextUpItem`, `SubjectSummary`, `CourseLesson`,
+  `PlayerMaterial`, `SearchResult`, `Recommendation`) keep its `goal_*`/`subject_*`/
+  `chapter_*` field names UNCHANGED while the store is a tree. Shallow trees fall back
+  sensibly (root doubles as subject). **Covers now use each material's OWN
+  `thumbnail_path`** (CoverArt handles the gradient fallback) instead of the old
+  random-subject-cover subquery.
+
+### 11.2 DONE (committed, `cargo test` 9/9 green, `cargo build` clean)
+- **Phase 1** (`schema.rs` + `connection.rs`): `SCHEMA_VERSION = 6`; fresh installs get
+  `nodes`; `migrate_v6_tree()` does the in-place surgery (FK OFF → create nodes → insert
+  goals(depth0)/subjects(depth1)/chapters(depth2) building old→new id maps → add
+  `materials.node_id` + map from chapter_id → drop `chapter_id` → add
+  `registered_dirs.root_node_id` + map from subject_id → drop legacy cols → drop
+  goals/subjects/chapters → `foreign_key_check` → FK ON). Test:
+  `migrates_pre_v6_hierarchy_into_nodes_tree`.
+- **Phase 2** (`queries.rs`): all ~20 coupled functions rewired to nodes via `MAT_ANC_CTE`
+  + recursive subtree CTEs. New write helpers: `upsert_root_node`, `upsert_child_node`,
+  `insert_material(node_id,…)`, `import_tree(root_node_id, &[ScannedNode], on_progress)`,
+  `insert_registered_dir(path, root_node_id)`. Rewrote `list_goals_with_counts`,
+  `list_subjects`, `list_chapters`, `goal_detail`, `subject_detail`, `chapter_detail`,
+  `list_materials`, `course_lessons`, `recommended_materials`, `get_recent_goal`,
+  `material_for_player`, `search_materials`, `continue_learning`/`bookmarked`/`next_up`
+  (via `recent_select()`), `mark_subject_missing_except(root_node_id,…)`, `build_export`,
+  `merge_import`. **DTO field names/shapes UNCHANGED** except `ImportResult` (below).
+- **Phase 3** (`walker.rs` + `scanner.rs` + `settings.rs` + `watcher.rs`): `scan_tree()`
+  recursively mirrors arbitrary folder depth → `Vec<ScannedNode>` (`rel_segments` =
+  cleaned folder chain, empty = import root; `files` = files directly in that folder).
+  `folder_segments()` cleans each segment via `strip_chapter_prefix`. `scan_and_import`
+  resolves destination (existing `parent_node_id` OR new root via `new_root_name`) and
+  calls `import_tree`. Rescan + watcher use `scan_tree`/`import_tree`/`root_node_id`. Test:
+  `scan_tree_mirrors_arbitrary_depth`.
+
+### 11.3 BREAKING API CHANGES the frontend must absorb (Phase 6 — do FIRST)
+- **`WizardImport`** (Rust `commands/scanner.rs`) is now
+  `{ path: string, parent_node_id?: number | null, new_root_name?: string }`.
+  The old `goal_name` / `subject_name` fields are GONE. `src/lib/types.ts` `WizardImport`
+  and `src/lib/ipc.ts` `scanAndImport` must be updated to match.
+- **`ImportResult`** is now `{ root_node_id, chapters_created, materials_imported }` — the
+  old `goal_id` / `subject_id` fields are GONE. Update `types.ts` + any consumer
+  (`materialManagerStore.ts` stores it; check no one reads `.goal_id`/`.subject_id`).
+- **`FolderPreview`** gained `max_depth: number`; each `ChapterMapping` gained
+  `depth: number` (was `{chapter, file_count}`, now `{chapter, depth, file_count}`).
+- Existing IPC commands STILL WORK unchanged (they return the same DTO shapes via the
+  shim): `goal_view`, `subject_view`, `chapter_view`, `course_view`, `list_library`,
+  `dashboard_data`, `open_material`, `search_materials`, `recommended_materials`,
+  `get_recent_goal`, `rescan_folder`, etc. So the app will still RUN on the old UI once the
+  two struct mismatches above are fixed — that's the minimum to get `npm run build` green.
+
+### 11.4 REMAINING WORK
+- **Phase 6 (do first, unblocks build):** update `types.ts` + `ipc.ts` for the 3 changed
+  DTOs above. Add NEW node IPC the tree browser needs (backend commands DO NOT EXIST YET —
+  must be added in `commands/` + registered in `lib.rs`):
+  - `node_children(parent_id: Option<i64>) -> Vec<NodeCard>` — direct child nodes of a node
+    (or roots when null), each with rolled-up subtree material/completed counts + a cover
+    thumbnail + `depth`. (Reuse the subtree-count CTE pattern from `list_subjects`.)
+  - `node_ancestors(node_id) -> Vec<{id,name,depth}>` — for the breadcrumb (recursive climb).
+  - `node_materials(node_id) -> Vec<MaterialRow>` — materials directly under a node
+    (`list_materials` already does exactly this; just expose/alias it).
+  - Optionally `node_detail(node_id)` for the header. Add matching `ipc.ts` wrappers + TS
+    types (`NodeCard`, `NodeCrumb`).
+- **Phase 4 — `AddFolderModal.tsx`** (`src/components/wizard/`): replace the Goal+Subject
+  step (`CategoryPicker`) with a **destination step**: (a) "New goal" → free-text
+  `new_root_name`; (b) "Add into existing" → a tree/node picker selecting `parent_node_id`.
+  Update the preview step to render the depth-aware folder tree (indented, uses
+  `ChapterMapping.depth`) and show a **depth-cap warning** when `max_depth` exceeds the
+  threshold (propose 6). Send the new `WizardImport` shape.
+- **Phase 5 — unified tree browser:** turn `CoursesPage.tsx` into a file-explorer:
+  `currentNodeId` state (null = roots), breadcrumb from `node_ancestors` (scrolls +
+  depth-cap visual cue past threshold), grid = child folder cards (`node_children`, drill
+  down on click) PLUS materials directly on the node (`node_materials`, open in player).
+  Deep-link `/courses/:nodeId?`. Then REPLACE the old Library pages: `Library.tsx`,
+  `GoalPage.tsx`, `SubjectPage.tsx`, `ChapterPage.tsx` either redirect into the tree
+  browser or are removed from the router (`src/App.tsx`) — pick one unified navigation
+  model (the browser). Keep `PlayerPage`/`CourseDetailPage` working (their IPC is unchanged
+  via the shim, so they can stay until the browser fully subsumes them).
+- **Phase 7:** update this doc's status to DONE + note the final routing.
+
+### 11.5 Execution strategy & gotchas for the next session
+- **Order:** Phase 6 (types/ipc + new node commands) → verify `npm run build` green →
+  Phase 4 → Phase 5 → cleanup routes → docs. Commit per phase (`git -c user.name="PLE Dev"
+  -c user.email="dev@ple.local" commit`). Current clean checkpoint is committed; revert
+  with `git reset --hard <sha>` (see `git log --oneline`).
+- **Verify pattern:** `npm run build` (tsc+Vite) for frontend; from `src-tauri`,
+  `cargo build` then `cargo test --lib` (expect 9/9). SQL errors surface at RUNTIME only
+  (rusqlite isn't compile-checked), so exercise the actual flows in `npm run tauri dev`.
+- **Gotchas:**
+  - Roots have `parent_id IS NULL`; SQLite `UNIQUE(parent_id,name)` treats NULLs as
+    distinct, so you CANNOT `ON CONFLICT` on roots — look up by name first
+    (`upsert_root_node` already does this; mirror it anywhere you create roots).
+  - `PRAGMA foreign_keys` can only toggle OUTSIDE a transaction — the migration does this
+    around its own BEGIN/COMMIT; don't nest it.
+  - The `MAT_ANC_CTE` const is prefixed onto queries with `format!("WITH {MAT_ANC_CTE} …")`
+    — when a query needs its OWN extra CTE, chain with a comma:
+    `format!("WITH {MAT_ANC_CTE}, ranked AS (…) …")` (see `next_up`, `recommended_materials`).
+  - Depth cap is UI-only (warn, don't block); DB depth stays unlimited.
+  - Skills for the remaining UI work (per the skill analysis): **ui-ux-pro-max**
+    (breadcrumb/tree/drill-down IA), **web-design-guidelines** (a11y: `aria-current`,
+    focus, target size, breadcrumb overflow), **design-taste-frontend** (glass/palette/
+    shape-lock taste — rules only, keep GSAP+lucide+Zustand stack), **gsap-react** +
+    **gsap-performance** (drill-down entrance staggers, transform/opacity + reduced-motion),
+    **vercel-react-best-practices** (per-node fetch hygiene, avoid waterfalls/re-renders).
+    Backend/SQL work uses NO skill.
+
+Verification at handoff: `cargo build` clean; `cargo test --lib` 9/9 green. Frontend build
+is currently RED until Phase 6 fixes the `WizardImport`/`ImportResult` type mismatch.
