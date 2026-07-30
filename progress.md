@@ -427,7 +427,7 @@ Once pushed, **GitHub Actions** will automatically compile the app in the cloud,
 
 ---
 
-## 11. Infinite-Depth Categorization Tree (IN PROGRESS — backend done, frontend remaining)
+## 11. Infinite-Depth Categorization Tree (DONE — all phases shipped)
 
 Replacing the rigid **Goal → Subject → Chapter → Material** hierarchy with a single
 self-referencing **`nodes`** adjacency-list tree so a folder can nest to ANY depth (UPSC:
@@ -485,7 +485,7 @@ unlimited in the DB).
   calls `import_tree`. Rescan + watcher use `scan_tree`/`import_tree`/`root_node_id`. Test:
   `scan_tree_mirrors_arbitrary_depth`.
 
-### 11.3 BREAKING API CHANGES the frontend must absorb (Phase 6 — do FIRST)
+### 11.3 BREAKING API CHANGES the frontend absorbed (Phase 6 — DONE)
 - **`WizardImport`** (Rust `commands/scanner.rs`) is now
   `{ path: string, parent_node_id?: number | null, new_root_name?: string }`.
   The old `goal_name` / `subject_name` fields are GONE. `src/lib/types.ts` `WizardImport`
@@ -501,60 +501,57 @@ unlimited in the DB).
   `get_recent_goal`, `rescan_folder`, etc. So the app will still RUN on the old UI once the
   two struct mismatches above are fixed — that's the minimum to get `npm run build` green.
 
-### 11.4 REMAINING WORK
-- **Phase 6 (do first, unblocks build):** update `types.ts` + `ipc.ts` for the 3 changed
-  DTOs above. Add NEW node IPC the tree browser needs (backend commands DO NOT EXIST YET —
-  must be added in `commands/` + registered in `lib.rs`):
-  - `node_children(parent_id: Option<i64>) -> Vec<NodeCard>` — direct child nodes of a node
-    (or roots when null), each with rolled-up subtree material/completed counts + a cover
-    thumbnail + `depth`. (Reuse the subtree-count CTE pattern from `list_subjects`.)
-  - `node_ancestors(node_id) -> Vec<{id,name,depth}>` — for the breadcrumb (recursive climb).
-  - `node_materials(node_id) -> Vec<MaterialRow>` — materials directly under a node
-    (`list_materials` already does exactly this; just expose/alias it).
-  - Optionally `node_detail(node_id)` for the header. Add matching `ipc.ts` wrappers + TS
-    types (`NodeCard`, `NodeCrumb`).
-- **Phase 4 — `AddFolderModal.tsx`** (`src/components/wizard/`): replace the Goal+Subject
-  step (`CategoryPicker`) with a **destination step**: (a) "New goal" → free-text
-  `new_root_name`; (b) "Add into existing" → a tree/node picker selecting `parent_node_id`.
-  Update the preview step to render the depth-aware folder tree (indented, uses
-  `ChapterMapping.depth`) and show a **depth-cap warning** when `max_depth` exceeds the
-  threshold (propose 6). Send the new `WizardImport` shape.
-- **Phase 5 — unified tree browser:** turn `CoursesPage.tsx` into a file-explorer:
-  `currentNodeId` state (null = roots), breadcrumb from `node_ancestors` (scrolls +
-  depth-cap visual cue past threshold), grid = child folder cards (`node_children`, drill
-  down on click) PLUS materials directly on the node (`node_materials`, open in player).
-  Deep-link `/courses/:nodeId?`. Then REPLACE the old Library pages: `Library.tsx`,
-  `GoalPage.tsx`, `SubjectPage.tsx`, `ChapterPage.tsx` either redirect into the tree
-  browser or are removed from the router (`src/App.tsx`) — pick one unified navigation
-  model (the browser). Keep `PlayerPage`/`CourseDetailPage` working (their IPC is unchanged
-  via the shim, so they can stay until the browser fully subsumes them).
-- **Phase 7:** update this doc's status to DONE + note the final routing.
+### 11.4 DONE — frontend phases (committed; `npm run build` + `cargo build`/`cargo test --lib` 9/9 all green)
+- **Phase 6** (`types.ts` + `ipc.ts` + new node IPC): absorbed the 3 changed DTOs
+  (`WizardImport` {path, parent_node_id?, new_root_name?}, `ImportResult` {root_node_id,
+  chapters_created, materials_imported}, `FolderPreview` +`max_depth` / `ChapterMapping`
+  +`depth`). Added `commands/nodes.rs` (registered in `lib.rs`) + `queries.rs` helpers:
+  - `node_children(parent_id: Option<i64>) -> Vec<NodeCard>` — direct child folders of a
+    node (or roots when null); `?1 IS NULL` picks the root set; whole-subtree material/
+    completed rollups + a cover thumbnail + `depth` + `child_count` (list_subjects pattern).
+  - `node_ancestors(node_id) -> Vec<NodeCrumb{id,name,depth}>` — root-first breadcrumb
+    (recursive climb, `ORDER BY depth ASC`).
+  - `node_materials(node_id)` — thin alias of `list_materials`.
+  - New TS types `NodeCard` / `NodeCrumb`; `ipc.nodeChildren/nodeAncestors/nodeMaterials`.
+  - Also fixed a pre-existing **malformed `package.json`** (its `"scripts": {` opening line
+    was missing, so npm couldn't parse it and no frontend build/verify could run).
+- **Phase 4** (`AddFolderModal.tsx`): replaced the Goal+Subject stepper with a 3-step flow
+  Folder → **Destination** → Review. Destination offers (a) "New goal" (free-text
+  `new_root_name`, reuse-by-name via `ComboSelect`) or (b) "Add into existing" (new
+  `NodePicker.tsx` — a drill-down node tree over `nodeChildren`, select a `parent_node_id`).
+  `FolderPreview.tsx` is now a **depth-aware indented tree** (uses `ChapterMapping.depth`)
+  with a **non-blocking depth-cap warning** at `DEPTH_CAP = 6` (exported from FolderPreview).
+  `CategoryPicker.tsx` is now unused (left in tree, no importers).
+- **Phase 5** (`CoursesPage.tsx` → unified file-explorer tree browser): drills the `nodes`
+  tree at `/courses` (roots) and `/courses/:nodeId` (a node's child `FolderCard`s +
+  materials-directly-on-node rows). Breadcrumb from `node_ancestors` (scrolls when deep +
+  depth-cap cue past 6); files open in the player with `source: "courses"`; Continue-Learning
+  feature card shows at the root only. New `components/courses/FolderCard.tsx`. GSAP
+  entrances re-stagger per drill (gsap.context + ctx.revert, reduced-motion gated).
 
-### 11.5 Execution strategy & gotchas for the next session
-- **Order:** Phase 6 (types/ipc + new node commands) → verify `npm run build` green →
-  Phase 4 → Phase 5 → cleanup routes → docs. Commit per phase (`git -c user.name="PLE Dev"
-  -c user.email="dev@ple.local" commit`). Current clean checkpoint is committed; revert
-  with `git reset --hard <sha>` (see `git log --oneline`).
-- **Verify pattern:** `npm run build` (tsc+Vite) for frontend; from `src-tauri`,
-  `cargo build` then `cargo test --lib` (expect 9/9). SQL errors surface at RUNTIME only
-  (rusqlite isn't compile-checked), so exercise the actual flows in `npm run tauri dev`.
-- **Gotchas:**
-  - Roots have `parent_id IS NULL`; SQLite `UNIQUE(parent_id,name)` treats NULLs as
-    distinct, so you CANNOT `ON CONFLICT` on roots — look up by name first
-    (`upsert_root_node` already does this; mirror it anywhere you create roots).
-  - `PRAGMA foreign_keys` can only toggle OUTSIDE a transaction — the migration does this
-    around its own BEGIN/COMMIT; don't nest it.
-  - The `MAT_ANC_CTE` const is prefixed onto queries with `format!("WITH {MAT_ANC_CTE} …")`
-    — when a query needs its OWN extra CTE, chain with a comma:
-    `format!("WITH {MAT_ANC_CTE}, ranked AS (…) …")` (see `next_up`, `recommended_materials`).
-  - Depth cap is UI-only (warn, don't block); DB depth stays unlimited.
-  - Skills for the remaining UI work (per the skill analysis): **ui-ux-pro-max**
-    (breadcrumb/tree/drill-down IA), **web-design-guidelines** (a11y: `aria-current`,
-    focus, target size, breadcrumb overflow), **design-taste-frontend** (glass/palette/
-    shape-lock taste — rules only, keep GSAP+lucide+Zustand stack), **gsap-react** +
-    **gsap-performance** (drill-down entrance staggers, transform/opacity + reduced-motion),
-    **vercel-react-best-practices** (per-node fetch hygiene, avoid waterfalls/re-renders).
-    Backend/SQL work uses NO skill.
+### 11.4a Final routing (App.tsx)
+- Browser owns `/courses` and `/courses/:nodeId`. Legacy Library routes REDIRECT (Navigate
+  `replace`): `/library` → `/courses`; `/library/goal|subject|chapter/:id` →
+  `/courses/:id` (safe because the v6 shim already returns node ids in those fields).
+- `/library/material/:materialId` STILL renders `PlayerPage` (unchanged; MAT_ANC_CTE shim).
+- Old page files (`Library.tsx`, `GoalPage.tsx`, `SubjectPage.tsx`, `ChapterPage.tsx`,
+  `CourseDetailPage.tsx`) are no longer routed → dropped from the bundle; files remain on
+  disk (harmless, can be deleted later). "Library" nav item removed from `nav.ts` (Courses
+  is the single content hub); `PlayerPage`/`CourseDetailPage` IPC untouched.
 
-Verification at handoff: `cargo build` clean; `cargo test --lib` 9/9 green. Frontend build
-is currently RED until Phase 6 fixes the `WizardImport`/`ImportResult` type mismatch.
+### 11.5 Gotchas (kept for reference)
+- Roots have `parent_id IS NULL`; SQLite `UNIQUE(parent_id,name)` treats NULLs as distinct,
+  so you CANNOT `ON CONFLICT` on roots — look up by name first (`upsert_root_node`). Note
+  `node_children` handles the root vs child cases with a single `?1 IS NULL` guard.
+- `PRAGMA foreign_keys` toggles OUTSIDE a transaction only (the migration does this around
+  its own BEGIN/COMMIT).
+- `MAT_ANC_CTE` is prefixed with `format!("WITH {MAT_ANC_CTE} …")`; chain a query's own CTE
+  with a comma (`format!("WITH {MAT_ANC_CTE}, ranked AS (…) …")`).
+- Depth cap is UI-only (warn, don't block); DB depth stays unlimited.
+- SQL errors surface at RUNTIME only (rusqlite isn't compile-checked), so exercise the real
+  flows in `npm run tauri dev` — the new node queries have NOT yet been run against a live
+  migrated DB, only type/compile-checked. Next session should smoke-test: import into a new
+  goal, import into an existing node, drill the browser, open a file from a node.
+
+Verification at handoff: `cargo build` clean; `cargo test --lib` 9/9 green; `npm run build`
+green. All 4 phases committed (Phase 6, 4, 5 + this doc).
