@@ -7,7 +7,7 @@
 
 import type { ElementType } from "react";
 import { GraduationCap, CalendarCheck } from "lucide-react";
-import { DashboardIcon, LibraryIcon, SettingsIcon } from "../ui/icons";
+import { DashboardIcon, SettingsIcon } from "../ui/icons";
 
 export interface NavItem {
   /** Router path (also used as the React key). */
@@ -24,6 +24,5 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Dashboard", icon: DashboardIcon, end: true },
   { to: "/courses", label: "Courses", icon: GraduationCap },
   { to: "/planning", label: "Planning", icon: CalendarCheck },
-  { to: "/library", label: "Library", icon: LibraryIcon },
   { to: "/settings", label: "Settings", icon: SettingsIcon },
 ];

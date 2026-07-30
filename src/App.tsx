@@ -11,17 +11,12 @@
  */
 
 import { lazy, Suspense } from "react";
-import { HashRouter, Routes, Route } from "react-router-dom";
+import { HashRouter, Navigate, Routes, Route, useParams } from "react-router-dom";
 import AppShell from "./components/layout/AppShell";
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
-const Library = lazy(() => import("./pages/Library"));
 const CoursesPage = lazy(() => import("./pages/CoursesPage"));
-const CourseDetailPage = lazy(() => import("./pages/CourseDetailPage"));
 const PlanningHub = lazy(() => import("./pages/PlanningHub"));
-const GoalPage = lazy(() => import("./pages/GoalPage"));
-const SubjectPage = lazy(() => import("./pages/SubjectPage"));
-const ChapterPage = lazy(() => import("./pages/ChapterPage"));
 const PlayerPage = lazy(() => import("./pages/PlayerPage"));
 const Settings = lazy(() => import("./pages/Settings"));
 const NotFound = lazy(() => import("./pages/NotFound"));
@@ -33,6 +28,18 @@ function PageFallback() {
       Loading…
     </div>
   );
+}
+
+/**
+ * Redirect a legacy `/library/:kind/:id` route into the unified tree browser. The v6
+ * shim returns node ids in the old `goal_id`/`subject_id`/`chapter_id` fields, so any id
+ * that used to name a goal/subject/chapter now names a node — the same value drills the
+ * browser to the right place. `replace` so Back skips the dead URL.
+ */
+function NodeRedirect({ param }: { param: string }) {
+  const params = useParams();
+  const id = params[param];
+  return <Navigate to={id != null ? `/courses/${id}` : "/courses"} replace />;
 }
 
 export default function App() {
@@ -49,15 +56,15 @@ export default function App() {
             }
           />
           <Route
-            path="library"
+            path="courses"
             element={
               <Suspense fallback={<PageFallback />}>
-                <Library />
+                <CoursesPage />
               </Suspense>
             }
           />
           <Route
-            path="courses"
+            path="courses/:nodeId"
             element={
               <Suspense fallback={<PageFallback />}>
                 <CoursesPage />
@@ -72,38 +79,11 @@ export default function App() {
               </Suspense>
             }
           />
-          <Route
-            path="courses/:subjectId"
-            element={
-              <Suspense fallback={<PageFallback />}>
-                <CourseDetailPage />
-              </Suspense>
-            }
-          />
-          <Route
-            path="library/goal/:goalId"
-            element={
-              <Suspense fallback={<PageFallback />}>
-                <GoalPage />
-              </Suspense>
-            }
-          />
-          <Route
-            path="library/subject/:subjectId"
-            element={
-              <Suspense fallback={<PageFallback />}>
-                <SubjectPage />
-              </Suspense>
-            }
-          />
-          <Route
-            path="library/chapter/:chapterId"
-            element={
-              <Suspense fallback={<PageFallback />}>
-                <ChapterPage />
-              </Suspense>
-            }
-          />
+          {/* Legacy Library routes → unified tree browser (ids are node ids under v6). */}
+          <Route path="library" element={<Navigate to="/courses" replace />} />
+          <Route path="library/goal/:goalId" element={<NodeRedirect param="goalId" />} />
+          <Route path="library/subject/:subjectId" element={<NodeRedirect param="subjectId" />} />
+          <Route path="library/chapter/:chapterId" element={<NodeRedirect param="chapterId" />} />
           <Route
             path="library/material/:materialId"
             element={
