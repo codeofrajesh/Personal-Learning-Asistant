@@ -1594,6 +1594,20 @@ pub fn mark_complete(conn: &mut Connection, material_id: i64, completed: bool) -
 /// `session_type` is `work` | `short_break` | `long_break`; only `work` sessions count
 /// as study time in the activity/streak aggregates (breaks are recorded but excluded
 /// there — see `weekly_activity`/`active_days`).
+///
+/// ## Block binding (v9)
+///
+/// A `work` session also credits the currently ACTIVE plan block's `executed_mins`. Before
+/// this, `add_executed_mins` was called from NOWHERE but tests — its own doc comment claimed
+/// this write path called it, and it didn't. The consequence was silent and total: every
+/// block's `executed_mins` stayed 0.0 forever, so adherence scored every planned day as a
+/// complete failure, the solver saw zero progress and computed drift against work already
+/// done, and block progress bars never moved. Every caller (player playback, media progress,
+/// Pomodoro) reports one DISCRETE elapsed chunk rather than a running total, so summing them
+/// is correct and cannot double-count.
+///
+/// Breaks are deliberately excluded: time on a break is not time on task, and counting it
+/// would let a student score full adherence by starting a block and walking away.
 pub fn log_study_session(
     conn: &Connection,
     material_id: Option<i64>,
@@ -1612,6 +1626,14 @@ pub fn log_study_session(
          VALUES(?1, datetime('now', ?2), datetime('now'), ?3, ?4)",
         rusqlite::params![material_id, format!("-{seconds} seconds"), seconds, stype],
     )?;
+
+    // Best-effort by contract, exactly like `plan::log_event`: the session row is the
+    // user-visible outcome and must not be rolled back because the planner credit failed.
+    if stype == "work" {
+        if let Ok(Some(block)) = crate::db::plan::active_block(conn) {
+            let _ = crate::db::plan::add_executed_mins(conn, block.id, seconds / 60.0);
+        }
+    }
     Ok(())
 }
 
@@ -3246,6 +3268,74 @@ mod tests {
         assert_eq!(completed, 1);
         assert!(adherence.unwrap() > 0.0, "a completed block must score adherence");
         assert_eq!(version, 2, "a schedule contributed → new formula version");
+    }
+
+    /// A `work` session must CREDIT the active block's `executed_mins`.
+    ///
+    /// This was broken and silent: `add_executed_mins` was called from nowhere but tests, so
+    /// every block stayed at 0.0 executed minutes forever — adherence scored every planned day
+    /// as a total failure and the solver computed drift against work already done.
+    #[test]
+    fn work_sessions_credit_the_active_block() {
+        let conn = test_conn();
+        let day: String = conn.query_row("SELECT date('now')", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO plan_blocks(day, planned_start, planned_mins, title, status)
+             VALUES(?1, '06:00', 60, 'Physics', 'active')",
+            [&day],
+        )
+        .unwrap();
+
+        log_study_session(&conn, None, 25.0 * 60.0, "work").unwrap();
+
+        let executed: f64 = conn
+            .query_row("SELECT executed_mins FROM plan_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            (executed - 25.0).abs() < 0.01,
+            "25 minutes of focus must land on the block, got {executed}"
+        );
+
+        // Discrete chunks accumulate — each caller reports one elapsed span, not a total.
+        log_study_session(&conn, None, 5.0 * 60.0, "work").unwrap();
+        let executed: f64 = conn
+            .query_row("SELECT executed_mins FROM plan_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert!((executed - 30.0).abs() < 0.01, "sessions add up, got {executed}");
+    }
+
+    /// Breaks must NOT count toward a block: time on a break is not time on task, and
+    /// crediting it would let a student score full adherence by starting a block and leaving.
+    #[test]
+    fn break_sessions_do_not_credit_the_active_block() {
+        let conn = test_conn();
+        let day: String = conn.query_row("SELECT date('now')", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO plan_blocks(day, planned_start, planned_mins, title, status)
+             VALUES(?1, '06:00', 60, 'Physics', 'active')",
+            [&day],
+        )
+        .unwrap();
+
+        log_study_session(&conn, None, 15.0 * 60.0, "short_break").unwrap();
+        log_study_session(&conn, None, 15.0 * 60.0, "long_break").unwrap();
+
+        let executed: f64 = conn
+            .query_row("SELECT executed_mins FROM plan_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(executed, 0.0, "breaks are recorded but never credited to a block");
+    }
+
+    /// With no active block, a session is still logged — the timer must work for a student
+    /// who never touches the planner.
+    #[test]
+    fn work_sessions_without_an_active_block_still_log() {
+        let conn = test_conn();
+        log_study_session(&conn, None, 10.0 * 60.0, "work").unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM study_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     /// `nodes_in_progress` returns only roots with 0 < completed < total; `recent_nodes`

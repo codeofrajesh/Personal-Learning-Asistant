@@ -14,7 +14,7 @@
  */
 
 import { memo } from "react";
-import { Play, Pause, RotateCcw, SkipForward, Timer } from "lucide-react";
+import { Play, Pause, RotateCcw, SkipForward, Timer, Link2 } from "lucide-react";
 import {
   useTimerStore,
   phaseLabel,
@@ -22,6 +22,7 @@ import {
   TIMER_DEFAULTS,
   type Phase,
 } from "../../lib/timerStore";
+import { useActiveBlock } from "./useActiveBlock";
 import { cn } from "../../lib/utils";
 
 const RADIUS = 52;
@@ -56,6 +57,8 @@ function PomodoroWidgetView() {
   const paused = !running && pausedRemaining != null;
   const idle = !running && pausedRemaining == null;
   const color = phaseColor(phase);
+  // Display only — the crediting itself happens server-side in `log_study_session`.
+  const activeBlock = useActiveBlock();
 
   const frac = phaseTotal > 0 ? Math.max(0, Math.min(1, remaining / phaseTotal)) : 0;
   const dashOffset = CIRCUMFERENCE * (1 - frac);
@@ -120,6 +123,17 @@ function PomodoroWidgetView() {
           </div>
         </div>
       </div>
+
+      {/* What this focus time is counting toward. Only shown while a work phase is actually
+          running: a label under a stopped timer would claim credit that isn't accruing. */}
+      {activeBlock && (
+        <div className="mt-1 flex items-center justify-center gap-1.5 text-[0.68rem] text-white/45">
+          <Link2 size={11} strokeWidth={2} className="shrink-0 text-lime/70" aria-hidden />
+          <span className="min-w-0 truncate">
+            Counting toward <span className="font-medium text-content-secondary">{activeBlock.title}</span>
+          </span>
+        </div>
+      )}
 
       {/* Cycle dots (●●●○) — work blocks toward the next long break */}
       <div className="mt-3 flex items-center justify-center gap-2" aria-label={`${cyclePos} of ${TIMER_DEFAULTS.longBreakEvery} focus blocks done`}>

@@ -575,7 +575,8 @@ pub fn start_block(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// Add executed minutes to a block (called from the existing `log_session` write path).
+/// Add executed minutes to a block. Called from `queries::log_study_session` for every `work`
+/// session, which is what makes `executed_mins` reflect reality; see that function's note.
 pub fn add_executed_mins(conn: &Connection, id: i64, mins: f64) -> AppResult<()> {
     if mins <= 0.0 {
         return Ok(());
