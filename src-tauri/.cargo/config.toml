@@ -5,8 +5,25 @@
 # linker (LNK1171 / ERROR_COMMITMENT_LIMIT). Serializing the build keeps peak
 # memory low at the cost of wall-clock time.
 [build]
+# Serialize crate compilation so two heavy crates (bundled SQLite, Tauri, tokio)
+# never link at once and blow the ~4 GB commit limit (LNK1171 / ERROR_COMMITMENT_LIMIT).
 jobs = 1
 
 [profile.dev]
-# Fewer codegen units => lower peak memory per crate during dev builds.
-codegen-units = 1
+# Low-memory dev profile for the ~4 GB machine. The goal is to minimize rustc/LLVM
+# PEAK memory, which is dominated by our own large `ple_lib` crate:
+#   - MANY codegen units (default 256) split the crate into small LLVM units, so no
+#     single unit needs a huge allocation. (codegen-units = 1 does the OPPOSITE — it
+#     forces the whole crate through LLVM at once and was causing the OOM.)
+#   - debug = "line-tables-only" keeps usable backtraces but drops the full DWARF that
+#     debuginfo = 2 (the dev default) generates, another large memory + disk cost.
+#   - Keeping the local crate unoptimized (opt-level 0) is the cheapest codegen.
+codegen-units = 256
+debug = "line-tables-only"
+incremental = true
+
+# Dependencies still get built once and cached; a touch of opt shrinks the heaviest
+# ones (SQLite/serde) without materially raising peak memory.
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
