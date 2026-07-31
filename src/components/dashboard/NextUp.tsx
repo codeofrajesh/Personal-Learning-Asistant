@@ -39,7 +39,7 @@ function NextUpRow({ item }: { item: NextUpItem }) {
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium text-content-primary">{item.file_name}</p>
         <p className="truncate text-[0.7rem] text-white/40">
-          {item.subject_name} · {item.chapter_name}
+          {item.root_name} · {item.node_name}
         </p>
       </div>
 
@@ -72,7 +72,7 @@ function NextUpView({ items }: { items: NextUpItem[] }) {
       ) : (
         <div className="-mx-1 flex flex-col">
           {items.map((item) => (
-            <NextUpRow key={item.subject_id} item={item} />
+            <NextUpRow key={item.root_id} item={item} />
           ))}
         </div>
       )}

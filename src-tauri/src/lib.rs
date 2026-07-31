@@ -6,6 +6,7 @@
 
 pub mod commands;
 pub mod db;
+pub mod planner;
 pub mod player;
 pub mod scanner;
 pub mod utils;
@@ -41,12 +42,29 @@ pub fn run() {
                 log::error!("watcher: failed to start: {e}");
             }
 
-            // Lazily backfill the consistency log up to today (Planning Hub). This is a
-            // one-shot O(days-since-last-open) upsert on boot — NOT a background loop —
-            // so it costs ~0 idle CPU. Runs regardless of the on/off setting so enabling
-            // the feature later shows real history. Failure must not block boot.
-            if let Err(e) = app.state::<Db>().with(|conn| db::queries::backfill_consistency(conn)) {
-                log::error!("consistency: backfill failed: {e}");
+            // Close out any past days whose blocks were never resolved, THEN backfill the
+            // consistency log. Order matters: reconciliation flips abandoned pending blocks to
+            // skipped/partial, and the snapshot that follows must see those final states or the
+            // adherence half of each day's score would be computed from stale rows.
+            //
+            // Both are one-shot O(days-since-last-open) passes on boot — NOT background loops —
+            // so idle CPU stays at zero on the 4 GB target. Failure must not block boot.
+            //
+            // `date('now')` here is UTC, whereas the planner is local-wall-clock throughout.
+            // Using it for reconciliation is deliberate and safe: the only risk is that "today"
+            // is judged up to a day early, which errs toward leaving a day OPEN (the frontend
+            // re-reconciles with the real local date on first load). Closing a day too early
+            // would be the damaging direction, and this can't do that.
+            let boot_reconcile = app.state::<Db>().with(|conn| {
+                let today: String = conn.query_row("SELECT date('now')", [], |r| r.get(0))?;
+                let skipped = db::plan::reconcile_plan_days(conn, &today)?;
+                db::queries::backfill_consistency(conn)?;
+                Ok(skipped)
+            });
+            match boot_reconcile {
+                Ok(n) if n > 0 => log::info!("planner: reconciled {n} unresolved block(s)"),
+                Ok(_) => {}
+                Err(e) => log::error!("planner/consistency: boot reconciliation failed: {e}"),
             }
 
             // Trigger background metadata extraction for any materials missing duration or thumbnails
@@ -105,6 +123,20 @@ pub fn run() {
             commands::tasks::set_task_done,
             commands::tasks::delete_task,
             commands::tasks::consistency_summary,
+            commands::plan::plan_day,
+            commands::plan::upsert_plan_block,
+            commands::plan::delete_plan_block,
+            commands::plan::set_plan_block_status,
+            commands::plan::start_plan_block,
+            commands::plan::active_plan_block,
+            commands::plan::set_plan_day_window,
+            commands::plan::recovery_plans,
+            commands::plan::apply_recovery,
+            commands::plan::undo_recovery,
+            commands::plan::dismiss_recovery,
+            commands::plan::apply_plan_template,
+            commands::plan::reconcile_plan,
+            commands::plan::score_summary,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

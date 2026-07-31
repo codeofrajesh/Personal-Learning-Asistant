@@ -125,15 +125,24 @@ export interface ActivityDay {
   hours: number;
 }
 
-/** One "Next Up" suggestion: the first unstarted lesson of a course (backend `NextUpItem`). */
+/**
+ * One "Next Up" suggestion: the first unstarted lesson of a course (backend `NextUpItem`).
+ *
+ * v9: NODE-NATIVE. This used to carry the legacy `chapter_name`/`subject_*`/`goal_name`
+ * vocabulary produced by the `MAT_ANC_CTE` compatibility shim. The scheduler's time blocks
+ * target `nodes` directly, so keeping two vocabularies for the same content was a standing
+ * source of confusion. `node_*` is the material's immediate folder; `root_*` is its course.
+ */
 export interface NextUpItem {
   id: number;
   file_name: string;
   file_type: string;
-  chapter_name: string;
-  subject_id: number;
-  subject_name: string;
-  goal_name: string;
+  /** The material's immediate parent node (its chapter/folder). */
+  node_id: number;
+  node_name: string;
+  /** The root node of the tree this material lives in (its course). */
+  root_id: number;
+  root_name: string;
   thumbnail_path: string | null;
   /** How many active, not-completed lessons remain in this course. */
   remaining: number;

@@ -21,7 +21,16 @@
 /// v8: added `nodes.is_pinned` — the Courses hub "Pinned" feature. A user can favorite any
 ///     node (course/folder) to surface it in a dedicated hub section, mirroring how
 ///     `materials.is_bookmarked` works for files.
-pub const SCHEMA_VERSION: i64 = 8;
+/// v9: the Planning / Scheduling / Intelligence system. Adds the time-block planner
+///     (`plan_blocks`), its append-only lifecycle ledger (`plan_events`), per-day intent +
+///     pre-mortem verdict (`plan_days`), routine templates (`plan_templates`,
+///     `plan_template_blocks`), a DURABLE reminder ledger (`reminder_state`, so reminders
+///     don't re-fire after a restart) and learned pace per course (`node_velocity`).
+///     Extends `consistency_log` with schedule-adherence columns + `score_version` so the
+///     scoring formula can evolve without rewriting the meaning of historical snapshots.
+///     NOTE: no new scoring tables — Weekly/Monthly/Rolling-90 are DERIVED aggregates over
+///     the existing one-row-per-day `consistency_log`.
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// The complete v1 schema. Every statement is `IF NOT EXISTS` where SQLite allows,
 /// so re-application is a no-op.
@@ -141,6 +150,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 -- written lazily on app boot (no background loop). Isolated from `tasks` /
 -- `study_sessions` so deleting/editing a task never rewrites past scores — the
 -- snapshot already captured that day. `score` is 0-100 (see queries::score_for_day).
+-- The v9 columns extend the SAME snapshot row with schedule adherence rather than
+-- introducing parallel weekly/monthly score tables: this table is already one row per day
+-- (365/year), so Week / Month / Rolling-90 are sub-millisecond derived GROUP BY aggregates.
+-- `score_version` lets the scoring formula evolve WITHOUT silently rewriting the meaning of
+-- historical rows, preserving the append-only snapshot promise.
 CREATE TABLE IF NOT EXISTS consistency_log (
     day                     TEXT PRIMARY KEY,   -- YYYY-MM-DD
     tasks_due               INTEGER DEFAULT 0,
@@ -149,6 +163,14 @@ CREATE TABLE IF NOT EXISTS consistency_log (
     tasks_missed            INTEGER DEFAULT 0,
     study_minutes           REAL DEFAULT 0,
     score                   REAL DEFAULT 0,
+    blocks_planned          INTEGER DEFAULT 0,  -- v9: schedule adherence
+    blocks_completed        INTEGER DEFAULT 0,
+    blocks_partial          INTEGER DEFAULT 0,
+    blocks_skipped          INTEGER DEFAULT 0,
+    planned_minutes         REAL DEFAULT 0,
+    executed_minutes        REAL DEFAULT 0,
+    adherence               REAL,               -- 0-100, NULL when nothing was planned
+    score_version           INTEGER DEFAULT 1,
     created_at              TEXT DEFAULT (datetime('now'))
 );
 
@@ -159,6 +181,140 @@ CREATE TABLE IF NOT EXISTS notes (
     timestamp_secs REAL NOT NULL DEFAULT 0,
     body           TEXT NOT NULL,
     created_at     TEXT DEFAULT (datetime('now')),
+    updated_at     TEXT DEFAULT (datetime('now'))
+);
+
+-- ── Planning / Scheduling / Intelligence (v9) ────────────────────────────────────────
+--
+-- Design note (deliberate, load-bearing): a BLOCK is a time *intention*; a TASK is a
+-- *deliverable*. They stay separate tables. A task can be worked across several blocks,
+-- and a block can target a QUANTITY of content ("2 lectures of Physics") rather than one
+-- specific row — neither fits as columns on `tasks`. Keeping them apart is what makes
+-- spillover, partial credit and schedule adherence measurable at all, and leaves the
+-- existing `tasks.due_at` consistency engine completely untouched.
+--
+-- Time is stored as LOCAL WALL-CLOCK 'HH:MM' + a `day` (YYYY-MM-DD), never UTC. A student
+-- who plans "6:00 AM study" means 6 AM wherever/whenever they are; storing UTC makes the
+-- block silently jump an hour across a DST boundary. Only `plan_events.at` is absolute,
+-- because those rows are real observations rather than intentions.
+CREATE TABLE IF NOT EXISTS plan_blocks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    day             TEXT NOT NULL,                  -- YYYY-MM-DD (local)
+    planned_start   TEXT NOT NULL,                  -- 'HH:MM' (local wall clock)
+    planned_mins    INTEGER NOT NULL,
+    -- The live/adjusted position. Diverges from planned_* once a recovery plan is applied;
+    -- keeping BOTH is what lets us score punctuality AND show "moved from 6:00".
+    actual_start    TEXT,
+    actual_mins     INTEGER,
+
+    title           TEXT NOT NULL,
+    -- What the block is FOR:
+    --   'material'     one specific file
+    --   'node_count'   N items from a course ("2 lectures of Physics")
+    --   'node_minutes' time-boxed study of a course
+    --   'task'         an existing to-do row
+    --   'freeform'     untracked ("read textbook page 10") → needs manual confirmation
+    target_kind        TEXT NOT NULL DEFAULT 'freeform',
+    target_node_id     INTEGER REFERENCES nodes(id)     ON DELETE SET NULL,
+    target_material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL,
+    target_task_id     INTEGER REFERENCES tasks(id)     ON DELETE SET NULL,
+    target_count       INTEGER,                     -- e.g. 2 lectures
+
+    weight          INTEGER NOT NULL DEFAULT 2,     -- 0-3, drives triage value (weight²)
+    -- An 'anchored' block cannot move (a live class, a coaching slot). This is the single
+    -- most important solver input — without it, cascade produces nonsense.
+    is_anchored     INTEGER NOT NULL DEFAULT 0,
+    -- Below this many minutes the block is pointless; the solver DROPS rather than shrinks.
+    min_viable_mins INTEGER,
+
+    status          TEXT NOT NULL DEFAULT 'pending',
+        -- pending | active | done | partial | skipped | spilled
+    executed_mins   REAL NOT NULL DEFAULT 0,        -- accumulated from study_sessions
+    progress_count  INTEGER NOT NULL DEFAULT 0,     -- items finished vs target_count
+    completed_at    TEXT,
+    -- Set when this block is the carry-over of an earlier one → the spillover debt ledger.
+    -- A dropped block is never deleted; it spills forward and its spill count PROMOTES it
+    -- in later triage, which is how chronic avoidance of a disliked subject self-corrects.
+    spilled_from_id INTEGER REFERENCES plan_blocks(id) ON DELETE SET NULL,
+    template_id     INTEGER REFERENCES plan_templates(id) ON DELETE SET NULL,
+    notes           TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- Append-only lifecycle audit. NEVER updated, only inserted. This is what makes velocity
+-- learning + adherence scoring possible without destroying the plan-vs-outcome distinction.
+CREATE TABLE IF NOT EXISTS plan_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    block_id   INTEGER REFERENCES plan_blocks(id) ON DELETE CASCADE,
+    day        TEXT NOT NULL,
+    kind       TEXT NOT NULL,   -- started|paused|resumed|completed|partial|skipped
+                                -- |shifted|compressed|dropped|spilled|confirmed
+    at         TEXT NOT NULL DEFAULT (datetime('now')),   -- absolute (a real observation)
+    delta_mins INTEGER,         -- for shifted/compressed: by how much
+    meta       TEXT             -- small JSON e.g. {"plan":"triage","reason":"late_start"}
+);
+
+-- Per-day plan intent + the pre-mortem verdict. `hard_stop_at` is per-day (a student may
+-- legitimately study late on a Saturday) and falls back to the global
+-- `plan.hard_stop` setting when NULL.
+CREATE TABLE IF NOT EXISTS plan_days (
+    day               TEXT PRIMARY KEY,   -- YYYY-MM-DD
+    wake_at           TEXT,               -- 'HH:MM' — start of the usable window
+    hard_stop_at      TEXT,               -- 'HH:MM' — never schedule past this
+    planned_mins      INTEGER NOT NULL DEFAULT 0,
+    capacity_mins     INTEGER,            -- realistic capacity after the fatigue discount
+    integrity         REAL,               -- 0-100: is this plan physically achievable?
+    adjust_state      TEXT,               -- null | 'prompted' | 'applied' | 'dismissed'
+    last_adjust_at    TEXT,
+    reconciled_at     TEXT,               -- set once the day is closed out on boot
+    template_id       INTEGER REFERENCES plan_templates(id) ON DELETE SET NULL,
+    created_at        TEXT DEFAULT (datetime('now'))
+);
+
+-- Routine days ("my normal weekday"), applied to generate a day's blocks in one tap.
+CREATE TABLE IF NOT EXISTS plan_templates (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    dow_mask   INTEGER NOT NULL DEFAULT 127,   -- bitmask, bit 0 = Sunday .. bit 6 = Saturday
+    is_active  INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS plan_template_blocks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id    INTEGER NOT NULL REFERENCES plan_templates(id) ON DELETE CASCADE,
+    planned_start  TEXT NOT NULL,
+    planned_mins   INTEGER NOT NULL,
+    title          TEXT NOT NULL,
+    target_kind    TEXT NOT NULL DEFAULT 'freeform',
+    target_node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
+    target_count   INTEGER,
+    weight         INTEGER NOT NULL DEFAULT 2,
+    is_anchored    INTEGER NOT NULL DEFAULT 0,
+    sort_order     INTEGER DEFAULT 0
+);
+
+-- DURABLE reminder ledger. Fixes a real bug in the current reminder engine: dedupe lives
+-- only in toastStore's in-memory `_cooldowns` map, so every reminder re-fires after an app
+-- restart. Persisting fired/ack/snooze state makes "fire at most once" actually true.
+CREATE TABLE IF NOT EXISTS reminder_state (
+    key        TEXT PRIMARY KEY,   -- e.g. 'block-42-start' | 'block-42-t10' | 'block-42-end'
+    fired_at   TEXT NOT NULL,
+    ack_at     TEXT,
+    snooze_to  TEXT
+);
+
+-- Learned pace per course. `pace_ratio` is an EWMA of (wall minutes spent / content minutes
+-- consumed): 1.0 = real-time, 1.6 = this student needs 96 min of clock for 60 min of
+-- lecture (pauses, notes, rewinds). Multiplying planned durations by it is what turns the
+-- planner from aspirational into honest. Updated on the EXISTING log_session write path —
+-- no new polling.
+CREATE TABLE IF NOT EXISTS node_velocity (
+    node_id        INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    samples        INTEGER NOT NULL DEFAULT 0,
+    pace_ratio     REAL NOT NULL DEFAULT 1.0,
+    avg_focus_mins REAL,           -- typical uninterrupted stretch before drifting off
     updated_at     TEXT DEFAULT (datetime('now'))
 );
 
@@ -205,4 +361,14 @@ CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path);
 CREATE INDEX IF NOT EXISTS idx_tasks_done ON tasks(done);
 CREATE INDEX IF NOT EXISTS idx_tasks_material ON tasks(material_id);
 CREATE INDEX IF NOT EXISTS idx_notes_material ON notes(material_id, timestamp_secs);
+-- v9 planner indexes. The plain (non-partial) ones are safe here because their tables are
+-- created above in this same batch. The PARTIAL index on plan_blocks(status) is created in
+-- connection.rs::migrate for symmetry with idx_nodes_pinned — see the note above.
+CREATE INDEX IF NOT EXISTS idx_blocks_day ON plan_blocks(day, planned_start);
+CREATE INDEX IF NOT EXISTS idx_blocks_node ON plan_blocks(target_node_id);
+CREATE INDEX IF NOT EXISTS idx_blocks_task ON plan_blocks(target_task_id);
+CREATE INDEX IF NOT EXISTS idx_blocks_spill ON plan_blocks(spilled_from_id);
+CREATE INDEX IF NOT EXISTS idx_events_day ON plan_events(day, at);
+CREATE INDEX IF NOT EXISTS idx_events_block ON plan_events(block_id, at);
+CREATE INDEX IF NOT EXISTS idx_tmpl_blocks ON plan_template_blocks(template_id, sort_order);
 "#;

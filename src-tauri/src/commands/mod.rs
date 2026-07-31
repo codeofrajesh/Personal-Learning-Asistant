@@ -10,6 +10,7 @@ pub mod goals;
 pub mod library;
 pub mod materials;
 pub mod nodes;
+pub mod plan;
 pub mod player;
 pub mod progress;
 pub mod scanner;

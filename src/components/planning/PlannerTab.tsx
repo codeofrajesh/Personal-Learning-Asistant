@@ -184,7 +184,7 @@ export default function PlannerTab({ planning }: Props) {
             <div className="-mx-1 flex flex-col">
               {nextUp.slice(0, 5).map((item) => (
                 <button
-                  key={item.subject_id}
+                  key={item.root_id}
                   type="button"
                   onClick={() => openMaterial(item.id)}
                   className="group flex items-center gap-3 rounded-[12px] px-3 py-2.5 text-left transition-colors hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/40"
@@ -194,7 +194,7 @@ export default function PlannerTab({ planning }: Props) {
                   </span>
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm text-content-primary">{item.file_name}</p>
-                    <p className="truncate text-[0.7rem] text-white/40">{item.subject_name}</p>
+                    <p className="truncate text-[0.7rem] text-white/40">{item.root_name}</p>
                   </div>
                   <span className="shrink-0 text-[0.62rem] text-white/30">{item.remaining} left</span>
                   <ChevronRight size={14} className="shrink-0 text-white/25 transition-transform group-hover:translate-x-0.5" aria-hidden />

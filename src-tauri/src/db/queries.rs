@@ -414,18 +414,26 @@ pub struct DashboardData {
     pub next_up: Vec<NextUpItem>,
 }
 
-/// One "Next Up" suggestion: the first not-completed lesson of a course (subject),
-/// with the context needed to render + deep-link into the player.
+/// One "Next Up" suggestion: the first not-completed lesson of a course, with the context
+/// needed to render + deep-link into the player.
+///
+/// v9: NODE-NATIVE. This DTO previously spoke the legacy goal/subject/chapter vocabulary via
+/// the `MAT_ANC_CTE` compatibility shim, which meant the scheduler (whose blocks target
+/// `nodes` directly) and the "what should I study next" feed described the same content in two
+/// different languages. Now both speak `nodes`: `node_*` is the material's immediate folder,
+/// `root_*` is the course it belongs to.
 #[derive(Debug, serde::Serialize)]
 pub struct NextUpItem {
     pub id: i64,
     pub file_name: String,
     pub file_type: String,
-    pub chapter_name: String,
-    pub subject_id: i64,
-    pub subject_name: String,
-    pub goal_name: String,
-    /// Subject cover thumbnail (one random video material's thumbnail; null if none).
+    /// The material's immediate parent node (its chapter/folder).
+    pub node_id: i64,
+    pub node_name: String,
+    /// The root node of the tree this material lives in (its course).
+    pub root_id: i64,
+    pub root_name: String,
+    /// Course cover thumbnail (first available video thumbnail; null if none).
     pub thumbnail_path: Option<String>,
     /// How many active, not-completed lessons remain in this course.
     pub remaining: i64,
@@ -602,44 +610,74 @@ pub fn active_days(conn: &Connection) -> AppResult<Vec<String>> {
     Ok(out)
 }
 
-/// The next unstarted lesson for each active course (subject), for the "Next Up" widget.
+/// SQL fragment resolving every material to its ROOT node (the course it belongs to).
 ///
-/// Scheduling algorithm (distinct from Continue-Learning's recency): for every subject
-/// that still has at least one active, not-completed material, pick its FIRST such
-/// material in course order (chapter `sort_order`/name, then material `sort_order`/name)
-/// — i.e. "the next thing to study in this course". Courses whose most-recent activity
-/// is freshest surface first, so the list tracks what the learner is actively working
-/// through. One row per subject; capped by `limit`.
+/// This is the node-native replacement for `MAT_ANC_CTE` in scheduling contexts. It answers one
+/// question — "which course is this material in?" — instead of manufacturing a three-level
+/// goal/subject/chapter vocabulary the tree doesn't actually have. Cheaper too: the climb is
+/// seeded only from material-bearing nodes and carries a single column up.
+///
+/// Columns: `mid`, `node_id` (immediate parent), `root_id`.
+pub const MAT_ROOT_CTE: &str = "
+mat_root_nodes(id) AS (
+    SELECT DISTINCT node_id FROM materials WHERE status = 'active'
+),
+node_root AS (
+    WITH RECURSIVE climb(base_node, curr_node, parent) AS (
+        SELECT id, id, parent_id FROM nodes WHERE id IN (SELECT id FROM mat_root_nodes)
+        UNION ALL
+        SELECT c.base_node, n.id, n.parent_id
+        FROM climb c JOIN nodes n ON n.id = c.parent
+    )
+    SELECT base_node AS node_id, curr_node AS root_id
+    FROM climb WHERE parent IS NULL
+),
+mat_root AS (
+    SELECT m.id AS mid, m.node_id AS node_id, r.root_id AS root_id
+    FROM materials m
+    JOIN node_root r ON r.node_id = m.node_id
+)";
+
+/// The next unstarted lesson for each active course, for the "Next Up" widget.
+///
+/// Scheduling algorithm (distinct from Continue-Learning's recency): for every ROOT node
+/// (course) that still has at least one active, not-completed material, pick its FIRST such
+/// material in course order — i.e. "the next thing to study in this course". Courses whose
+/// most-recent activity is freshest surface first, so the list tracks what the learner is
+/// actively working through. One row per course; capped by `limit`.
+///
+/// v9: node-native (see [`MAT_ROOT_CTE`]). Ordering now keys on the material's own node
+/// `sort_order`/name as well, so nested folders still yield a stable course sequence.
 pub fn next_up(conn: &Connection, limit: i64) -> AppResult<Vec<NextUpItem>> {
-    // Per subject: the next lesson = the min-ordered active, not-completed material.
-    // We rank materials within each subject by course order and take rank 1, then order
-    // subjects by their latest `last_opened_at` (active courses first), then by newest.
     let sql = format!(
-        "WITH {MAT_ANC_CTE},
+        "WITH {MAT_ROOT_CTE},
          ranked AS (
             SELECT
                 m.id, m.file_name, m.file_type,
-                a.chapter_name AS chapter_name,
-                a.subject_id AS subject_id, a.subject_name AS subject_name,
-                a.goal_name AS goal_name,
+                mr.node_id AS node_id,
+                pn.name AS node_name,
+                mr.root_id AS root_id,
+                rn2.name AS root_name,
                 ROW_NUMBER() OVER (
-                    PARTITION BY a.subject_id
-                    ORDER BY m.sort_order, m.file_name
+                    PARTITION BY mr.root_id
+                    ORDER BY pn.sort_order, pn.name, m.sort_order, m.file_name
                 ) AS rn,
-                COUNT(*) OVER (PARTITION BY a.subject_id) AS remaining,
+                COUNT(*) OVER (PARTITION BY mr.root_id) AS remaining,
                 (SELECT MAX(m3.last_opened_at)
-                   FROM materials m3 JOIN mat_anc a3 ON a3.mid = m3.id
-                   WHERE a3.subject_id = a.subject_id) AS subject_last_opened,
+                   FROM materials m3 JOIN mat_root mr3 ON mr3.mid = m3.id
+                   WHERE mr3.root_id = mr.root_id) AS root_last_opened,
                 m.thumbnail_path AS thumbnail_path
             FROM materials m
-            JOIN mat_anc a ON a.mid = m.id
+            JOIN mat_root mr ON mr.mid = m.id
+            JOIN nodes pn ON pn.id = mr.node_id
+            JOIN nodes rn2 ON rn2.id = mr.root_id
             WHERE m.status = 'active' AND m.is_completed = 0
          )
-         SELECT id, file_name, file_type, chapter_name,
-                subject_id, subject_name, goal_name, thumbnail_path, remaining
+         SELECT id, file_name, file_type, node_id, node_name,
+                root_id, root_name, thumbnail_path, remaining
          FROM ranked
          WHERE rn = 1
-         ORDER BY (subject_last_opened IS NULL), subject_last_opened DESC, subject_id DESC
+         ORDER BY (root_last_opened IS NULL), root_last_opened DESC, root_id DESC
          LIMIT ?1"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -648,10 +686,10 @@ pub fn next_up(conn: &Connection, limit: i64) -> AppResult<Vec<NextUpItem>> {
             id: r.get(0)?,
             file_name: r.get(1)?,
             file_type: r.get(2)?,
-            chapter_name: r.get(3)?,
-            subject_id: r.get(4)?,
-            subject_name: r.get(5)?,
-            goal_name: r.get(6)?,
+            node_id: r.get(3)?,
+            node_name: r.get(4)?,
+            root_id: r.get(5)?,
+            root_name: r.get(6)?,
             thumbnail_path: r.get(7)?,
             remaining: r.get(8)?,
         })
@@ -2211,22 +2249,64 @@ pub fn day_facts(conn: &Connection, day: &str) -> AppResult<DayFacts> {
     })
 }
 
+/// Blend the task-punctuality score with schedule adherence into one 0-100 day score.
+///
+/// The product decision here is deliberate: ONE headline number, with Week / Month /
+/// Rolling-90 derived as aggregates over these daily rows rather than stored separately.
+/// Four competing scores dilute each other until none means anything.
+///
+/// - Both signals present → 50/50 blend (deadlines and time-blocks are equally real).
+/// - Only one present → that one stands alone (a student who only uses to-dos, or only uses
+///   the schedule, still gets an honest score).
+/// - Neither → `None`, a neutral day, excluded from trailing averages so nobody is punished
+///   for a day they never planned.
+pub fn blended_score(task_score: Option<f64>, adherence: Option<f64>) -> Option<f64> {
+    match (task_score, adherence) {
+        (Some(t), Some(a)) => Some(((0.5 * t + 0.5 * a) as f64).clamp(0.0, 100.0)),
+        (Some(t), None) => Some(t.clamp(0.0, 100.0)),
+        (None, Some(a)) => Some(a.clamp(0.0, 100.0)),
+        (None, None) => None,
+    }
+}
+
 /// Upsert the snapshot row for `day` from its current facts (idempotent).
+///
+/// v9: also captures the day's schedule adherence. `score_version` records WHICH formula
+/// produced the number (1 = tasks only, 2 = tasks blended with schedule adherence) so the
+/// meaning of a historical row is never silently rewritten when the formula evolves.
 pub fn snapshot_day(conn: &Connection, day: &str) -> AppResult<()> {
     let f = day_facts(conn, day)?;
-    let score = score_for_day(&f).unwrap_or(0.0);
+    let task_score = score_for_day(&f);
+
+    let pf = crate::db::plan::plan_day_facts(conn, day)?;
+    let adherence = crate::db::plan::adherence_for_day(&pf);
+
+    let score = blended_score(task_score, adherence).unwrap_or(0.0);
+    // Version 2 means "a schedule existed and contributed"; version 1 keeps the pre-v9 meaning.
+    let score_version = if adherence.is_some() { 2 } else { 1 };
+
     conn.execute(
         "INSERT INTO consistency_log(
             day, tasks_due, tasks_completed_on_time, tasks_completed_late,
-            tasks_missed, study_minutes, score)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            tasks_missed, study_minutes, score,
+            blocks_planned, blocks_completed, blocks_partial, blocks_skipped,
+            planned_minutes, executed_minutes, adherence, score_version)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(day) DO UPDATE SET
             tasks_due               = excluded.tasks_due,
             tasks_completed_on_time = excluded.tasks_completed_on_time,
             tasks_completed_late    = excluded.tasks_completed_late,
             tasks_missed            = excluded.tasks_missed,
             study_minutes           = excluded.study_minutes,
-            score                   = excluded.score",
+            score                   = excluded.score,
+            blocks_planned          = excluded.blocks_planned,
+            blocks_completed        = excluded.blocks_completed,
+            blocks_partial          = excluded.blocks_partial,
+            blocks_skipped          = excluded.blocks_skipped,
+            planned_minutes         = excluded.planned_minutes,
+            executed_minutes        = excluded.executed_minutes,
+            adherence               = excluded.adherence,
+            score_version           = excluded.score_version",
         rusqlite::params![
             day,
             f.tasks_due,
@@ -2234,10 +2314,92 @@ pub fn snapshot_day(conn: &Connection, day: &str) -> AppResult<()> {
             f.tasks_completed_late,
             f.tasks_missed,
             f.study_minutes,
-            score
+            score,
+            pf.blocks_planned,
+            pf.blocks_completed,
+            pf.blocks_partial,
+            pf.blocks_skipped,
+            pf.planned_minutes,
+            pf.executed_minutes,
+            adherence,
+            score_version
         ],
     )?;
     Ok(())
+}
+
+/// Aggregate score over a trailing window of days — the derived Week / Month / Rolling-90
+/// figures. Deliberately NOT stored: `consistency_log` is already one row per day, so this is a
+/// sub-millisecond `GROUP BY` and there is no second write path to keep in sync.
+///
+/// Only days with real signal count (tasks due, study time, or a plan), matching the existing
+/// neutral-day rule. Returns `None` when the window holds no signal at all.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScoreWindow {
+    pub label: String,
+    pub days: i64,
+    pub score: Option<f64>,
+    /// Days in the window that carried signal (the denominator behind `score`).
+    pub counted_days: i64,
+    pub study_minutes: f64,
+    pub blocks_planned: i64,
+    pub blocks_completed: i64,
+}
+
+/// Compute one trailing window. `days` is inclusive of today.
+pub fn score_window(conn: &Connection, label: &str, days: i64) -> AppResult<ScoreWindow> {
+    let offset = format!("-{} days", days.max(1) - 1);
+    let (score, counted, study, planned, completed): (
+        Option<f64>,
+        i64,
+        f64,
+        i64,
+        i64,
+    ) = conn.query_row(
+        "SELECT
+            AVG(score),
+            COUNT(*),
+            COALESCE(SUM(study_minutes), 0),
+            COALESCE(SUM(blocks_planned), 0),
+            COALESCE(SUM(blocks_completed), 0)
+         FROM consistency_log
+         WHERE day >= date('now', ?1)
+           AND (tasks_due > 0 OR study_minutes > 0 OR blocks_planned > 0)",
+        [offset],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        },
+    )?;
+
+    Ok(ScoreWindow {
+        label: label.to_string(),
+        days,
+        score,
+        counted_days: counted,
+        study_minutes: study,
+        blocks_planned: planned,
+        blocks_completed: completed,
+    })
+}
+
+/// The full score drill-down: Today, Week, Month, and Rolling-90.
+///
+/// There is intentionally NO lifetime "Overall" score. After a bad month a lifetime average
+/// becomes mathematically unrecoverable, which turns feedback into a permanent indictment and
+/// is a well-known driver of study-app abandonment. Rolling-90 always recovers.
+pub fn score_summary(conn: &Connection) -> AppResult<Vec<ScoreWindow>> {
+    Ok(vec![
+        score_window(conn, "Today", 1)?,
+        score_window(conn, "Week", 7)?,
+        score_window(conn, "Month", 30)?,
+        score_window(conn, "Rolling 90", 90)?,
+    ])
 }
 
 /// Lazy backfill: snapshot every day from the earliest relevant activity (or the last
@@ -2806,6 +2968,161 @@ mod tests {
         let pinned = pinned_nodes(&conn).unwrap();
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].id, b, "unpinned node dropped, pinned one remains");
+    }
+
+    /// v9: `next_up` is NODE-NATIVE. It must resolve each material to its immediate folder
+    /// (`node_*`) and its course root (`root_*`) through MAT_ROOT_CTE — no goal/subject/chapter
+    /// shim — return ONE row per course, and skip courses that are fully complete. rusqlite
+    /// isn't compile-checked, so this runs the real SQL.
+    #[test]
+    fn next_up_is_node_native_and_one_row_per_course() {
+        let mut conn = test_conn();
+
+        // Course A: nested UPSC > Polity > Topic with two lessons, neither complete.
+        let a = upsert_root_node(&conn, "UPSC").unwrap();
+        import_tree(
+            &mut conn,
+            a,
+            &[ScannedNode {
+                rel_segments: vec!["Polity".to_string(), "Topic".to_string()],
+                files: vec![
+                    file("/a/Polity/Topic/01.mp4", "01.mp4", 1),
+                    file("/a/Polity/Topic/02.mp4", "02.mp4", 2),
+                ],
+            }],
+            |_, _| {},
+        )
+        .unwrap();
+
+        // Course B: fully completed — must NOT appear (nothing left to study).
+        let b = upsert_root_node(&conn, "Finished").unwrap();
+        insert_material(&conn, b, &file("/b/done.mp4", "done.mp4", 1)).unwrap();
+        conn.execute(
+            "UPDATE materials SET is_completed = 1 WHERE file_path = '/b/done.mp4'",
+            [],
+        )
+        .unwrap();
+
+        let items = next_up(&conn, 10).unwrap();
+        assert_eq!(items.len(), 1, "one row per course, completed courses excluded");
+
+        let it = &items[0];
+        assert_eq!(it.root_id, a, "root_id is the course root node");
+        assert_eq!(it.root_name, "UPSC");
+        assert_eq!(it.node_name, "Topic", "node_name is the immediate parent folder");
+        assert_eq!(it.file_name, "01.mp4", "the FIRST lesson in course order");
+        assert_eq!(it.remaining, 2, "both lessons still outstanding");
+
+        // The returned node_id really is the material's parent node.
+        let parent: i64 = conn
+            .query_row(
+                "SELECT node_id FROM materials WHERE file_path = '/a/Polity/Topic/01.mp4'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(it.node_id, parent);
+    }
+
+    /// A shallow tree (files directly under the root — the casual-learner shape) must still
+    /// resolve: the root doubles as both the course and the immediate folder.
+    #[test]
+    fn next_up_handles_a_flat_single_root_course() {
+        let conn = test_conn();
+        let root = upsert_root_node(&conn, "Guitar").unwrap();
+        insert_material(&conn, root, &file("/g/lesson1.mp4", "lesson1.mp4", 1)).unwrap();
+
+        let items = next_up(&conn, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].root_id, root);
+        assert_eq!(items[0].node_id, root, "flat tree: the root IS the parent node");
+        assert_eq!(items[0].root_name, "Guitar");
+        assert_eq!(items[0].node_name, "Guitar");
+    }
+
+    /// The v9 score drill-down: derived windows over `consistency_log`, with NO lifetime
+    /// "Overall" figure (an unrecoverable lifetime average drives study-app abandonment).
+    /// Days without signal must not drag the average down.
+    #[test]
+    fn score_summary_derives_windows_and_ignores_neutral_days() {
+        let conn = test_conn();
+        // Two signal-bearing days and one fully-neutral day.
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, score, blocks_planned)
+             VALUES (date('now'), 2, 80.0, 2), (date('now','-3 days'), 2, 60.0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, study_minutes, score, blocks_planned)
+             VALUES (date('now','-1 days'), 0, 0, 0.0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let windows = score_summary(&conn).unwrap();
+        let labels: Vec<&str> = windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, vec!["Today", "Week", "Month", "Rolling 90"]);
+        assert!(
+            !labels.contains(&"Overall"),
+            "no lifetime score — it can never recover after a bad month"
+        );
+
+        let today = &windows[0];
+        assert_eq!(today.score, Some(80.0));
+        assert_eq!(today.counted_days, 1);
+
+        // The week average is 70 (80 and 60), NOT 46.7 — the neutral day is excluded.
+        let week = &windows[1];
+        assert_eq!(week.counted_days, 2, "the zero-signal day is skipped");
+        assert_eq!(week.score, Some(70.0));
+    }
+
+    /// The blended score: both signals average, one signal stands alone, neither is neutral.
+    /// This is what lets a to-do-only user and a schedule-only user both get honest numbers.
+    #[test]
+    fn blended_score_combines_task_and_schedule_signals() {
+        assert_eq!(blended_score(Some(80.0), Some(60.0)), Some(70.0));
+        assert_eq!(blended_score(Some(80.0), None), Some(80.0), "tasks only");
+        assert_eq!(blended_score(None, Some(60.0)), Some(60.0), "schedule only");
+        assert_eq!(blended_score(None, None), None, "a neutral day stays neutral");
+    }
+
+    /// `snapshot_day` must capture schedule adherence alongside task punctuality and stamp
+    /// score_version = 2 once a plan exists, so historical rows keep their original meaning.
+    #[test]
+    fn snapshot_day_records_adherence_and_bumps_score_version() {
+        let conn = test_conn();
+        let day: String = conn.query_row("SELECT date('now')", [], |r| r.get(0)).unwrap();
+
+        // No plan yet → version stays 1.
+        snapshot_day(&conn, &day).unwrap();
+        let v: i64 = conn
+            .query_row("SELECT score_version FROM consistency_log WHERE day = ?1", [&day], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 1, "no schedule → the pre-v9 formula");
+
+        // Add and complete a block, then re-snapshot.
+        conn.execute(
+            "INSERT INTO plan_blocks(day, planned_start, planned_mins, title, status, executed_mins)
+             VALUES(?1, '06:00', 60, 'Physics', 'done', 60)",
+            [&day],
+        )
+        .unwrap();
+        snapshot_day(&conn, &day).unwrap();
+
+        let (planned, completed, adherence, version): (i64, i64, Option<f64>, i64) = conn
+            .query_row(
+                "SELECT blocks_planned, blocks_completed, adherence, score_version
+                   FROM consistency_log WHERE day = ?1",
+                [&day],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(planned, 1);
+        assert_eq!(completed, 1);
+        assert!(adherence.unwrap() > 0.0, "a completed block must score adherence");
+        assert_eq!(version, 2, "a schedule contributed → new formula version");
     }
 
     /// `nodes_in_progress` returns only roots with 0 < completed < total; `recent_nodes`

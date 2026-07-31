@@ -168,6 +168,40 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_nodes_pinned ON nodes(is_pinned) WHERE is_pinned = 1",
         )?;
+
+        // v9: the Planning/Scheduling system. All the NEW tables (plan_blocks, plan_events,
+        // plan_days, plan_templates, plan_template_blocks, reminder_state, node_velocity)
+        // are created by SCHEMA_SQL above — `CREATE TABLE IF NOT EXISTS` handles both fresh
+        // installs and migrating DBs, since none of them existed before v9.
+        //
+        // `consistency_log`, however, ALREADY EXISTS on any pre-v9 DB, so its new adherence
+        // columns need guarded ALTERs (a CREATE TABLE IF NOT EXISTS can't add a column to an
+        // existing table). Each is conditional, so this is a no-op on fresh installs.
+        for (col, decl) in [
+            ("blocks_planned", "INTEGER DEFAULT 0"),
+            ("blocks_completed", "INTEGER DEFAULT 0"),
+            ("blocks_partial", "INTEGER DEFAULT 0"),
+            ("blocks_skipped", "INTEGER DEFAULT 0"),
+            ("planned_minutes", "REAL DEFAULT 0"),
+            ("executed_minutes", "REAL DEFAULT 0"),
+            ("adherence", "REAL"),
+            ("score_version", "INTEGER DEFAULT 1"),
+        ] {
+            if !column_exists(conn, "consistency_log", col)? {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE consistency_log ADD COLUMN {col} {decl}"
+                ))?;
+            }
+        }
+
+        // Partial index on the planner's hot filter (the solver only ever reads pending /
+        // active blocks). Created here rather than in SCHEMA_SQL purely for symmetry with
+        // idx_nodes_pinned — partial indexes referencing recently-added columns are the exact
+        // shape that broke the v8 migration, so the project keeps them all in one place.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_blocks_status ON plan_blocks(status)
+             WHERE status IN ('pending','active')",
+        )?;
         Ok(())
     })();
 
@@ -530,6 +564,108 @@ mod tests {
         // The legacy task survived the migration.
         let n: i64 = conn
             .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// v9: a pre-v9 DB gains the whole planner (new tables) AND the adherence columns added to
+    /// the ALREADY-EXISTING consistency_log. The second half is the risky part: a
+    /// `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that already exists, so
+    /// those need guarded ALTERs — and the partial index on plan_blocks must only be built
+    /// after its table exists (the exact trap the v8 migration hit).
+    #[test]
+    fn migrates_pre_v9_db_by_adding_planner_tables_and_adherence_columns() {
+        let conn = Connection::open_in_memory().expect("open");
+        configure_pragmas(&conn).unwrap();
+        // A pre-v9 consistency_log: the v4 shape, WITHOUT any adherence columns, holding a
+        // real historical snapshot that must survive untouched.
+        conn.execute_batch(
+            "CREATE TABLE consistency_log (
+                day                     TEXT PRIMARY KEY,
+                tasks_due               INTEGER DEFAULT 0,
+                tasks_completed_on_time INTEGER DEFAULT 0,
+                tasks_completed_late    INTEGER DEFAULT 0,
+                tasks_missed            INTEGER DEFAULT 0,
+                study_minutes           REAL DEFAULT 0,
+                score                   REAL DEFAULT 0,
+                created_at              TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO consistency_log(day, tasks_due, tasks_completed_on_time, score)
+                VALUES ('2026-01-05', 3, 3, 88.5);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 8i64).unwrap();
+        assert!(!column_exists(&conn, "consistency_log", "adherence").unwrap());
+        assert!(!table_exists(&conn, "plan_blocks").unwrap());
+
+        migrate(&conn).unwrap();
+
+        // Every planner table now exists.
+        for t in [
+            "plan_blocks",
+            "plan_events",
+            "plan_days",
+            "plan_templates",
+            "plan_template_blocks",
+            "reminder_state",
+            "node_velocity",
+        ] {
+            assert!(table_exists(&conn, t).unwrap(), "{t} must be created");
+        }
+
+        // The adherence columns were ALTERed onto the pre-existing table.
+        for c in [
+            "blocks_planned",
+            "blocks_completed",
+            "blocks_partial",
+            "blocks_skipped",
+            "planned_minutes",
+            "executed_minutes",
+            "adherence",
+            "score_version",
+        ] {
+            assert!(
+                column_exists(&conn, "consistency_log", c).unwrap(),
+                "consistency_log.{c} must be added"
+            );
+        }
+
+        // The historical snapshot is intact — an append-only log must never be rewritten by a
+        // migration, and its score keeps its original v1 meaning.
+        let (score, version): (f64, i64) = conn
+            .query_row(
+                "SELECT score, score_version FROM consistency_log WHERE day = '2026-01-05'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(score, 88.5, "historical score preserved");
+        assert_eq!(version, 1, "old rows keep the pre-v9 formula version");
+
+        // The partial index built after the table exists.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_blocks_status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "partial index on plan_blocks(status) must exist");
+
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        // A planner write actually works against the migrated schema (FKs enforced).
+        conn.execute(
+            "INSERT INTO plan_blocks(day, planned_start, planned_mins, title)
+             VALUES('2026-07-31', '06:00', 60, 'Physics')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM plan_blocks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
     }
