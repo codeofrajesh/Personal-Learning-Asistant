@@ -764,12 +764,12 @@ sections with correct membership; (b) **pin/unpin** a course from a hub card and
 
 ---
 
-## 14. Planning, Scheduling & Intelligence System (schema v9)
+## 14. Planning, Scheduling & Intelligence System (schema v10)
 
 Time-blocked scheduling with an Intelligent Adjustment engine, an advisory pre-mortem, learned
-pace, and schedule-adherence scoring. **Phases A + B (backend) and C (Today view, one clock,
-durable reminders) are DONE**: `cargo test --lib` **81/81** green (was 14), zero new warnings;
-`npm run build` + `tsc --noEmit` clean. Phases D–F are not started.
+pace, and schedule-adherence scoring. **ALL phases (A–F) are DONE**: `cargo test --lib`
+**117/117** green (was 14), no new clippy warnings; `npm run build` + `tsc --noEmit` clean.
+**37 plan commands** registered. Still owed: a live smoke test against a real pre-v9 DB (§14.11).
 
 ### 14.0 Architectural decisions (pushbacks accepted by the user)
 These were argued *against* the original brief and approved — they are load-bearing, not
@@ -868,13 +868,24 @@ tree doesn't have. `NextUpItem` now carries `node_id`/`node_name` (immediate fol
 - **Frontend (DTO absorption only):** `lib/types.ts`, `components/dashboard/NextUp.tsx`,
   `components/planning/PlannerTab.tsx`.
 
-### 14.6 Command surface (19 registered, untested live)
-`plan_day`, `upsert_plan_block`, `delete_plan_block`, `set_plan_block_status`,
-`start_plan_block`, `active_plan_block`, `set_plan_day_window`, `recovery_plans` (**read-only**),
-`apply_recovery` (→ undo token), `undo_recovery`, `dismiss_recovery`, `apply_plan_template`,
-`reconcile_plan`, `score_summary`, plus the Phase C reminder ledger: `claim_reminder`
-(atomic, returns whether YOU get to fire), `list_reminders`, `ack_reminder`, `snooze_reminder`,
-`prune_reminders`.
+### 14.6 Command surface (37 registered, untested live)
+**Blocks & day (A–B):** `plan_day`, `upsert_plan_block`, `delete_plan_block`,
+`set_plan_block_status`, `start_plan_block`, `active_plan_block`, `set_plan_day_window`,
+`reconcile_plan`, `score_summary`.
+**Adjustment (D):** `recovery_plans` (**read-only**), `apply_recovery` (→ undo token),
+`undo_recovery`, `dismiss_recovery`.
+**Reminder ledger (C):** `claim_reminder` (atomic, returns whether YOU get to fire),
+`list_reminders`, `ack_reminder`, `snooze_reminder`, `prune_reminders`.
+**Routines (F):** `apply_plan_template`, `list_plan_templates`, `plan_template_blocks`,
+`upsert_plan_template`, `delete_plan_template`, `upsert_plan_template_block`,
+`delete_plan_template_block`, `save_day_as_template`, `suggested_plan_template`.
+**Exams (F, v10):** `list_exams`, `upsert_exam`, `delete_exam`, `exam_plans`.
+**Insight & commitment (F):** `peak_hours`, `streak_status`, `commit_focus`, `resolve_focus`,
+`focus_contract`, `focus_record`.
+
+Every command that needs "today"/"now"/a weekday/a UTC offset takes it as a **parameter**. This
+is now enforced across the whole surface — Phase E found `score_window` and `consistency_summary`
+still anchored on SQLite's UTC `date('now')`, which silently mis-filed a student's evening.
 
 ### 14.7 Phase C — DONE (Today view, one clock, durable reminders)
 `cargo test --lib` **81/81** green (was 74); `tsc --noEmit` + `npm run build` clean.
@@ -1026,10 +1037,88 @@ Design decisions:
   which is how the dead contiguity check in `longestStreak` was caught. Temp files removed.
   `tsc --noEmit` clean, `npm run build` green.
 
-### 14.10 Next — Phase F
-- **F:** Innovations — Plan Integrity surfacing, templates UI, **exam backward-planning**,
-  learned peak hours, streak insurance, Pomodoro↔block binding, focus contract.
-- **Also owed:** live smoke test of v9 against a real pre-v9 DB, plus §13.5's outstanding items.
-- **Worth doing:** a real frontend test runner (Vitest). Phase E's client-side derivations had to
-  be verified with a throwaway esbuild harness, and it found a genuine bug — that shouldn't be
-  a manual step.
+### 14.10 Phase F — DONE (the seven innovations)
+All seven shipped. Plan Integrity surfacing already landed in Phase C as `IntegrityCard`, so this
+phase covered the remaining six. `cargo test --lib` **117/117**; no new clippy warnings.
+
+**1. Pomodoro↔block binding — and the silent bug it exposed.**
+`add_executed_mins` was called from **nowhere but tests**, despite its own doc comment claiming the
+`log_session` path used it. Consequence: every block's `executed_mins` stayed `0.0` forever, so
+adherence scored every planned day as a total failure, the solver computed drift against work
+already done, and block progress bars never moved. `queries::log_study_session` now credits the
+active block for `work` sessions only — breaks are recorded but never credited, since crediting
+them would let a student score full adherence by starting a block and walking away. Every caller
+reports one DISCRETE elapsed chunk, so summing cannot double-count. Best-effort by contract, like
+`plan::log_event`. `PomodoroWidget` shows "Counting toward X"; the crediting is entirely
+server-side.
+
+**2. Routine templates UI (9 commands).** Backend had only `apply_template`. Authoring is by
+**capture, not by form**: nobody builds a good routine in an empty form, they build a good *day*
+and want it back. `save_day_as_template` captures `planned_*` (the intention), never `effective_*`
+(one morning's adjustments baked in permanently), and excludes spill carry-overs that belong to the
+day that went wrong. It refuses an empty day rather than leaving a routine that silently does
+nothing, deleting the orphan row it just created. Applying is **additive and idempotent** — never
+clears the day. Template blocks get the same validation as real blocks: a bad time in a routine
+would generate broken days on every application. `suggested_template` takes the weekday from the
+frontend (`strftime('%w')` is UTC → offers tomorrow's routine at 22:00); inactive and empty
+routines are never suggested. Deleting a routine never touches the days it generated.
+
+**3. Exam backward-planning (schema v10).** New `exams` table — the headline item, and what
+finally makes `solver::DayBlock.exam_linked` **real**: it was hardcoded `false`, so the solver's
+1.5× urgency multiplier was dead code. `exam_plan()` derives, never caches (materials change
+daily): remaining syllabus ÷ usable days, at the learned pace. Partial progress **counts** (a
+60-min lecture watched to 40 leaves 20, not 60 — counting it whole makes the feature cry wolf);
+unknown durations get a conservative 10-min placeholder rather than being free work; the revision
+tail is withheld from new material, because a plan that has you learning new content the night
+before has already failed. Out of study days it switches from coverage to **triage** instead of
+dividing by zero. `exam_linked` matches the exam node **and its descendants** — an exam is set on
+"Physics" while blocks target a chapter underneath, so exact-node matching would leave real blocks
+unlinked. Keyed on the day being planned, not `now`, and past exams stop conferring urgency.
+
+**4. Learned peak hours.** `utc_offset_mins` is a **required** parameter: `started_at` is written
+with UTC `datetime('now')`, so bucketing on `strftime('%H')` alone would tell a UTC+5:30 student
+they peak five and a half hours from when they actually study — i.e. advise them to schedule their
+hardest work while asleep. Out-of-range offsets are rejected rather than silently rotating the
+histogram. `usePeakHours` negates `getTimezoneOffset()` **once, at the boundary** (it returns the
+inverse of the offset people mean). **Confidence gate:** under 180 logged minutes across 4+
+distinct days the card reports how much more data it needs instead of naming an hour — advice from
+two sessions is noise, and a student who follows it once and has a bad time stops trusting
+everything else. The histogram still renders; only the *conclusion* needs a threshold. Best window
+is 2 hours, since a single-hour spike may just be when a long lecture started.
+
+**5. Streak insurance.** A derived **tolerance**, not a spendable token. A wallet design was
+rejected: it requires persisting which days were paid for (a write during a read) and makes the
+displayed streak depend on the order the student happened to open the app in. This reads
+`consistency_log` only, so the same history always yields the same number — nothing to migrate,
+nothing to farm. Earning is progressive (7 good days for the first bridge, 14 for the second) and
+capped at 2: consistency buys forgiveness, never invulnerability. A third bad day ends the streak
+and the next one starts from scratch, insurance included. Neutral days are skipped, not bridged.
+**The chronological walk is load-bearing** — the first implementation scanned newest-first and
+counted the good days *after* a bad day toward its cost; tests caught it bridging nothing.
+
+**6. Focus contract.** Pre-commitment: write in one line what "done" means, then say whether you
+kept it. Stored as `plan_events` rows (`committed` / `contract_kept` / `contract_broken`) rather
+than new columns — it's a sequence of observations about a block, which is what that append-only
+ledger is for, so no migration and the history survives block edits. **Not enforcement:** nothing
+is locked or punished, because a planner that fights the student loses and an enforced commitment
+teaches nothing about whether they'd have kept it. **Self-reported** because "did I do what I
+said?" isn't observable from playback — inferring it from minutes would score *sitting in front of
+a lecture* rather than finishing what was promised. `keep_rate` counts resolved contracts only and
+stays `null` under 3 samples (unanswered-as-broken punishes blocks in flight; unanswered-as-kept
+flatters). The intention is JSON-escaped via `serde_json`, not string-formatted — a quote would
+otherwise produce invalid `meta` that reads back empty (test covers it). The prompt appears on the
+**leading block only** (four commitment fields at once is a form, not a decision), plus a separate
+`OpenContracts` list, because `UpNextCard` shows only *open* blocks — a finished block would
+otherwise take its unanswered question with it when it left the list.
+
+### 14.11 Still owed
+- **Live smoke test against a real pre-v9 DB.** Everything above is compile-, test- and
+  build-verified only. The v9→v10 migration path is covered by unit tests but has never run
+  against a real user database.
+- **A frontend test runner (Vitest).** Phase E's client-side derivations had to be verified with a
+  throwaway esbuild harness, and it found a genuine bug (`longestStreak`'s dead contiguity check).
+  That shouldn't be a manual step. Phase F's client logic is thinner but equally unguarded.
+- §13.5's outstanding items.
+- **Known minor:** on the Planning page `useDayPlan` and the global `useBlockReminders` both read
+  `plan_day` for today, so that day is fetched twice while the page is open. Cheap and correct,
+  but redundant — worth collapsing if that wiring is touched again.

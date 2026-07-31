@@ -201,7 +201,7 @@ pub fn apply_plan_template(db: State<'_, Db>, template_id: i64, day: String) -> 
 /// All routines, with block counts.
 #[tauri::command]
 pub fn list_plan_templates(db: State<'_, Db>) -> AppResult<Vec<PlanTemplate>> {
-    db.with(|conn| plan::list_templates(conn))
+    db.with(plan::list_templates)
 }
 
 /// One routine's blocks, in routine order.
