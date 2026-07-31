@@ -8,12 +8,16 @@
  *
  * Perf: no polling — toasts are driven by the store; each card owns a single
  * setTimeout for its auto-dismiss, cleared on unmount.
+ *
+ * Collision: the stack shifts up when the mini-player is docked (also bottom-right, with a
+ * transparent clip-path hole punched through AppShell for the mpv surface). See below.
  */
 
 import { useEffect, useRef } from "react";
 import { gsap } from "gsap";
 import { Timer, Coffee, CheckCircle2, AlertTriangle, Info, X } from "lucide-react";
 import { useToastStore, type Toast, type ToastTone } from "../../lib/toastStore";
+import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { cn } from "../../lib/utils";
 
 const TONE: Record<ToastTone, { icon: typeof Info; ring: string; glow: string; bar: string; iconColor: string }> = {
@@ -27,12 +31,21 @@ const TONE: Record<ToastTone, { icon: typeof Info; ring: string; glow: string; b
 export default function ToastHost() {
   const toasts = useToastStore((s) => s.toasts);
   const dismiss = useToastStore((s) => s.dismiss);
+  // The docked mini-player also lives bottom-right, and AppShell punches a transparent
+  // clip-path hole through the ambient canvas so mpv (which renders BEHIND the webview) shows
+  // through it. A toast sitting over that hole is unreadable — the video is behind it, not the
+  // app background — and it also hides the video the student is watching. So when the mini
+  // card is docked, lift the stack clear of it. `rect` is null whenever it isn't docked, which
+  // is the whole condition; no route sniffing needed.
+  const miniRect = useMiniPlayer((s) => s.rect);
+  const liftPx = miniRect ? Math.round(miniRect.h + 32) : 0;
 
   return (
     <div
       aria-live="polite"
       aria-relevant="additions"
-      className="scroll-thin pointer-events-none fixed bottom-6 right-6 z-[80] flex max-h-[calc(100vh-3rem)] w-[min(26rem,calc(100vw-3rem))] flex-col gap-3 overflow-y-auto"
+      style={{ bottom: `${24 + liftPx}px` }}
+      className="scroll-thin pointer-events-none fixed right-6 z-[80] flex max-h-[calc(100vh-3rem)] w-[min(26rem,calc(100vw-3rem))] flex-col gap-3 overflow-y-auto transition-[bottom] duration-200"
     >
       {toasts.map((t) => (
         <ToastCard key={t.id} toast={t} onDismiss={() => dismiss(t.id)} />

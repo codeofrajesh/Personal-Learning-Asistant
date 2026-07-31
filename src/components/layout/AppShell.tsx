@@ -23,6 +23,7 @@ import MiniPlayer from "../player/MiniPlayer";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { usePerf } from "../../lib/perfStore";
 import { useTaskReminders } from "../useTaskReminders";
+import { useBlockReminders } from "../../lib/scheduleReminders";
 
 export default function AppShell() {
   const [collapsed, setCollapsed] = useState(false);
@@ -41,8 +42,12 @@ export default function AppShell() {
     void hydratePerf();
   }, [hydratePerf]);
 
-  // App-wide task-deadline reminders (low-CPU 60s poll; deduped toasts).
+  // App-wide reminders. Both are event-driven off the shared minute clock (no polling) and
+  // deduped through the durable `reminder_state` ledger, so nothing re-fires after a restart.
+  // They live here rather than on the Planning page because a reminder that only arrives while
+  // you're already looking at your schedule isn't a reminder.
   useTaskReminders();
+  useBlockReminders();
 
   // On the player route, force the sidebar into minimized (icon-only) mode for the
   // immersive 3-column layout. The user can still toggle it; this just sets the

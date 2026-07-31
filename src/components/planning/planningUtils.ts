@@ -4,7 +4,7 @@
  * every surface (design-taste "color consistency lock").
  */
 
-import type { Task } from "../../lib/types";
+import type { PlanBlock, Task } from "../../lib/types";
 
 /** Priority index → label + solid dot + duotone gradient + accent text. */
 export const PRIORITY_META: {
@@ -192,4 +192,146 @@ export function taskIconKind(task: Task): TaskIconKind {
     default:
       return "task";
   }
+}
+
+// ── Blocks (v9 schedule) ─────────────────────────────────────────────────────
+
+/**
+ * Presentation state of a block. Distinct from `BlockStatus` because two of these are
+ * *derived from the clock*, not stored: a `pending` block reads differently at 05:00 (upcoming),
+ * 06:05 (missed its start) and 09:00 (long gone). Deriving it here keeps that judgement in one
+ * place instead of scattering `Date.now()` comparisons through the views.
+ */
+export type BlockVisualState =
+  | "done"
+  | "partial"
+  | "skipped"
+  | "spilled"
+  | "active"
+  | "overrun"
+  | "late"
+  | "now"
+  | "upcoming";
+
+/** How long past its start a pending block counts as "late" rather than just imminent. */
+export const BLOCK_LATE_MINS = 5;
+
+/**
+ * Classify a block for display. `nowMins` is minutes since local midnight; `isToday` gates the
+ * clock-derived states so browsing next Tuesday doesn't paint every block as "late".
+ */
+export function blockVisualState(
+  block: PlanBlock,
+  nowMins: number,
+  isToday: boolean,
+): BlockVisualState {
+  switch (block.status) {
+    case "done":
+      return "done";
+    case "partial":
+      return "partial";
+    case "skipped":
+      return "skipped";
+    case "spilled":
+      return "spilled";
+    default:
+      break;
+  }
+
+  const start = blockStartMins(block);
+  const end = start == null ? null : start + block.effective_mins;
+
+  if (block.status === "active") {
+    // Still running past its planned end — the moment worth offering a recovery for.
+    return isToday && end != null && nowMins > end ? "overrun" : "active";
+  }
+  if (!isToday || start == null) return "upcoming";
+  if (nowMins >= start + BLOCK_LATE_MINS) return "late";
+  if (nowMins >= start) return "now";
+  return "upcoming";
+}
+
+/** A block's effective start in minutes since midnight, or null when unparseable. */
+export function blockStartMins(block: PlanBlock): number | null {
+  const m = /^(\d{1,2}):(\d{2})/.exec(block.effective_start);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/** Palette per visual state, reusing the task status vocabulary so the two surfaces agree. */
+export const BLOCK_STATE_META: Record<
+  BlockVisualState,
+  { grad: string; rail: string; text: string; label: string }
+> = {
+  done: { grad: DONE_META.grad, rail: DONE_META.rail, text: DONE_META.text, label: "Done" },
+  partial: {
+    grad: "from-emerald-500/[0.10] to-amber-400/[0.04]",
+    rail: "bg-emerald-500/50",
+    text: "text-emerald-200/70",
+    label: "Partly done",
+  },
+  skipped: {
+    grad: "from-white/[0.04] to-white/[0.01]",
+    rail: "bg-white/20",
+    text: "text-white/35",
+    label: "Skipped",
+  },
+  spilled: {
+    grad: "from-violet-500/[0.14] to-white/[0.02]",
+    rail: "bg-violet-400/60",
+    text: "text-violet-200/80",
+    label: "Moved on",
+  },
+  active: {
+    grad: "from-lime/20 to-emerald-400/[0.05]",
+    rail: "bg-lime",
+    text: "text-lime",
+    label: "In progress",
+  },
+  overrun: {
+    grad: OVERDUE_META.grad,
+    rail: OVERDUE_META.rail,
+    text: OVERDUE_META.text,
+    label: "Running over",
+  },
+  late: { grad: SOON_META.grad, rail: SOON_META.rail, text: SOON_META.text, label: "Late start" },
+  now: {
+    grad: "from-cyan-500/20 to-sky-400/[0.05]",
+    rail: "bg-cyan-400",
+    text: "text-cyan-300",
+    label: "Starts now",
+  },
+  upcoming: {
+    grad: UPCOMING_META.grad,
+    rail: UPCOMING_META.rail,
+    text: UPCOMING_META.text,
+    label: "Upcoming",
+  },
+};
+
+/** True when a block is still open work the adjustment engine would touch. */
+export function isBlockOpen(block: PlanBlock): boolean {
+  return block.status === "pending" || block.status === "active";
+}
+
+/** `"1h 20m"` / `"45m"` — matches the Rust `fmt_duration` so both sides read identically. */
+export function fmtMins(mins: number): string {
+  const m = Math.max(0, Math.round(mins));
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return rem === 0 ? `${h}h` : `${h}h ${rem}m`;
+}
+
+/** `'HH:MM'` (24h) → a friendly local label ("6:00 AM"), without re-parsing dates. */
+export function fmtHhmmLabel(hhmm: string): string {
+  const m = /^(\d{1,2}):(\d{2})/.exec(hhmm);
+  if (!m) return hhmm;
+  const h = Number(m[1]);
+  const suffix = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${m[2]} ${suffix}`;
 }

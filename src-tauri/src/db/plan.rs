@@ -833,6 +833,176 @@ pub fn dismiss_recovery(conn: &Connection, day: &str) -> AppResult<()> {
     Ok(())
 }
 
+// ── Durable reminder ledger ──────────────────────────────────────────────────
+
+/// One row of the reminder ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReminderState {
+    pub key: String,
+    pub fired_at: String,
+    pub ack_at: Option<String>,
+    pub snooze_to: Option<String>,
+}
+
+/// Normalize a caller-supplied wall-clock datetime to `'YYYY-MM-DD HH:MM:SS'`.
+///
+/// Every timestamp in this ledger is compared **lexicographically** against another timestamp
+/// from the same source, so they must all share one format: `'2026-07-31T21:05'` and
+/// `'2026-07-31 21:05:00'` describe the same instant but sort differently as strings, and a
+/// snooze stored in one shape would be compared wrongly against a claim in the other.
+///
+/// A trailing `Z` is **rejected** rather than stripped. The planner is local-wall-clock
+/// throughout (see the module header); silently reading a UTC instant as local would shift
+/// every reminder by the caller's offset — a reminder that fires at the wrong hour is worse
+/// than a loud error at the call site.
+fn norm_dt(raw: &str) -> AppResult<String> {
+    let s = raw.trim();
+    let invalid = || {
+        AppError::Invalid(format!(
+            "invalid datetime '{raw}' (want local 'YYYY-MM-DD HH:MM[:SS]', no timezone suffix)"
+        ))
+    };
+    if s.ends_with('Z') || s.ends_with('z') {
+        return Err(AppError::Invalid(format!(
+            "datetime '{raw}' is UTC; the planner needs LOCAL wall-clock time"
+        )));
+    }
+    let b = s.as_bytes();
+    let date_shaped = b.len() >= 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[..10]
+            .iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit());
+    if !date_shaped {
+        return Err(invalid());
+    }
+    let date = &s[..10];
+
+    let rest = s[10..].trim_start_matches(['T', 't', ' ']);
+    if rest.is_empty() {
+        // A date-only value means "start of that day", which is what a bare day implies.
+        return Ok(format!("{date} 00:00:00"));
+    }
+    let mut parts = rest.split(':');
+    let mut next = |default: u32| -> AppResult<u32> {
+        match parts.next() {
+            None => Ok(default),
+            Some(p) => p.trim().parse::<u32>().map_err(|_| invalid()),
+        }
+    };
+    let (h, m, sec) = (next(0)?, next(0)?, next(0)?);
+    if parts.next().is_some() || h > 23 || m > 59 || sec > 59 {
+        return Err(invalid());
+    }
+    Ok(format!("{date} {h:02}:{m:02}:{sec:02}"))
+}
+
+fn clean_key(key: &str) -> AppResult<&str> {
+    let k = key.trim();
+    if k.is_empty() {
+        Err(AppError::Invalid("reminder key is required".into()))
+    } else {
+        Ok(k)
+    }
+}
+
+/// Atomically CLAIM a reminder: `true` only for the caller that gets to fire it.
+///
+/// This exists because the frontend's dedupe (`toastStore`'s in-memory cooldown map) forgets
+/// everything on restart, so every reminder re-fired on the next launch. The claim is a single
+/// upsert — not read-then-write — so two clocks racing the same key can't both win.
+///
+/// Re-granted only when an active snooze has expired. An acknowledged reminder is never
+/// re-granted: the student already acted on it.
+pub fn claim_reminder(conn: &Connection, key: &str, now: &str) -> AppResult<bool> {
+    let key = clean_key(key)?;
+    let now = norm_dt(now)?;
+    let n = conn.execute(
+        "INSERT INTO reminder_state(key, fired_at) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET fired_at = excluded.fired_at,
+                                        snooze_to = NULL
+          WHERE reminder_state.ack_at IS NULL
+            AND reminder_state.snooze_to IS NOT NULL
+            AND reminder_state.snooze_to <= excluded.fired_at",
+        rusqlite::params![key, now],
+    )?;
+    Ok(n == 1)
+}
+
+/// Ledger rows whose key starts with `prefix` (e.g. `block-42-`), newest first.
+///
+/// Matched with `substr` rather than `LIKE`: a key fragment containing `%` or `_` would
+/// otherwise act as a wildcard and quietly return unrelated reminders. The table is bounded by
+/// [`prune_reminders`], so the scan is cheap.
+pub fn list_reminders(conn: &Connection, prefix: &str) -> AppResult<Vec<ReminderState>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, fired_at, ack_at, snooze_to FROM reminder_state
+          WHERE substr(key, 1, length(?1)) = ?1
+          ORDER BY fired_at DESC, key",
+    )?;
+    let rows = stmt.query_map([prefix], |r| {
+        Ok(ReminderState {
+            key: r.get(0)?,
+            fired_at: r.get(1)?,
+            ack_at: r.get(2)?,
+            snooze_to: r.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Mark a reminder acknowledged (the student acted on it) and clear any snooze.
+///
+/// Upserts so an ack can't fail on a row that was pruned between firing and acking — losing the
+/// ack would let the reminder fire again, which is the exact bug this ledger exists to prevent.
+/// `ack_at` is bookkeeping (an absolute observation, never compared against wall-clock plan
+/// times), so SQLite's own timestamp is the right source here.
+pub fn ack_reminder(conn: &Connection, key: &str) -> AppResult<()> {
+    let key = clean_key(key)?;
+    conn.execute(
+        "INSERT INTO reminder_state(key, fired_at, ack_at)
+         VALUES(?1, datetime('now'), datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET ack_at = datetime('now'), snooze_to = NULL",
+        [key],
+    )?;
+    Ok(())
+}
+
+/// Snooze a reminder until `snooze_to` (local wall clock); it may be claimed again after that.
+pub fn snooze_reminder(conn: &Connection, key: &str, snooze_to: &str) -> AppResult<()> {
+    let key = clean_key(key)?;
+    let until = norm_dt(snooze_to)?;
+    conn.execute(
+        "INSERT INTO reminder_state(key, fired_at, snooze_to)
+         VALUES(?1, datetime('now'), ?2)
+         ON CONFLICT(key) DO UPDATE SET snooze_to = excluded.snooze_to, ack_at = NULL",
+        rusqlite::params![key, until],
+    )?;
+    Ok(())
+}
+
+/// Drop ledger rows older than `keep_days`, returning how many were removed.
+///
+/// Rows with a snooze still in the future are kept regardless of age: deleting one would let
+/// the reminder be re-claimed immediately, resurfacing something the student deliberately
+/// pushed away. `keep_days` is clamped to 1..=3650 so a stray 0 can't wipe today's ledger.
+pub fn prune_reminders(conn: &Connection, keep_days: i64) -> AppResult<i64> {
+    let keep = keep_days.clamp(1, 3650);
+    let n = conn.execute(
+        "DELETE FROM reminder_state
+          WHERE fired_at < datetime('now', ?1)
+            AND (snooze_to IS NULL OR snooze_to <= datetime('now'))",
+        [format!("-{keep} days")],
+    )?;
+    Ok(n as i64)
+}
+
 // ── Templates ────────────────────────────────────────────────────────────────
 
 /// Generate a day's blocks from a routine template. Skips blocks that already exist for that
@@ -1497,5 +1667,168 @@ mod tests {
         let conn = test_conn();
         assert!(get_block(&conn, 424242).is_err());
         assert!(set_block_status(&conn, 424242, "done", None).is_err());
+    }
+
+    // ── Reminder ledger ──────────────────────────────────────────────────────
+
+    /// The whole point of the ledger: a reminder is granted exactly ONCE, and the second
+    /// attempt is refused even though the in-memory dedupe of a restarted app would have
+    /// forgotten it.
+    #[test]
+    fn a_reminder_is_claimable_exactly_once() {
+        let conn = test_conn();
+        let key = "block-42-start";
+
+        assert!(claim_reminder(&conn, key, "2026-07-31 06:00").unwrap(), "first claim fires");
+        assert!(
+            !claim_reminder(&conn, key, "2026-07-31 06:01").unwrap(),
+            "a restart must NOT re-fire it"
+        );
+        // Much later, still refused: absence of a snooze means the reminder is spent.
+        assert!(!claim_reminder(&conn, key, "2026-08-05 09:00").unwrap());
+
+        let rows = list_reminders(&conn, "block-42-").unwrap();
+        assert_eq!(rows.len(), 1, "one ledger row, not one per attempt");
+        assert_eq!(rows[0].fired_at, "2026-07-31 06:00:00", "fired_at is the FIRST fire");
+        assert!(rows[0].ack_at.is_none() && rows[0].snooze_to.is_none());
+    }
+
+    /// Snooze is the one path back: refused while pending, re-granted once elapsed. Acking
+    /// afterwards closes it for good.
+    #[test]
+    fn snooze_regrants_a_claim_only_after_it_elapses() {
+        let conn = test_conn();
+        let key = "block-7-t10";
+        assert!(claim_reminder(&conn, key, "2026-07-31 08:00").unwrap());
+
+        snooze_reminder(&conn, key, "2026-07-31 08:30").unwrap();
+        assert!(
+            !claim_reminder(&conn, key, "2026-07-31 08:29").unwrap(),
+            "still snoozed — must stay quiet"
+        );
+        assert!(
+            claim_reminder(&conn, key, "2026-07-31 08:30").unwrap(),
+            "the snooze has elapsed → fire again"
+        );
+        // Claiming clears the snooze, so it does not re-grant a third time.
+        assert!(!claim_reminder(&conn, key, "2026-07-31 09:00").unwrap());
+        let row = &list_reminders(&conn, key).unwrap()[0];
+        assert!(row.snooze_to.is_none(), "the consumed snooze is cleared");
+
+        // An acknowledged reminder is never re-granted, even with a stale snooze on the row.
+        ack_reminder(&conn, key).unwrap();
+        snooze_reminder(&conn, key, "2026-07-31 09:05").unwrap();
+        assert!(
+            claim_reminder(&conn, key, "2026-07-31 09:10").unwrap(),
+            "snoozing explicitly re-opens a reminder the student pushed away"
+        );
+    }
+
+    /// Ack survives a pruned row: losing it would let a handled reminder fire again, which is
+    /// exactly the bug this table exists to prevent.
+    #[test]
+    fn ack_marks_the_row_and_blocks_further_claims() {
+        let conn = test_conn();
+        let key = "block-9-end";
+
+        // Ack with no prior row at all (it was pruned between firing and acking).
+        ack_reminder(&conn, key).unwrap();
+        let rows = list_reminders(&conn, key).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].ack_at.is_some());
+
+        assert!(
+            !claim_reminder(&conn, key, "2026-07-31 10:00").unwrap(),
+            "the student already acted on it"
+        );
+    }
+
+    /// Prefix listing must be a literal prefix match. A key fragment containing SQL wildcards
+    /// would otherwise pull in unrelated reminders.
+    #[test]
+    fn listing_matches_a_literal_prefix_not_a_like_pattern() {
+        let conn = test_conn();
+        for key in ["block-4-start", "block-4-end", "block-42-start", "exam-1-start"] {
+            claim_reminder(&conn, key, "2026-07-31 06:00").unwrap();
+        }
+
+        let mut keys: Vec<String> = list_reminders(&conn, "block-4-")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["block-4-end", "block-4-start"], "block-42 is NOT a block-4- reminder");
+
+        // `_` and `%` are literal characters here, not wildcards.
+        assert!(list_reminders(&conn, "block-4_").unwrap().is_empty());
+        assert!(list_reminders(&conn, "%").unwrap().is_empty());
+        assert_eq!(list_reminders(&conn, "").unwrap().len(), 4, "empty prefix = everything");
+    }
+
+    /// Pruning bounds the table but must never resurface a pending snooze.
+    #[test]
+    fn pruning_drops_old_rows_but_keeps_pending_snoozes() {
+        let conn = test_conn();
+        claim_reminder(&conn, "old-1", "2026-01-01 06:00").unwrap();
+        claim_reminder(&conn, "old-2", "2026-01-01 07:00").unwrap();
+        conn.execute(
+            "UPDATE reminder_state SET fired_at = datetime('now', '-90 days')",
+            [],
+        )
+        .unwrap();
+        // An ancient row the student deliberately pushed into the future.
+        conn.execute(
+            "INSERT INTO reminder_state(key, fired_at, snooze_to)
+             VALUES('old-3', datetime('now', '-90 days'), datetime('now', '+2 days'))",
+            [],
+        )
+        .unwrap();
+        claim_reminder(&conn, "fresh", "2026-07-31 06:00").unwrap();
+
+        let removed = prune_reminders(&conn, 30).unwrap();
+        assert_eq!(removed, 2, "only the two spent old rows go");
+
+        let mut keys: Vec<String> = list_reminders(&conn, "")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["fresh", "old-3"], "a pending snooze survives pruning");
+
+        // A stray 0 (or negative) retention must not wipe the ledger.
+        assert_eq!(prune_reminders(&conn, 0).unwrap(), 0);
+        assert_eq!(list_reminders(&conn, "").unwrap().len(), 2);
+    }
+
+    /// Timestamps are compared lexicographically, so mixed formats would compare wrongly.
+    /// Everything is normalized on the way in, and UTC is refused outright — the planner is
+    /// local wall-clock, and reading a `Z` instant as local would shift every reminder.
+    #[test]
+    fn datetimes_are_normalized_and_utc_is_refused() {
+        assert_eq!(norm_dt("2026-07-31T21:05").unwrap(), "2026-07-31 21:05:00");
+        assert_eq!(norm_dt(" 2026-07-31 21:05:09 ").unwrap(), "2026-07-31 21:05:09");
+        assert_eq!(norm_dt("2026-07-31").unwrap(), "2026-07-31 00:00:00", "date → start of day");
+        assert!(norm_dt("2026-07-31T21:05:00Z").is_err(), "UTC must be rejected, not stripped");
+        for bad in ["", "31-07-2026 21:05", "2026-07-31 24:00", "2026-07-31 21:60", "nonsense"] {
+            assert!(norm_dt(bad).is_err(), "{bad:?} must not parse");
+        }
+
+        // Cross-format ordering actually works after normalization.
+        let conn = test_conn();
+        claim_reminder(&conn, "k", "2026-07-31T08:00").unwrap();
+        snooze_reminder(&conn, "k", "2026-07-31 08:30:00").unwrap();
+        assert!(!claim_reminder(&conn, "k", "2026-07-31T08:15").unwrap());
+        assert!(claim_reminder(&conn, "k", "2026-07-31T08:45").unwrap());
+    }
+
+    #[test]
+    fn reminder_keys_and_times_are_validated() {
+        let conn = test_conn();
+        assert!(claim_reminder(&conn, "   ", "2026-07-31 06:00").is_err(), "blank key");
+        assert!(claim_reminder(&conn, "k", "whenever").is_err(), "unparseable time");
+        assert!(ack_reminder(&conn, "").is_err());
+        assert!(snooze_reminder(&conn, "k", "2026-13-99 99:99").is_err());
     }
 }

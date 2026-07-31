@@ -11,22 +11,43 @@
  * GSAP entrance on the shell (reduced-motion gated).
  */
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { gsap } from "gsap";
-import { LayoutDashboard, CalendarRange } from "lucide-react";
+import { LayoutDashboard, CalendarRange, CalendarClock } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import PlannerTab from "../components/planning/PlannerTab";
+import TodayTab from "../components/planning/TodayTab";
 import ViewTab from "../components/planning/ViewTab";
 import { usePlanningTasks } from "../components/planning/usePlanningTasks";
+import { useDayPlan } from "../components/planning/useDayPlan";
+import { ipc, isTauri } from "../lib/ipc";
+import { localDay } from "../lib/scheduleClock";
 import { motionAllowed } from "../lib/perfStore";
 import { cn } from "../lib/utils";
 
-type Tab = "planner" | "view";
+type Tab = "today" | "planner" | "view";
 
 export default function PlanningHub() {
   const planning = usePlanningTasks();
-  const [tab, setTab] = useState<Tab>("planner");
+  const schedule = useDayPlan();
+  // Today is the default: the schedule is the thing you act on, the to-do list is the thing you
+  // maintain. Opening on the list every time buries the blocks you're supposed to be doing.
+  const [tab, setTab] = useState<Tab>("today");
   const rootRef = useRef<HTMLDivElement>(null);
+
+  // Finish boot reconciliation with the TRUE local date. `lib.rs` already ran a conservative
+  // UTC-dated pass, which can only err toward leaving a day open — this closes it correctly.
+  useEffect(() => {
+    if (!isTauri()) return;
+    void ipc
+      .reconcilePlan(localDay())
+      .then((n) => {
+        if (n > 0) void schedule.reload();
+      })
+      .catch(() => {});
+    // Once per mount: reconciliation is a one-shot boot pass, not a loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useLayoutEffect(() => {
     if (!planning.loaded || planning.preview) return;
@@ -52,10 +73,11 @@ export default function PlanningHub() {
             </p>
           </div>
 
-          {/* Top-level tabs: Planner | View */}
+          {/* Top-level tabs: Today | Planner | View */}
           {!planning.preview && (
             <div className="flex items-center gap-1 rounded-full border border-white/[0.06] bg-white/[0.02] p-1">
               {([
+                { key: "today", label: "Today", icon: CalendarClock },
                 { key: "planner", label: "Planner", icon: LayoutDashboard },
                 { key: "view", label: "View", icon: CalendarRange },
               ] as const).map((t) => (
@@ -83,6 +105,8 @@ export default function PlanningHub() {
           <div className="grid min-h-40 place-items-center rounded-[24px] border border-white/[0.06] bg-white/[0.02] p-card text-center text-sm text-white/40 shadow-2xl backdrop-blur-xl">
             Preview mode — open inside the desktop app to plan tasks.
           </div>
+        ) : tab === "today" ? (
+          <TodayTab schedule={schedule} />
         ) : tab === "planner" ? (
           <PlannerTab planning={planning} />
         ) : (

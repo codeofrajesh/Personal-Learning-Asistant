@@ -137,6 +137,11 @@ pub fn run() {
             commands::plan::apply_plan_template,
             commands::plan::reconcile_plan,
             commands::plan::score_summary,
+            commands::plan::claim_reminder,
+            commands::plan::list_reminders,
+            commands::plan::ack_reminder,
+            commands::plan::snooze_reminder,
+            commands::plan::prune_reminders,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

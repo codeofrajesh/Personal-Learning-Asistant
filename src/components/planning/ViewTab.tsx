@@ -4,12 +4,13 @@
  * Both views read the shared task state and open the same edit modal.
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { GanttChartSquare, Table2 } from "lucide-react";
 import CalendarTimeline from "./CalendarTimeline";
 import TableView from "./TableView";
 import TaskModal from "./TaskModal";
+import { useScheduleClock } from "../../lib/scheduleClock";
 import { cn } from "../../lib/utils";
 import type { Task } from "../../lib/types";
 import type { PlanningTasks } from "./usePlanningTasks";
@@ -24,14 +25,10 @@ export default function ViewTab({ planning }: Props) {
   const navigate = useNavigate();
   const { tasks, toggleDone, removeTask, addTask, applyEdit } = planning;
   const [sub, setSub] = useState<SubView>("timeline");
-  const [nowTick, setNowTick] = useState(() => Date.now());
+  // The shared minute clock, replacing a second local 30s interval — one clock for the app.
+  const nowTick = useScheduleClock((s) => s.nowMs);
   const [modalOpen, setModalOpen] = useState(false);
   const [editTask, setEditTask] = useState<Task | null>(null);
-
-  useEffect(() => {
-    const id = window.setInterval(() => setNowTick(Date.now()), 30_000); // 30s is plenty here
-    return () => window.clearInterval(id);
-  }, []);
 
   const openMaterial = (id: number) => navigate(`/library/material/${id}`, { state: { source: "courses" } });
   const openTask = (t: Task) => { setEditTask(t); setModalOpen(true); };

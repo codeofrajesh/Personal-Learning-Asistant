@@ -458,3 +458,174 @@ export interface NodeCrumb {
   name: string;
   depth: number;
 }
+
+// ── Planning / Scheduling / Intelligence (v9 — commands::plan) ──────────────
+//
+// All times here are LOCAL wall-clock, never UTC: `day` is 'YYYY-MM-DD' and times
+// are 'HH:MM'. "6:00 AM study" must mean 6 AM wherever the student is, and a UTC
+// round-trip would shift it an hour across DST. The backend deliberately never
+// guesses the local day — every command below takes `day` / `nowMins` from here.
+
+/** Lifecycle of a block (backend `plan_blocks.status`). Only `pending`/`active`
+ *  are open work the adjustment engine will touch; the rest are history. */
+export type BlockStatus = "pending" | "active" | "done" | "partial" | "skipped" | "spilled";
+
+/** What a block targets. `freeform` has no digital footprint, so it — and only it —
+ *  needs manual confirmation (backend `TARGET_KINDS`). */
+export type BlockTargetKind = "material" | "node_count" | "node_minutes" | "task" | "freeform";
+
+/** One planner block (backend `db::plan::PlanBlock`). */
+export interface PlanBlock {
+  id: number;
+  day: string;
+  planned_start: string;
+  planned_mins: number;
+  actual_start: string | null;
+  actual_mins: number | null;
+  /** The position actually in force (`actual_*` when adjusted, else `planned_*`).
+   *  Provided by the backend so the UI never re-implements the fallback rule. */
+  effective_start: string;
+  effective_mins: number;
+  title: string;
+  target_kind: BlockTargetKind;
+  target_node_id: number | null;
+  target_material_id: number | null;
+  target_task_id: number | null;
+  target_count: number | null;
+  /** Resolved display name of the target, when it still exists. */
+  target_name: string | null;
+  weight: number;
+  is_anchored: boolean;
+  min_viable_mins: number | null;
+  status: BlockStatus;
+  executed_mins: number;
+  progress_count: number;
+  completed_at: string | null;
+  spilled_from_id: number | null;
+  /** How many times this work has already been pushed to a later day. */
+  spill_count: number;
+  notes: string | null;
+  /** True when completion can't be detected automatically and the student must confirm. */
+  needs_manual_confirm: boolean;
+}
+
+/** The pre-mortem verdict on a day's plan (backend `solver::IntegrityVerdict`).
+ *  Advisory ONLY — an ambitious plan is never blocked from saving. */
+export interface IntegrityVerdict {
+  /** 0-100. 100 = comfortably achievable. */
+  integrity: number;
+  /** Honest minutes the plan demands (pace-adjusted). */
+  demand_mins: number;
+  capacity_mins: number;
+  /** Minutes to trim to make the plan achievable (0 when it already is). */
+  overcommit_mins: number;
+  message: string | null;
+}
+
+/** Everything the Today surface needs in one round-trip (backend `db::plan::DayPlan`). */
+export interface DayPlan {
+  day: string;
+  wake_at: string;
+  hard_stop_at: string;
+  planned_mins: number;
+  executed_mins: number;
+  blocks: PlanBlock[];
+  integrity: IntegrityVerdict;
+}
+
+/** Create/update payload for a block (backend `BlockInputDto`). `id` omitted = create. */
+export interface BlockInput {
+  id?: number | null;
+  day: string;
+  planned_start: string;
+  planned_mins: number;
+  title: string;
+  target_kind?: BlockTargetKind;
+  target_node_id?: number | null;
+  target_material_id?: number | null;
+  target_task_id?: number | null;
+  target_count?: number | null;
+  weight?: number;
+  is_anchored?: boolean;
+  min_viable_mins?: number | null;
+  notes?: string | null;
+}
+
+/** What a recovery plan does to one block (backend `solver::MoveAction`).
+ *  `drop` never deletes — the backend spills the block to the next day. */
+export type MoveAction = "keep" | "shift" | "compress" | "drop";
+
+/** Which strategy produced a plan (backend `solver::PlanKind`). */
+export type PlanKind = "cascade" | "triage" | "compress";
+
+/** One block's fate under a plan. `from_*`/`to_*` are both present so the UI can
+ *  render a literal diff ("Physics 6:00 → 7:00") without recomputing anything. */
+export interface BlockMove {
+  block_id: number;
+  title: string;
+  action: MoveAction;
+  from_start: string;
+  to_start: string;
+  from_mins: number;
+  to_mins: number;
+}
+
+/** One previewable recovery option (backend `solver::RecoveryPlan`). */
+export interface RecoveryPlan {
+  /** Stable id (`cascade`/`triage`/`compress`) — passed back to `applyRecovery` so the
+   *  backend re-derives the plan itself rather than trusting a client-sent diff. */
+  id: string;
+  kind: PlanKind;
+  label: string;
+  /** One-line consequence in CONTENT terms ("Chemistry won't fit"), never "3 changes". */
+  summary: string;
+  /** Fraction of today's weighted value retained → "reaches 91% of today". */
+  coverage: number;
+  integrity: number;
+  continuity: number;
+  score: number;
+  /** True on the single best-scoring plan. A default, never an imposition. */
+  recommended: boolean;
+  moves: BlockMove[];
+  dropped_titles: string[];
+  kept_count: number;
+  dropped_count: number;
+  scheduled_mins: number;
+}
+
+/** The full adjustment verdict for a day (backend `solver::RecoveryReport`). */
+export interface RecoveryReport {
+  day: string;
+  /** How far behind the student is, in minutes (0 when on track). */
+  drift_mins: number;
+  usable_mins: number;
+  required_mins: number;
+  /** True when everything still fits — present gently (one shift), not as a crisis. */
+  fits: boolean;
+  /** True when there is genuinely nothing to adjust. */
+  nothing_to_do: boolean;
+  plans: RecoveryPlan[];
+}
+
+/** One derived score window — Today / Week / Month / Rolling 90 (backend `ScoreWindow`).
+ *  There is deliberately no lifetime "Overall": after a bad month it is mathematically
+ *  unrecoverable, which turns feedback into a permanent indictment. */
+export interface ScoreWindow {
+  label: string;
+  days: number;
+  /** `null` when the window holds no signal at all (an unplanned day stays neutral). */
+  score: number | null;
+  counted_days: number;
+  study_minutes: number;
+  blocks_planned: number;
+  blocks_completed: number;
+}
+
+/** Durable reminder ledger row (backend `reminder_state`). Persisted rather than kept
+ *  in memory so "fire at most once" survives an app restart. */
+export interface ReminderState {
+  key: string;
+  fired_at: string;
+  ack_at: string | null;
+  snooze_to: string | null;
+}

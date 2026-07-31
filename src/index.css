@@ -132,6 +132,38 @@
     contain-intrinsic-size: auto 88px;
   }
 
+  /* ── Schedule now-line (Today view) ─────────────────────────────────────────
+     The line that marks "now" on the day axis moves in CSS, NOT JavaScript.
+
+     A JS-driven line means a state write + React reconcile on every frame (or a 1 Hz
+     jump that visibly stutters) while the compositor is already busy decoding video —
+     the exact 4GB-target failure mode this app keeps fighting. Instead:
+
+       · one linear animation spanning a full day (86400s),
+       · started with a NEGATIVE delay equal to the seconds already elapsed today,
+
+     so the browser interpolates the position on the compositor and the line is in the
+     right place on the very first frame. `--now-delay` is the only value JS supplies,
+     once per mount. Self-correcting on remount; no timers, no per-frame work.
+
+     Reduced-motion/lite users get a static line at the correct offset (`--now-offset`),
+     because the global kill-switches zero animation duration — hence both variables. */
+  .now-line {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: var(--now-offset, 0%);
+    height: 0;
+    will-change: top;
+    animation: now-sweep 86400s linear infinite;
+    animation-delay: var(--now-delay, 0s);
+  }
+
+  @keyframes now-sweep {
+    from { top: 0%; }
+    to { top: 100%; }
+  }
+
   /* Thin, styled scrollbars that match the dark theme. */
   .scroll-thin {
     scrollbar-width: thin;

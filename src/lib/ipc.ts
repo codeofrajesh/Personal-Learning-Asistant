@@ -9,10 +9,13 @@
 
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type {
+  BlockInput,
+  BlockStatus,
   ChapterView,
   ConsistencySummary,
   CourseView,
   DashboardData,
+  DayPlan,
   FolderPreview,
   GoalSummary,
   GoalView,
@@ -23,11 +26,15 @@ import type {
   NodeCard,
   NodeCrumb,
   Note,
+  PlanBlock,
   PlayerView,
   Recommendation,
+  RecoveryReport,
   RegisteredDir,
+  ReminderState,
   RescanCounts,
   ScanProgress,
+  ScoreWindow,
   SearchResult,
   SubjectView,
   Task,
@@ -261,6 +268,133 @@ export const ipc = {
   /** Consistency summary (score, streak, per-day series) for the Planning Hub. */
   consistencySummary(windowDays?: number): Promise<ConsistencySummary> {
     return call<ConsistencySummary>("consistency_summary", { windowDays });
+  },
+
+  // ── Planning / Scheduling / Intelligence (v9 — commands::plan) ──────────────
+  //
+  // `day` is always a LOCAL 'YYYY-MM-DD' and `nowMins` local minutes-since-midnight.
+  // The backend refuses to guess either: SQLite's `date('now')` is UTC, which would
+  // mis-file late-evening study for anyone not sitting on the prime meridian.
+
+  /** The whole Today payload: window, blocks, and the advisory pre-mortem verdict. */
+  planDay(day: string): Promise<DayPlan> {
+    return call<DayPlan>("plan_day", { day });
+  },
+
+  /** Create (no `id`) or update (with `id`) a time block. Returns its id. */
+  upsertPlanBlock(block: BlockInput): Promise<number> {
+    return call<number>("upsert_plan_block", { block });
+  },
+
+  /** Delete a block outright — distinct from skipping it, which keeps the record. */
+  deletePlanBlock(id: number): Promise<void> {
+    return call<void>("delete_plan_block", { id });
+  },
+
+  /**
+   * Set a block's status, re-snapshotting the day so the score updates immediately.
+   * Pass `day` to snapshot the block's OWN day: confirming yesterday's block during an
+   * end-of-day review must move yesterday's score, not today's.
+   */
+  setPlanBlockStatus(
+    id: number,
+    status: BlockStatus,
+    executedMins: number | null = null,
+    day: string | null = null,
+  ): Promise<void> {
+    return call<void>("set_plan_block_status", { id, status, executedMins, day });
+  },
+
+  /** Mark a block as started (at most one is active at a time). */
+  startPlanBlock(id: number): Promise<void> {
+    return call<void>("start_plan_block", { id });
+  },
+
+  /** The block currently in progress, if any. */
+  activePlanBlock(): Promise<PlanBlock | null> {
+    return call<PlanBlock | null>("active_plan_block");
+  },
+
+  /** Set (or clear, with nulls) a day's wake / hard-stop overrides. */
+  setPlanDayWindow(
+    day: string,
+    wakeAt: string | null,
+    hardStopAt: string | null,
+  ): Promise<void> {
+    return call<void>("set_plan_day_window", { day, wakeAt, hardStopAt });
+  },
+
+  /** Compute recovery options. READ-ONLY — safe to call as often as the UI likes. */
+  recoveryPlans(day: string, nowMins: number): Promise<RecoveryReport> {
+    return call<RecoveryReport>("recovery_plans", { day, nowMins });
+  },
+
+  /** Apply one recovery plan in a single transaction. Returns an undo token.
+   *  `nextDay` is where dropped blocks spill to (local calendar arithmetic lives here). */
+  applyRecovery(
+    day: string,
+    planId: string,
+    nowMins: number,
+    nextDay: string,
+  ): Promise<string> {
+    return call<string>("apply_recovery", { day, planId, nowMins, nextDay });
+  },
+
+  /** Revert the most recently applied recovery. */
+  undoRecovery(token: string): Promise<void> {
+    return call<void>("undo_recovery", { token });
+  },
+
+  /** Record that the student dismissed the recovery card — enforces one prompt per drift. */
+  dismissRecovery(day: string): Promise<void> {
+    return call<void>("dismiss_recovery", { day });
+  },
+
+  /** Generate a day's blocks from a routine template. Returns how many were created. */
+  applyPlanTemplate(templateId: number, day: string): Promise<number> {
+    return call<number>("apply_plan_template", { templateId, day });
+  },
+
+  /** Close out past days from the caller's true LOCAL date. Returns days reconciled. */
+  reconcilePlan(today: string): Promise<number> {
+    return call<number>("reconcile_plan", { today });
+  },
+
+  /** Score drill-down: Today / Week / Month / Rolling 90 (no lifetime figure by design). */
+  scoreSummary(): Promise<ScoreWindow[]> {
+    return call<ScoreWindow[]>("score_summary");
+  },
+
+  // ── Durable reminder ledger (v9 `reminder_state`) ───────────────────────────
+
+  /**
+   * Atomically CLAIM a reminder: resolves `true` only if this call is the one that gets
+   * to fire it. This is what makes "at most once" true across restarts — toastStore's
+   * cooldown map is in-memory, so it forgets everything the moment the app closes.
+   * A claim whose snooze has expired is re-granted.
+   */
+  claimReminder(key: string, nowIso: string): Promise<boolean> {
+    return call<boolean>("claim_reminder", { key, nowIso });
+  },
+
+  /** Reminder ledger rows whose key starts with `prefix` (e.g. `block-42-`). */
+  listReminders(prefix: string): Promise<ReminderState[]> {
+    return call<ReminderState[]>("list_reminders", { prefix });
+  },
+
+  /** Mark a reminder acknowledged (the student acted on it). */
+  ackReminder(key: string): Promise<void> {
+    return call<void>("ack_reminder", { key });
+  },
+
+  /** Snooze a reminder until `snoozeTo` (absolute local datetime); it may fire again after. */
+  snoozeReminder(key: string, snoozeTo: string): Promise<void> {
+    return call<void>("snooze_reminder", { key, snoozeTo });
+  },
+
+  /** Drop ledger rows older than `keepDays` so the table can't grow without bound. */
+  pruneReminders(keepDays: number): Promise<number> {
+    return call<number>("prune_reminders", { keepDays });
   },
 
   // ── Settings (Section 8 Page 7) ─────────────────────────────────────────────

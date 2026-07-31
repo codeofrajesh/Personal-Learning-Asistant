@@ -1,87 +1,113 @@
 /**
- * Task reminders — raises deduped toasts for tasks approaching or past their deadline.
+ * Task reminders — deadline alerts for to-do items.
  *
- * Low-CPU by design: ONE poll every 60s (not per-second), and each poll is a single
- * cheap `listTasks` read. There is no per-task timer. Dedupe is handled by the toast
- * store's `key` + `cooldownMs`, so a task that's "due in 1h" only alerts once per
- * window, never on every poll.
+ * ## What changed and why
  *
- * Reminder tiers (each fires at most once per task per app session, plus a long
- * cooldown as a backstop):
- *   - due within 60 min  → "due soon" (orange)
- *   - just crossed due    → "overdue" (warning)
- * Completed tasks never alert. Runs only while mounted (AppShell) — unmount clears it.
+ * This used to own a 60s `setInterval` that refetched `listTasks()` — 1,440 IPC calls a day
+ * whether anything was due or not, and a reminder could still land up to 60s late. It also
+ * deduped purely through `toastStore`'s in-memory cooldown map, so **every reminder re-fired
+ * after an app restart**: reopening at 21:00 replayed the whole day's alerts.
+ *
+ * Both problems are now handled by shared machinery:
+ *   * Time comes from `useScheduleClock` — ONE app-wide minute tick, so this hook costs a
+ *     `useMemo` per minute instead of its own timer and its own fetch.
+ *   * Dedupe goes through the durable `reminder_state` ledger (`ipc.claimReminder`), a single
+ *     atomic upsert that survives restart. The in-memory cooldown is now just a fast path.
+ *   * Tasks come from the caller's already-loaded list, so there is no second fetch and no
+ *     second source of truth.
+ *
+ * Tiers (each claimed once, ever, per task):
+ *   * due within 60 min → "due soon"
+ *   * deadline crossed  → "overdue" (claimed only while still fresh, so an app opened days
+ *     later doesn't shout about deadlines the student already knows about)
  */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { ipc, isTauri } from "../lib/ipc";
 import { toast } from "../lib/toastStore";
+import { localDateTime, useScheduleClock } from "../lib/scheduleClock";
+import { dueMs } from "./planning/planningUtils";
 import type { Task } from "../lib/types";
 
-const POLL_MS = 60_000; // once a minute — cheap, no per-second work
-const SOON_MS = 60 * 60_000; // 60 minutes
-
-/** Parse a task's due_at into epoch ms (tolerates date / 'T' / ' ' forms). */
-function dueMs(task: Task): number | null {
-  if (!task.due_at) return null;
-  const t = new Date(task.due_at.replace(" ", "T")).getTime();
-  return isNaN(t) ? null : t;
-}
+const SOON_MS = 60 * 60_000;
+/** How long after a deadline an overdue alert is still worth raising. */
+const OVERDUE_FRESH_MS = 6 * 60 * 60_000;
 
 function humanLeft(ms: number): string {
   const m = Math.round(ms / 60000);
-  if (m < 60) return `${m} min`;
-  return `${Math.round(m / 60)} h`;
+  return m < 60 ? `${m} min` : `${Math.round(m / 60)} h`;
 }
 
-export function useTaskReminders() {
+/**
+ * Raise reminders for `tasks`. Pass the list you already have (AppShell fetches it once);
+ * omitting it makes the hook fetch once on mount rather than on a schedule.
+ */
+export function useTaskReminders(tasks?: Task[]) {
+  const nowMs = useScheduleClock((s) => s.nowMs);
+  const [ownTasks, setOwnTasks] = useState<Task[]>([]);
+
+  // Only when the caller has no list of its own: one fetch, not a poll.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (tasks || !isTauri()) return;
     let alive = true;
-
-    const check = async () => {
-      let tasks: Task[];
-      try {
-        tasks = await ipc.listTasks();
-      } catch {
-        return;
-      }
-      if (!alive) return;
-      const now = Date.now();
-      for (const task of tasks) {
-        if (task.done) continue;
-        const due = dueMs(task);
-        if (due == null) continue;
-        const left = due - now;
-        if (left < 0 && left > -POLL_MS * 1.5) {
-          // Just crossed the deadline (within ~the last poll window) → one overdue alert.
-          toast({
-            tone: "warning",
-            title: "Task overdue",
-            body: `"${task.title}" is now past its deadline.`,
-            key: `task-overdue-${task.id}`,
-            cooldownMs: 12 * 3600_000, // at most once per 12h per task
-          });
-        } else if (left > 0 && left <= SOON_MS) {
-          // Approaching deadline → one "due soon" alert per task.
-          toast({
-            tone: "warning",
-            title: "Task due soon",
-            body: `"${task.title}" is due in ${humanLeft(left)}.`,
-            key: `task-soon-${task.id}`,
-            cooldownMs: 6 * 3600_000, // at most once per 6h per task
-          });
-        }
-      }
-    };
-
-    // First check shortly after mount (let the app settle), then every minute.
-    const first = window.setTimeout(() => void check(), 4000);
-    const interval = window.setInterval(() => void check(), POLL_MS);
+    void ipc
+      .listTasks()
+      .then((t) => {
+        if (alive) setOwnTasks(t);
+      })
+      .catch(() => {});
     return () => {
       alive = false;
-      window.clearTimeout(first);
-      window.clearInterval(interval);
     };
-  }, []);
+  }, [tasks]);
+
+  const list = tasks ?? ownTasks;
+
+  useEffect(() => {
+    if (!isTauri() || list.length === 0) return;
+    let alive = true;
+
+    const run = async () => {
+      for (const task of list) {
+        if (!alive) return;
+        if (task.done) continue;
+        const due = dueMs(task.due_at);
+        if (due == null) continue;
+        const left = due - nowMs;
+
+        let key: string | null = null;
+        let payload: { title: string; body: string } | null = null;
+        if (left < 0 && left > -OVERDUE_FRESH_MS) {
+          key = `task-overdue-${task.id}`;
+          payload = {
+            title: "Task overdue",
+            body: `"${task.title}" is now past its deadline.`,
+          };
+        } else if (left > 0 && left <= SOON_MS) {
+          key = `task-soon-${task.id}`;
+          payload = {
+            title: "Task due soon",
+            body: `"${task.title}" is due in ${humanLeft(left)}.`,
+          };
+        }
+        if (!key || !payload) continue;
+
+        try {
+          // The ledger decides. `false` = already fired (possibly in a previous run of the
+          // app), acknowledged, or snoozed.
+          if (!(await ipc.claimReminder(key, localDateTime(new Date())))) continue;
+        } catch {
+          continue;
+        }
+        if (!alive) return;
+        toast({ tone: "warning", title: payload.title, body: payload.body, key });
+      }
+    };
+
+    void run();
+    return () => {
+      alive = false;
+    };
+  }, [list, nowMs]);
 }
+

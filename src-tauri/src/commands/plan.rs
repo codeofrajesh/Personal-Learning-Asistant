@@ -19,7 +19,7 @@
 
 use tauri::State;
 
-use crate::db::plan::{self, BlockInputDto, DayPlan, PlanBlock};
+use crate::db::plan::{self, BlockInputDto, DayPlan, PlanBlock, ReminderState};
 use crate::db::queries::{self, ScoreWindow};
 use crate::db::Db;
 use crate::planner::solver::RecoveryReport;
@@ -214,4 +214,46 @@ pub fn reconcile_plan(db: State<'_, Db>, today: String) -> AppResult<i64> {
 #[tauri::command]
 pub fn score_summary(db: State<'_, Db>) -> AppResult<Vec<ScoreWindow>> {
     db.with(|conn| queries::score_summary(conn))
+}
+
+// ── Durable reminder ledger ──────────────────────────────────────────────────
+//
+// The reminder engine's dedupe used to live only in `toastStore`'s in-memory cooldown map, so
+// every reminder re-fired after a restart. These five commands move that state into SQLite.
+// `now_iso` / `snooze_to` are LOCAL wall-clock strings from the frontend for the same reason
+// every other planner command takes `day`: SQLite's `datetime('now')` is UTC and would arm
+// reminders at the wrong hour.
+
+/// Atomically claim a reminder. `true` only for the caller that gets to fire it.
+///
+/// The claim is one upsert rather than a read-then-write, so two clock ticks racing the same key
+/// cannot both fire it. A claim is re-granted only once an active snooze has elapsed.
+#[tauri::command]
+pub fn claim_reminder(db: State<'_, Db>, key: String, now_iso: String) -> AppResult<bool> {
+    db.with(|conn| plan::claim_reminder(conn, &key, &now_iso))
+}
+
+/// Ledger rows whose key starts with `prefix` (e.g. `block-42-`), newest first.
+#[tauri::command]
+pub fn list_reminders(db: State<'_, Db>, prefix: String) -> AppResult<Vec<ReminderState>> {
+    db.with(|conn| plan::list_reminders(conn, &prefix))
+}
+
+/// Mark a reminder acknowledged — the student acted on it, so it must never fire again.
+#[tauri::command]
+pub fn ack_reminder(db: State<'_, Db>, key: String) -> AppResult<()> {
+    db.with(|conn| plan::ack_reminder(conn, &key))
+}
+
+/// Snooze a reminder until `snooze_to` (local wall clock). It becomes claimable again after.
+#[tauri::command]
+pub fn snooze_reminder(db: State<'_, Db>, key: String, snooze_to: String) -> AppResult<()> {
+    db.with(|conn| plan::snooze_reminder(conn, &key, &snooze_to))
+}
+
+/// Drop ledger rows older than `keep_days`, returning how many were removed. Rows with a snooze
+/// still pending survive regardless of age — pruning one would resurface it immediately.
+#[tauri::command]
+pub fn prune_reminders(db: State<'_, Db>, keep_days: i64) -> AppResult<i64> {
+    db.with(|conn| plan::prune_reminders(conn, keep_days))
 }

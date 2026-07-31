@@ -9,7 +9,7 @@
  * deadline labels (no global loop).
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ListChecks, CalendarClock, Play, ChevronRight } from "lucide-react";
 import QuickAddBar from "./QuickAddBar";
@@ -18,6 +18,7 @@ import TaskModal from "./TaskModal";
 import ConsistencyHeatmap, { HeatmapLegend } from "./ConsistencyHeatmap";
 import ConsistencyScore from "./ConsistencyScore";
 import { dueMs } from "./planningUtils";
+import { useScheduleClock } from "../../lib/scheduleClock";
 import { cn } from "../../lib/utils";
 import type { Task } from "../../lib/types";
 import type { PlanningTasks } from "./usePlanningTasks";
@@ -55,14 +56,12 @@ export default function PlannerTab({ planning }: Props) {
   const navigate = useNavigate();
   const { tasks, consistency, nextUp, loaded, addTask, toggleDone, removeTask, applyEdit } = planning;
 
-  const [nowTick, setNowTick] = useState(() => Date.now());
+  // One shared clock, minute resolution. This used to be a component-local 1 Hz interval that
+  // re-rendered this whole subtree (every row, the heatmap, Next Up) once a second — for labels
+  // that are only ever rendered in minutes, so 59 of every 60 renders could not change a pixel.
+  const nowTick = useScheduleClock((s) => s.nowMs);
   const [modalOpen, setModalOpen] = useState(false);
   const [editTask, setEditTask] = useState<Task | null>(null);
-
-  useEffect(() => {
-    const id = window.setInterval(() => setNowTick(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
 
   const openMaterial = (id: number) => navigate(`/library/material/${id}`, { state: { source: "courses" } });
 

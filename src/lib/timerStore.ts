@@ -416,8 +416,10 @@ export function fmtClock(secs: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-/** A short, self-contained completion chime via the Web Audio API (no asset). */
-function playChime() {
+/** A short, self-contained completion chime via the Web Audio API (no asset).
+ *  Exported so the schedule reminder ladder can reuse the exact same sound for block
+ *  starts — a second, different chime would just teach the student to ignore both. */
+export function playChime() {
   if (typeof window === "undefined") return;
   try {
     const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;

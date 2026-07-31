@@ -7,7 +7,7 @@ Rust** (backend, SQLite, native mpv playback) and **React + Vite + TypeScript + 
 live in one local SQLite database; focus-timer runtime/configuration is kept in WebView
 `localStorage`.
 
-Last updated: 2026-07-29.
+Last updated: 2026-07-31.
 
 ---
 
@@ -767,9 +767,9 @@ sections with correct membership; (b) **pin/unpin** a course from a hub card and
 ## 14. Planning, Scheduling & Intelligence System (schema v9)
 
 Time-blocked scheduling with an Intelligent Adjustment engine, an advisory pre-mortem, learned
-pace, and schedule-adherence scoring. **Phases A + B (backend) are DONE**: `cargo test --lib`
-**74/74** green (was 14), zero warnings; `npm run build` + `tsc --noEmit` clean. Phases C–F
-(frontend) are not started.
+pace, and schedule-adherence scoring. **Phases A + B (backend) and C (Today view, one clock,
+durable reminders) are DONE**: `cargo test --lib` **81/81** green (was 14), zero new warnings;
+`npm run build` + `tsc --noEmit` clean. Phases D–F are not started.
 
 ### 14.0 Architectural decisions (pushbacks accepted by the user)
 These were argued *against* the original brief and approved — they are load-bearing, not
@@ -868,21 +868,87 @@ tree doesn't have. `NextUpItem` now carries `node_id`/`node_name` (immediate fol
 - **Frontend (DTO absorption only):** `lib/types.ts`, `components/dashboard/NextUp.tsx`,
   `components/planning/PlannerTab.tsx`.
 
-### 14.6 Command surface (registered, untested live)
+### 14.6 Command surface (19 registered, untested live)
 `plan_day`, `upsert_plan_block`, `delete_plan_block`, `set_plan_block_status`,
 `start_plan_block`, `active_plan_block`, `set_plan_day_window`, `recovery_plans` (**read-only**),
 `apply_recovery` (→ undo token), `undo_recovery`, `dismiss_recovery`, `apply_plan_template`,
-`reconcile_plan`, `score_summary`.
+`reconcile_plan`, `score_summary`, plus the Phase C reminder ledger: `claim_reminder`
+(atomic, returns whether YOU get to fire), `list_reminders`, `ack_reminder`, `snooze_reminder`,
+`prune_reminders`.
 
-### 14.7 Next — Phase C onward (frontend, not started)
-- **C:** Today view (blocks, **CSS-animated now-line** — `animation: sweep 86400s linear` with a
-  negative delay, zero JS per frame so it can't jitter during playback), one `scheduleClock`
-  store replacing both the 60s reminder poll and `PlannerTab`'s 1 Hz whole-subtree re-render,
-  reminder escalation ladder, durable dedupe via `reminder_state`, reuse `playChime()` for block
-  starts (approved). **Must fix:** `ToastHost` (bottom-right) currently collides with
-  `MiniPlayer` (also bottom-right, with a clip-path hole punched through AppShell for the mpv
-  surface) — offset toasts upward when `useMiniPlayer(s => s.rect)` is non-null, or reminders
-  will cover the video.
+### 14.7 Phase C — DONE (Today view, one clock, durable reminders)
+`cargo test --lib` **81/81** green (was 74); `tsc --noEmit` + `npm run build` clean.
+
+**Backend — the 5 `reminder_state` commands** (`db/plan.rs` + `commands/plan.rs` + `lib.rs`):
+`claim_reminder`, `list_reminders`, `ack_reminder`, `snooze_reminder`, `prune_reminders`
+(7 new tests). Design points that are load-bearing:
+- **`claim_reminder` is ONE atomic upsert, not read-then-write** — `INSERT … ON CONFLICT DO
+  UPDATE … WHERE ack_at IS NULL AND snooze_to <= excluded.fired_at`, returning `n == 1`. Two
+  clocks racing the same key cannot both fire. `fired_at` keeps the FIRST fire time.
+- **`norm_dt()` normalizes every datetime to `'YYYY-MM-DD HH:MM:SS'`** because the ledger
+  compares timestamps **lexicographically** — `'…T21:05'` vs `'… 21:05:00'` are the same instant
+  but sort differently, so a snooze in one shape would compare wrongly against a claim in the
+  other. A trailing `Z` is **rejected, not stripped**: reading a UTC instant as local would shift
+  every reminder by the caller's offset.
+- **`list_reminders` matches with `substr(key,1,length(?1)) = ?1`, not `LIKE`** — a prefix
+  containing `%`/`_` would otherwise act as a wildcard and return unrelated reminders. Also
+  `block-4-` must NOT match `block-42-start` (tested).
+- **`ack_reminder` upserts** so an ack can't fail on a pruned row (losing the ack would let a
+  handled reminder fire again — the exact bug this table exists to fix).
+- **`prune_reminders` keeps rows whose snooze is still in the future** regardless of age;
+  deleting one would let it be re-claimed immediately, resurfacing what the student pushed away.
+  `keep_days` clamped 1..=3650 so a stray `0` can't wipe today's ledger.
+
+**Frontend — one clock** (`src/lib/scheduleClock.ts`): replaces BOTH old clocks. `PlannerTab`'s
+1 Hz `setNowTick` re-rendered its whole subtree (every row + heatmap + Next Up) once a second
+for labels rendered in *minutes* — 59 of 60 renders could not change a pixel. Now a Zustand
+store ticking on the **minute boundary** with selectors, so subscribers re-render alone. Each
+tick re-arms a fresh `setTimeout` from the wall clock (self-correcting; `setInterval` would
+drift under WebView2 throttling and skip hours across a laptop sleep), plus
+`visibilitychange`/`focus` resync. `ViewTab`'s separate 30s interval is gone too. Helpers:
+`localDay`, `localMinutes`, `dayOffset` (noon-anchored so DST can't repeat a date), `hhmmToMins`,
+`minsToHhmm`, `localDateTime`, `dayMinsToMs`, `relativeMins`.
+
+**Frontend — reminder ladder** (`src/lib/scheduleReminders.ts`): event-driven, ~30 wakeups/day
+vs 1,440 polls, and it fires *on time* instead of up to a poll late. Rungs per block: `t10`
+(heads-up), `start` (one-tap Start + the shared `playChime()`, now exported from `timerStore`),
+`over` (~5 min past the end while still `active`). Each rung is gated on
+`ipc.claimReminder(key, at)` with `key = block-<id>-<rung>`; a rung more than `STALE_MINS` in
+the past is **skipped, not replayed** ("starts in 10 minutes" delivered 40 minutes late is
+noise). Sleeps until the next future rung, bounded to 15 min.
+- **Armed in `AppShell` (`useBlockReminders`), NOT in the Today tab** — a reminder that only
+  fires while you're already looking at your schedule isn't a reminder; the student needs it most
+  while on the player route. Since the *editing* happens on an unmounted page, `usePlanRevision`
+  (a counter bumped by `useDayPlan`) tells the global ladder to refetch. A counter, not a poll.
+- `useTaskReminders` rewritten on the same basis: no interval, no fetch of its own (takes the
+  caller's list), claims through the ledger. This kills the "every reminder re-fires after
+  restart" bug — reopening at 21:00 used to replay the whole day.
+
+**Frontend — Today view** (`TodayTab.tsx`, `useDayPlan.ts`, `BlockModal.tsx`):
+- **Now-line is CSS** (`.now-line` in `index.css`): `animation: now-sweep 86400s linear` with a
+  **negative delay** (`--now-delay`) so it's correct on the first painted frame and the
+  compositor carries it — zero JS per frame, no jitter during playback. `--now-offset` is a
+  static fallback because the lite-tier/reduced-motion sweeps zero out animation duration.
+- Day axis reuses `CalendarTimeline`'s 64px/hour grid + greedy lane partitioning; out-of-window
+  time (before wake / after hard stop) is shaded so an impossible late block reads as outside
+  the day. GSAP block stagger gated on `motionAllowed()`.
+- `useDayPlan` owns the day pointer and **follows the clock across midnight only while parked on
+  today** (`pinnedRef`) — otherwise midnight would yank a student off the Friday they were
+  planning. Mutations always refetch rather than patching locally, because the backend recomputes
+  the pre-mortem and the pace-adjusted durations.
+- `BlockModal` is deliberately separate from `TaskModal`: its distinctive fields (`weight`,
+  `is_anchored`, `min_viable_mins`) are solver inputs, and a merged form would be half-irrelevant
+  in either mode. Editing changes `planned_start`, not `effective_start`, so editing an adjusted
+  block changes the *intention* instead of baking the adjustment in.
+- `blockVisualState()` in `planningUtils.ts` derives `now`/`late`/`overrun` from the clock (a
+  `pending` block reads differently at 05:00, 06:05 and 09:00) — gated on `isToday`.
+- Phase C also finished boot reconciliation with the **true local date** (`ipc.reconcilePlan`)
+  once per hub mount; `lib.rs`'s UTC pass can only err toward leaving a day open.
+- **`ToastHost` × `MiniPlayer` collision FIXED:** the stack now lifts by `rect.h + 32` whenever
+  `useMiniPlayer(s => s.rect)` is non-null. A toast over that clip-path hole is unreadable (mpv
+  is behind it, not the app background) and covers the video.
+
+### 14.8 Next — Phase D onward
 - **D:** Recovery Card (inline, never a modal; suppressed during fullscreen video; one prompt
   per drift event via `plan_days.adjust_state`; 10s Undo).
 - **E:** Score drill-downs (Today/Week/Month/Rolling-90) + weekly review.
