@@ -545,6 +545,22 @@ export interface DayPlan {
   adjust_state: string | null;
 }
 
+/** A streak that tolerates a limited number of EARNED bad days (backend `StreakStatus`).
+ *  Purely derived from `consistency_log` - there is no spendable token, so the same history
+ *  always yields the same number and there is nothing to farm or migrate. */
+export interface StreakStatus {
+  /** The streak shown to the student, with insured days bridged. */
+  streak: number;
+  /** What it would be under the strict "any bad day ends it" rule. */
+  raw_streak: number;
+  /** Days inside the current streak that insurance is covering, most recent first. */
+  insured_days: string[];
+  /** Further bad days that could still be absorbed. */
+  insurance_left: number;
+  /** Good days needed to earn the next insured day (0 when at the cap). */
+  next_earned_in: number;
+}
+
 /** One hour of the day with the focus actually logged in it (backend `PeakHour`).
  *  Bucketed in LOCAL time - `study_sessions.started_at` is UTC, so the caller must send its
  *  offset or a UTC+5:30 student is told they peak while asleep. */

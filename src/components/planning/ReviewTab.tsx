@@ -31,10 +31,10 @@ import { fmtMins } from "./planningUtils";
 import { dayHasSignal, type ScoreReviewState, type WeeklyReview } from "./useScoreReview";
 import { usePeakHours, type PeakHoursState } from "./usePeakHours";
 import { cn } from "../../lib/utils";
-import type { ConsistencyDay, ScoreWindow } from "../../lib/types";
+import type { ConsistencyDay, ScoreWindow, StreakStatus } from "../../lib/types";
 
 export default function ReviewTab({ review: state }: { review: ScoreReviewState }) {
-  const { windows, summary, review, loaded } = state;
+  const { windows, summary, review, streak, loaded } = state;
   // Learned rhythm. Lives here rather than on Today: it's a reflective insight you act on when
   // planning, not a control you need mid-day.
   const peak = usePeakHours();
@@ -64,6 +64,8 @@ export default function ReviewTab({ review: state }: { review: ScoreReviewState 
           ))}
         </div>
       </section>
+
+      {streak && <StreakCard streak={streak} />}
 
       {review && <WeeklyReviewCard review={review} />}
 
@@ -200,6 +202,65 @@ function WeeklyReviewCard({ review }: { review: WeeklyReview }) {
           </p>
         </div>
       )}
+    </section>
+  );
+}
+
+/**
+ * The streak, with earned bad days bridged.
+ *
+ * The insurance is stated openly rather than hidden. A streak that silently survives a bad day
+ * teaches the student that the number is arbitrary; one that says "a day off is covered, you
+ * earned it" rewards the consistency that paid for it. And when the cover runs out, saying so is
+ * the honest warning — not a surprise reset tomorrow morning.
+ */
+function StreakCard({ streak }: { streak: StreakStatus }) {
+  const { streak: shown, raw_streak, insured_days, insurance_left, next_earned_in } = streak;
+  const bridged = insured_days.length > 0;
+
+  return (
+    <section className="plan-panel rounded-[24px] border border-white/[0.06] bg-white/[0.02] p-6 shadow-2xl backdrop-blur-xl">
+      <header className="mb-1 flex items-center gap-2">
+        <Flame size={16} strokeWidth={2} className="text-orange" aria-hidden />
+        <h2 className="text-sm font-semibold text-content-primary">Streak</h2>
+      </header>
+
+      <div className="flex flex-wrap items-baseline gap-2">
+        <span className="text-3xl font-bold tabular-nums text-content-primary">{shown}</span>
+        <span className="text-sm text-content-secondary">
+          {shown === 1 ? "day" : "days"} kept
+        </span>
+        {bridged && (
+          <span className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-2 py-0.5 text-[0.62rem] font-semibold text-cyan-300">
+            {insured_days.length} covered
+          </span>
+        )}
+      </div>
+
+      <p className="mt-2 text-[0.72rem] leading-relaxed text-content-secondary">
+        {shown === 0 ? (
+          "Nothing running yet. A day counts once you score 60 or better."
+        ) : bridged ? (
+          <>
+            {insured_days.length === 1 ? "A day off is" : `${insured_days.length} days off are`}{" "}
+            covered by the consistency you'd already built — strictly it would be {raw_streak}.{" "}
+            {insurance_left > 0
+              ? `${insurance_left} more ${insurance_left === 1 ? "day" : "days"} of cover left.`
+              : "That's the last of the cover, so the next missed day ends it."}
+          </>
+        ) : insurance_left > 0 && next_earned_in === 0 ? (
+          <>
+            You've banked cover for {insurance_left}{" "}
+            {insurance_left === 1 ? "bad day" : "bad days"}. Being ill shouldn't cost you a month
+            of consistency.
+          </>
+        ) : (
+          <>
+            {next_earned_in} more good {next_earned_in === 1 ? "day" : "days"} earns you a day of
+            cover, so one bad day won't reset this.
+          </>
+        )}
+      </p>
     </section>
   );
 }

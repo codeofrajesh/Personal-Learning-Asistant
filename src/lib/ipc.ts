@@ -42,6 +42,7 @@ import type {
   ScanProgress,
   ScoreWindow,
   SearchResult,
+  StreakStatus,
   SubjectView,
   Task,
   TemplateBlockInput,
@@ -363,6 +364,11 @@ export const ipc = {
    *  Idempotent: re-applying skips blocks that already exist at the same time+title. */
   applyPlanTemplate(templateId: number, day: string): Promise<number> {
     return call<number>("apply_plan_template", { templateId, day });
+  },
+
+  /** The current streak with earned bad days bridged. `today` is the caller's LOCAL date. */
+  streakStatus(today: string): Promise<StreakStatus> {
+    return call<StreakStatus>("streak_status", { today });
   },
 
   /** Focus-by-hour over the trailing `days`, in LOCAL time.

@@ -1671,6 +1671,132 @@ pub fn exam_plans(conn: &Connection, today: &str) -> AppResult<Vec<ExamPlan>> {
     Ok(out)
 }
 
+// ── Streak insurance ─────────────────────────────────────────────────────────
+
+/// A streak that tolerates the occasional bad day, plus the arithmetic behind it.
+#[derive(Debug, Clone, Serialize)]
+pub struct StreakStatus {
+    /// The streak the student is shown, with insured days bridged.
+    pub streak: i64,
+    /// What the streak would be under the strict "any bad day ends it" rule.
+    pub raw_streak: i64,
+    /// Days inside the current streak that insurance is covering, most recent first.
+    pub insured_days: Vec<String>,
+    /// Further bad days that could still be absorbed right now.
+    pub insurance_left: i64,
+    /// Good days needed to earn the next insured day.
+    pub next_earned_in: i64,
+}
+
+/// Good days required to earn each insured day. The second one costs twice as much, and so on.
+const INSURANCE_EARN_EVERY: i64 = 7;
+/// Hard ceiling. Without it a long history would make the streak nearly unbreakable, and a
+/// number that cannot be lost is not a streak.
+const INSURANCE_MAX: i64 = 2;
+/// Score at or above which a day counts as kept — the same bar the summary's streak uses.
+const STREAK_BAR: f64 = 60.0;
+
+/// The current streak, allowing a limited number of earned bad days to be bridged.
+///
+/// ## Why this is a tolerance, not a spendable token
+///
+/// The obvious design is a wallet: earn insurance, spend it to save a streak. It was rejected.
+/// Spending requires PERSISTING which days were paid for, which means a write during what should
+/// be a read, and it makes the displayed streak depend on the order the student happened to open
+/// the app in. This rule is instead purely derived from `consistency_log`, so the same history
+/// always produces the same number — nothing to migrate, nothing to reconcile, and no way to
+/// farm tokens by opening the app on the right day.
+///
+/// Earning is progressive (7 good days for the first bridge, 14 for the second) and capped at
+/// [`INSURANCE_MAX`], so consistency buys forgiveness but never invulnerability. A student who
+/// studies hard for a month and gets ill for a day keeps their streak; one who works two days a
+/// week does not get a free pass.
+///
+/// Neutral days (nothing due, nothing planned, nothing studied) are skipped rather than bridged —
+/// they cost no insurance, matching the rest of the scoring layer's treatment of an empty day as
+/// no evidence rather than as failure.
+pub fn streak_status(conn: &Connection, today: &str) -> AppResult<StreakStatus> {
+    // CHRONOLOGICAL order matters: insurance is earned by the good days BEFORE a bad one, so a
+    // reverse walk would test the wrong days' worth of consistency against the cost.
+    //
+    // 120 days is a deliberate cap. A streak that started earlier is truncated to this window;
+    // the alternative is scanning unbounded history on every read for a number that is already
+    // in the "long time" bucket by then.
+    let mut stmt = conn.prepare(
+        "SELECT day, score, tasks_due, study_minutes, blocks_planned
+           FROM consistency_log
+          WHERE day <= ?1 AND day >= date(?1, '-120 days')
+          ORDER BY day ASC",
+    )?;
+    let rows = stmt.query_map([today], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, f64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, f64>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })?;
+
+    // Signal-bearing days only, chronological. Neutral days are dropped here so they can neither
+    // extend a streak nor consume insurance.
+    let mut days: Vec<(String, bool)> = Vec::new();
+    for row in rows {
+        let (day, score, tasks_due, study_minutes, blocks_planned) = row?;
+        if tasks_due == 0 && study_minutes <= 0.0 && blocks_planned == 0 {
+            continue;
+        }
+        days.push((day, score >= STREAK_BAR));
+    }
+
+    let mut good = 0i64;
+    let mut insured: Vec<String> = Vec::new();
+
+    for (day, is_good) in &days {
+        if *is_good {
+            good += 1;
+            continue;
+        }
+        // A day below the bar. The n-th bridge costs n × INSURANCE_EARN_EVERY good days, all of
+        // which must already be banked in the CURRENT run.
+        let cost = INSURANCE_EARN_EVERY * (insured.len() as i64 + 1);
+        if (insured.len() as i64) < INSURANCE_MAX && good >= cost {
+            insured.push(day.clone());
+            continue;
+        }
+        // Unaffordable: the streak ends and the next one starts from scratch, insurance included.
+        good = 0;
+        insured.clear();
+    }
+
+    // The strict streak: trailing good days with nothing bridged.
+    let raw_streak = days
+        .iter()
+        .rev()
+        .take_while(|(_, is_good)| *is_good)
+        .count() as i64;
+
+    // Most recent first, matching how the UI lists them.
+    insured.reverse();
+
+    let used = insured.len() as i64;
+    let insurance_left = (INSURANCE_MAX - used).max(0);
+    let next_cost = INSURANCE_EARN_EVERY * (used + 1);
+    let next_earned_in = if insurance_left == 0 {
+        0
+    } else {
+        (next_cost - good).max(0)
+    };
+
+    Ok(StreakStatus {
+        streak: good,
+        raw_streak,
+        insured_days: insured,
+        insurance_left,
+        next_earned_in,
+    })
+}
+
 // ── Learned peak hours ───────────────────────────────────────────────────────
 
 /// One hour of the day, with how much focus the student has actually logged in it.
@@ -2569,6 +2695,136 @@ mod tests {
             revision_days: revision,
             is_archived: false,
         }
+    }
+
+    /// Insert a run of consistency_log days ending on `last`, newest score last.
+    /// `scores[i]` is the day `last - (len-1-i)`, so the slice reads chronologically.
+    fn log_run(conn: &Connection, last: &str, scores: &[f64]) {
+        let n = scores.len() as i64;
+        for (i, score) in scores.iter().enumerate() {
+            let offset = format!("-{} days", n - 1 - i as i64);
+            conn.execute(
+                "INSERT INTO consistency_log(day, tasks_due, score) VALUES(date(?1, ?2), 1, ?3)",
+                rusqlite::params![last, offset, score],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Consistency earns forgiveness: 7 good days buys ONE bridged bad day, so a student who
+    /// worked hard for a week and then got ill keeps their streak.
+    #[test]
+    fn streak_insurance_bridges_one_earned_bad_day() {
+        let conn = test_conn();
+        // 7 good, one bad, then 2 good — the bad day sits inside the streak.
+        let mut scores = vec![80.0; 7];
+        scores.push(10.0);
+        scores.extend([80.0, 80.0]);
+        log_run(&conn, DAY, &scores);
+
+        let s = streak_status(&conn, DAY).unwrap();
+        assert_eq!(s.raw_streak, 2, "the strict rule stops at the bad day");
+        assert_eq!(s.streak, 9, "insurance bridges it: all 9 good days count");
+        assert_eq!(s.insured_days.len(), 1);
+        assert_eq!(s.insurance_left, 1, "one bridge still available");
+    }
+
+    /// Without enough good days behind it, a bad day ends the streak. Insurance is EARNED —
+    /// otherwise it's just a weaker streak rule pretending to be a reward.
+    #[test]
+    fn streak_insurance_must_be_earned() {
+        let conn = test_conn();
+        // Only 3 good days before the bad one — short of the 7 needed.
+        log_run(&conn, DAY, &[80.0, 80.0, 80.0, 10.0, 80.0, 80.0]);
+
+        let s = streak_status(&conn, DAY).unwrap();
+        assert_eq!(s.streak, 2, "the bad day is not bridged");
+        assert_eq!(s.raw_streak, 2);
+        assert!(s.insured_days.is_empty());
+        assert_eq!(s.next_earned_in, 5, "2 good days so far, 7 needed");
+    }
+
+    /// Earning is progressive and capped: the second bridge costs 14 good days, and there is no
+    /// third at any price. A streak that cannot be lost is not a streak.
+    #[test]
+    fn streak_insurance_is_progressive_and_capped() {
+        let conn = test_conn();
+        // 14 good, bad, 7 good, bad, 1 good. Walking back from today: 7 good then a bad day
+        // (first bridge, needs 7 — affordable), then 14 more good and a second bad day (second
+        // bridge, needs 14 — also affordable).
+        let mut scores = vec![80.0; 14];
+        scores.push(10.0);
+        scores.extend(vec![80.0; 7]);
+        scores.push(10.0);
+        scores.push(80.0);
+        log_run(&conn, DAY, &scores);
+
+        let s = streak_status(&conn, DAY).unwrap();
+        assert_eq!(s.insured_days.len(), 2, "both bad days bridged");
+        assert_eq!(s.streak, 22, "14 + 7 + 1 good days");
+        assert_eq!(s.insurance_left, 0, "the cap is reached");
+        assert_eq!(s.next_earned_in, 0, "nothing more to earn");
+
+        // A THIRD bad day breaks the streak no matter how much history precedes it, and the new
+        // streak starts from scratch — insurance included. Consistency buys forgiveness twice,
+        // never a permanently unbreakable number.
+        let conn = test_conn();
+        let mut scores = vec![80.0; 40];
+        for _ in 0..3 {
+            scores.push(10.0);
+            scores.extend(vec![80.0; 8]);
+        }
+        log_run(&conn, DAY, &scores);
+        let s = streak_status(&conn, DAY).unwrap();
+        assert_eq!(
+            s.streak, 8,
+            "the third bad day ends it; only the 8 days since then count"
+        );
+        assert!(
+            s.insured_days.is_empty(),
+            "a fresh streak carries no bridged days from the broken one"
+        );
+        assert_eq!(s.insurance_left, INSURANCE_MAX, "and insurance resets with it");
+    }
+
+    /// A neutral day costs nothing: nothing was due, planned, or studied, so there is no evidence
+    /// either way and no insurance is consumed.
+    #[test]
+    fn streak_skips_neutral_days_without_spending_insurance() {
+        let conn = test_conn();
+        // Two good days (today and -2), with a genuinely EMPTY day between them at -1.
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, score) VALUES(?1, 1, 80.0)",
+            [DAY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, study_minutes, score, blocks_planned)
+             VALUES(date(?1, '-1 days'), 0, 0, 0.0, 0)",
+            [DAY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, score) VALUES(date(?1, '-2 days'), 1, 80.0)",
+            [DAY],
+        )
+        .unwrap();
+
+        let s = streak_status(&conn, DAY).unwrap();
+        assert_eq!(s.streak, 2, "the empty day is skipped, not bridged");
+        assert_eq!(s.insured_days.len(), 0, "and costs no insurance");
+        assert_eq!(s.raw_streak, 2, "nor does it break the strict streak");
+    }
+
+    /// No history at all is a zero streak, not an error.
+    #[test]
+    fn streak_handles_no_history() {
+        let conn = test_conn();
+        let s = streak_status(&conn, DAY).unwrap();
+        assert_eq!(s.streak, 0);
+        assert_eq!(s.raw_streak, 0);
+        assert_eq!(s.insurance_left, INSURANCE_MAX);
+        assert_eq!(s.next_earned_in, INSURANCE_EARN_EVERY);
     }
 
     /// Peak hours must be bucketed in LOCAL time. `started_at` is stored in UTC, so an offset

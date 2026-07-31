@@ -13,7 +13,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
 import { localDay, useScheduleClock } from "../../lib/scheduleClock";
-import type { ConsistencyDay, ConsistencySummary, ScoreWindow } from "../../lib/types";
+import type {
+  ConsistencyDay,
+  ConsistencySummary,
+  ScoreWindow,
+  StreakStatus,
+} from "../../lib/types";
 
 /** A day carries signal if the student had a deadline, studied, or planned. Mirrors the
  *  backend's `day_has_signal` exactly — two definitions here would desync the review from
@@ -55,6 +60,9 @@ export interface ScoreReviewState {
   windows: ScoreWindow[];
   summary: ConsistencySummary | null;
   review: WeeklyReview | null;
+  /** Streak with earned bad days bridged. Fetched here because it shares this hook's
+   *  day-boundary trigger — a separate hook would mean a second identical refetch rule. */
+  streak: StreakStatus | null;
   loaded: boolean;
   reload: () => Promise<void>;
 }
@@ -68,6 +76,7 @@ export function useScoreReview(): ScoreReviewState {
   const clockDay = useScheduleClock((s) => s.day);
   const [windows, setWindows] = useState<ScoreWindow[]>([]);
   const [summary, setSummary] = useState<ConsistencySummary | null>(null);
+  const [streak, setStreak] = useState<StreakStatus | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   const reload = useCallback(async () => {
@@ -77,13 +86,15 @@ export function useScoreReview(): ScoreReviewState {
     }
     const today = localDay();
     try {
-      const [w, s] = await Promise.all([
+      const [w, s, st] = await Promise.all([
         ipc.scoreSummary(today),
         // 91 days = a full heatmap AND enough history for the weekday pattern to mean something.
         ipc.consistencySummary(today, 91),
+        ipc.streakStatus(today),
       ]);
       setWindows(w);
       setSummary(s);
+      setStreak(st);
     } catch {
       /* keep prior state — a failed read must not blank a page the student is reading */
     } finally {
@@ -101,8 +112,8 @@ export function useScoreReview(): ScoreReviewState {
   );
 
   return useMemo(
-    () => ({ windows, summary, review, loaded, reload }),
-    [windows, summary, review, loaded, reload],
+    () => ({ windows, summary, review, streak, loaded, reload }),
+    [windows, summary, review, streak, loaded, reload],
   );
 }
 

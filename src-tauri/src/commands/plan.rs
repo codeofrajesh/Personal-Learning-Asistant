@@ -21,7 +21,7 @@ use tauri::State;
 
 use crate::db::plan::{
     self, BlockInputDto, DayPlan, Exam, ExamInputDto, ExamPlan, PeakHour, PlanBlock, PlanTemplate,
-    PlanTemplateBlock, ReminderState, TemplateBlockInputDto, TemplateInputDto,
+    PlanTemplateBlock, ReminderState, StreakStatus, TemplateBlockInputDto, TemplateInputDto,
 };
 use crate::db::queries::{self, ScoreWindow};
 use crate::db::Db;
@@ -261,6 +261,17 @@ pub fn suggested_plan_template(
     weekday: i64,
 ) -> AppResult<Option<PlanTemplate>> {
     db.with(|conn| plan::suggested_template(conn, weekday))
+}
+
+/// The current streak, with earned bad days bridged.
+///
+/// Purely derived from `consistency_log`, so the same history always yields the same number —
+/// there is no spendable token to persist and no way to farm one by opening the app on the right
+/// day. `today` is the caller's LOCAL date.
+#[tauri::command]
+pub fn streak_status(db: State<'_, Db>, today: String) -> AppResult<StreakStatus> {
+    validate_day(&today)?;
+    db.with(|conn| plan::streak_status(conn, &today))
 }
 
 /// Focus-by-hour over the trailing `days`, in the caller's LOCAL time.
