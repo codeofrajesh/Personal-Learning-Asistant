@@ -318,6 +318,47 @@ export function isBlockOpen(block: PlanBlock): boolean {
 }
 
 /**
+ * The block's progress toward its OWN target, as short text ("1 / 2 lessons", "15m / 1h").
+ *
+ * The backend has tracked this since the attribution funnel landed, and the UI never showed it:
+ * `progress_count` and `executed_mins` both moved while every surface displayed only a status
+ * word, so a student watching lecture one of two got no acknowledgement that anything counted.
+ * A silent tracker is indistinguishable from a broken one, which is exactly how it was reported.
+ *
+ * The unit follows the block's contract, because that is what the student agreed to:
+ *
+ *   * `node_count`   → items, the thing they asked for ("2 lessons"), with minutes available on
+ *                      the bar underneath. Falls back to a bare count when no target is set.
+ *   * `node_minutes` → minutes, since a time box is answered in minutes and `progress_count`
+ *                      is only incidental there (it is counted, never used to complete).
+ *   * `material`     → a single file: "done" or nothing. "0 / 1 lessons" is noise for a block
+ *                      whose own title already names the one video.
+ *   * everything else (task / freeform) → minutes against the plan when any time is logged.
+ *
+ * Returns `null` when there is genuinely nothing to say, so callers can omit the row entirely
+ * rather than render an empty slot.
+ */
+export function blockProgressLabel(block: PlanBlock): string | null {
+  const done = Math.max(0, Math.round(block.executed_mins));
+
+  if (block.target_kind === "node_count") {
+    const want = block.target_count ?? 0;
+    const items = Math.max(0, block.progress_count);
+    if (want > 0) return `${Math.min(items, want)} / ${want} lessons`;
+    return items > 0 ? `${items} ${items === 1 ? "lesson" : "lessons"}` : null;
+  }
+
+  if (block.target_kind === "material") {
+    return block.status === "done" ? "Watched" : null;
+  }
+
+  // Time-boxed and freeform work: minutes are the honest unit. Suppressed until something has
+  // actually been logged, so an untouched block stays quiet instead of advertising "0m".
+  if (done <= 0) return null;
+  return `${fmtMins(done)} / ${fmtMins(block.effective_mins)}`;
+}
+
+/**
  * How much of a timeline block's content actually fits in its rendered height.
  *
  * A calendar block is a fixed-height flex column, and its rows do NOT declare `shrink-0` by

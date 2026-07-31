@@ -45,6 +45,7 @@ import type {
   ScoreWindow,
   SearchResult,
   StreakStatus,
+  StudyMeter,
   SubjectView,
   Task,
   TemplateBlockInput,
@@ -401,6 +402,14 @@ export const ipc = {
    *  `Date.getTimezoneOffset()` returns the inverse, so pass `-new Date().getTimezoneOffset()`. */
   peakHours(utcOffsetMins: number, days?: number): Promise<PeakHour[]> {
     return call<PeakHour[]>("peak_hours", { utcOffsetMins, days });
+  },
+
+  /** Today's studied minutes + the goal they're measured against (the sidebar Study Meter).
+   *  Takes BOTH the local `day` and the UTC offset — sessions are stored in UTC, so the offset is
+   *  what makes an evening in New York count toward the day the student is living in. Same SIGN
+   *  caveat as `peakHours`: pass `-new Date().getTimezoneOffset()`. */
+  studyMeter(day: string, utcOffsetMins: number): Promise<StudyMeter> {
+    return call<StudyMeter>("study_meter", { day, utcOffsetMins });
   },
 
   // ── Exams & backward planning (v10) ─────────────────────────────────────────

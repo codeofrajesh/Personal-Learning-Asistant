@@ -593,6 +593,20 @@ export interface PeakHour {
   days: number;
 }
 
+/** Today's real time on task and the goal it is measured against (backend `StudyMeter`).
+ *  Anchored on the caller's LOCAL day + UTC offset: sessions are stored in UTC, so an evening
+ *  west of Greenwich would otherwise be filed as tomorrow and today's meter would read zero. */
+export interface StudyMeter {
+  /** Minutes of `work` sessions that started on the caller's local day. */
+  studied_mins: number;
+  /** The denominator; always >= 1 so the UI can divide safely. */
+  goal_mins: number;
+  /** Where the goal came from, so the meter can explain its own number. */
+  goal_source: "plan" | "setting" | "default";
+  /** How many sessions made up the total (one sitting vs six abandoned starts). */
+  sessions: number;
+}
+
 // ── Exams & backward planning (v10) ─────────────────────────────────────────
 
 /** A dated exam attached to a course subtree (backend `Exam`). */

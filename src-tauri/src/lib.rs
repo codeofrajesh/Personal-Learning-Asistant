@@ -149,6 +149,7 @@ pub fn run() {
             commands::plan::exam_plans,
             commands::plan::peak_hours,
             commands::plan::streak_status,
+            commands::plan::study_meter,
             commands::plan::commit_focus,
             commands::plan::resolve_focus,
             commands::plan::focus_contract,

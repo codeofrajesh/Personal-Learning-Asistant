@@ -22,7 +22,8 @@ use tauri::State;
 use crate::db::plan::{
     self, BlockInputDto, DayPlan, Exam, ExamInputDto, ExamPlan, FocusContract, FocusRecord,
     PeakHour, PlanBlock, PlanTemplate,
-    PlanTemplateBlock, ReminderState, StreakStatus, TemplateBlockInputDto, TemplateInputDto,
+    PlanTemplateBlock, ReminderState, StreakStatus, StudyMeter, TemplateBlockInputDto,
+    TemplateInputDto,
 };
 use crate::db::queries::{self, ScoreWindow};
 use crate::db::Db;
@@ -318,6 +319,17 @@ pub fn peak_hours(
 ) -> AppResult<Vec<PeakHour>> {
     let window = days.unwrap_or(60);
     db.with(|conn| plan::peak_hours(conn, utc_offset_mins, window))
+}
+
+/// Today's real time on task plus the goal it is measured against (the sidebar Study Meter).
+///
+/// Takes BOTH the local `day` and `utc_offset_mins`: sessions are stored in UTC, so the offset is
+/// what lets an evening in New York count toward the day the student is actually living in. See
+/// [`plan::study_meter`].
+#[tauri::command]
+pub fn study_meter(db: State<'_, Db>, day: String, utc_offset_mins: i64) -> AppResult<StudyMeter> {
+    validate_day(&day)?;
+    db.with(|conn| plan::study_meter(conn, &day, utc_offset_mins))
 }
 
 // ── Exams & backward planning (v10) ──────────────────────────────────────────

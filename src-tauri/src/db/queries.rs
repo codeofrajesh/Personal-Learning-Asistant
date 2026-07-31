@@ -1528,6 +1528,10 @@ const COMPLETION_THRESHOLD: f64 = 0.95;
 /// (refreshing `last_watched_at`), flips `completed` when watched past the threshold, and
 /// mirrors `is_completed` onto the `materials` row. `watch_count` is NOT touched here — a
 /// genuine view is counted once on open (`material_for_player`), not on every save.
+///
+/// Once past the threshold it also credits the active plan block (see
+/// [`crate::db::plan::attribute_completion`]), which de-duplicates per (block, material) so
+/// repeated saves cost nothing and re-watching for revision still counts.
 pub fn save_progress(
     conn: &mut Connection,
     material_id: i64,
@@ -1536,23 +1540,6 @@ pub fn save_progress(
 ) -> AppResult<()> {
     let completed = duration_secs > 0.0 && (position_secs / duration_secs) >= COMPLETION_THRESHOLD;
     let completed_i = i64::from(completed);
-
-    // Was this material ALREADY finished before this save? This is the difference between an
-    // event and a state, and the planner needs the event: `save_progress` keeps firing every few
-    // seconds while a finished video plays out its last frames, so crediting "an item is done" on
-    // every call would race a "2 lectures" block to completion inside a minute. Read it before
-    // the write, credit only on the false → true transition.
-    let was_completed: bool = conn
-        .query_row(
-            "SELECT COALESCE(MAX(w.completed), MAX(m.is_completed), 0)
-               FROM materials m LEFT JOIN watch_progress w ON w.material_id = m.id
-              WHERE m.id = ?1",
-            [material_id],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?
-        .map(|v| v != 0)
-        .unwrap_or(false);
 
     let tx = conn.transaction()?;
     tx.execute(
@@ -1576,12 +1563,19 @@ pub fn save_progress(
     }
     tx.commit()?;
 
-    // The missing event hook (the Phase C disconnect). Watching a lecture to the end updated the
-    // course database and told the SCHEDULE nothing, so a "2 lectures of Physics" block sat at
-    // zero while both lectures were finished. Credited after the commit and only on the
-    // transition: the watch progress is the user-visible outcome, so planner bookkeeping is
-    // best-effort by the same contract as `plan::log_event` and must never roll it back.
-    if completed && !was_completed {
+    // The event hook into the schedule. Watching a lecture to the end used to update the course
+    // database and tell the SCHEDULE nothing, so a "2 lectures of Physics" block sat at zero while
+    // both lectures were finished.
+    //
+    // Called on every completed save, NOT only on a first-ever completion. The de-duplication
+    // lives in `attribute_completion`, which records one credit event per (block, material) — so
+    // this call is idempotent for the rest of the video, and a REVISION block still earns credit
+    // for re-watching a lecture that was already finished. Gating here on the false → true
+    // transition is what made revision unrewardable.
+    //
+    // Best-effort after the commit, by the same contract as `plan::log_event`: watch progress is
+    // the user-visible outcome and planner bookkeeping must never roll it back.
+    if completed {
         let _ = crate::db::plan::attribute_completion(conn, material_id);
     }
     Ok(())
@@ -3377,10 +3371,12 @@ mod tests {
     /// Watching a video to the end must credit ONE item to the active block, and the flood of
     /// `save_progress` calls that follows must not credit any more.
     ///
-    /// This is the gate that makes item-tracking usable at all: the player keeps flushing
-    /// progress every few seconds while a finished video sits at its last frame, so counting
-    /// per-call would race a "2 lectures" block to done inside a minute. The transition is read
-    /// BEFORE the write, so only the first crossing counts.
+    /// This is the gate that makes item-tracking usable at all: the player keeps flushing progress
+    /// every few seconds while a finished video sits at its last frame, so counting per-call would
+    /// race a "2 lectures" block to done inside a minute. De-duplication is per (block, material)
+    /// in the `plan_events` ledger, so the trailing flushes are free — and, unlike the old
+    /// first-completion gate, a later revision block can still earn credit for the same file
+    /// (`a_revision_block_credits_an_already_completed_material`).
     #[test]
     fn completing_a_material_credits_the_block_exactly_once() {
         let mut conn = test_conn();
@@ -3423,6 +3419,75 @@ mod tests {
             .query_row("SELECT progress_count FROM plan_blocks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "completion is an event, not a state re-reported");
+    }
+
+    /// The revision workflow, end to end through the real write path.
+    ///
+    /// A student finished this lecture weeks ago, so `watch_progress.completed` is already 1 and no
+    /// false → true transition will ever happen again. Under the old gate a revision block could
+    /// therefore never move, which made re-watching invisible to the planner — the reported bug.
+    /// A NEW block has no credit event for this material, so it credits normally.
+    #[test]
+    fn a_revision_block_credits_an_already_completed_material() {
+        let mut conn = test_conn();
+        let day: String = conn.query_row("SELECT date('now')", [], |r| r.get(0)).unwrap();
+        let node = upsert_root_node(&conn, "Physics").unwrap();
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                   duration_secs)
+             VALUES(?1, '/p/1.mp4', '1.mp4', 'video', 'mp4', 600)",
+            [node],
+        )
+        .unwrap();
+        let mat = conn.last_insert_rowid();
+
+        // Session one: watched to the end under its own block, which then closes itself out.
+        conn.execute(
+            "INSERT INTO plan_blocks(day, planned_start, planned_mins, title, status,
+                                     target_kind, target_node_id, target_count)
+             VALUES(?1, '06:00', 60, 'Physics', 'active', 'node_count', ?2, 1)",
+            rusqlite::params![&day, node],
+        )
+        .unwrap();
+        let first = conn.last_insert_rowid();
+        save_progress(&mut conn, mat, 600.0, 600.0).unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT progress_count FROM plan_blocks WHERE id = ?1",
+                [first],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1
+        );
+
+        // Session two, later: a revision block on the same course. The material is already
+        // completed, so nothing about it transitions.
+        conn.execute(
+            "INSERT INTO plan_blocks(day, planned_start, planned_mins, title, status,
+                                     target_kind, target_node_id, target_count)
+             VALUES(?1, '20:00', 30, 'Physics revision', 'active', 'node_count', ?2, 1)",
+            rusqlite::params![&day, node],
+        )
+        .unwrap();
+        let revision = conn.last_insert_rowid();
+        save_progress(&mut conn, mat, 600.0, 600.0).unwrap();
+
+        let b = crate::db::plan::get_block(&conn, revision).unwrap();
+        assert_eq!(b.progress_count, 1, "re-watching for revision is real work");
+        assert_eq!(b.status, "done", "and it finishes a 1-lesson revision block");
+
+        // The original block is untouched: credit belongs to the block that was running.
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT progress_count FROM plan_blocks WHERE id = ?1",
+                [first],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1,
+            "a settled block is not re-credited by later study"
+        );
     }
 
     /// `nodes_in_progress` returns only roots with 0 < completed < total; `recent_nodes`

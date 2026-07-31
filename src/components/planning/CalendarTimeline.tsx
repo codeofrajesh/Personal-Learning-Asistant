@@ -32,6 +32,16 @@ type Grain = "day" | "month" | "year";
 
 const HOUR_H = 64; // px per hour in Day view (roomier blocks)
 const DAY_SCROLL_TO = 7; // auto-scroll Day view to ~7 AM
+/** Minimum rendered task height, so a short task stays readable and tappable. */
+const MIN_TASK_H = 44;
+/**
+ * `MIN_TASK_H` in minutes of axis (~41 at 64px/hour), handed to the layout engine.
+ *
+ * Same reason as the Today axis: a task drawn 44px tall occupies ~41 minutes of timeline
+ * regardless of its estimate, so collisions must be measured against that floor or two short
+ * tasks minutes apart get one column each at full width and render on top of each other.
+ */
+const MIN_TASK_MINS = (MIN_TASK_H / HOUR_H) * 60;
 
 interface Props {
   tasks: Task[];
@@ -63,6 +73,9 @@ type LaidOutTask = {
  *
  * Open work ranks ahead of completed work for the primary column, so a finished task never
  * outranks the live one sharing its slot.
+ *
+ * `MIN_TASK_MINS` makes the engine aware of the rendered height floor, so short tasks that will be
+ * DRAWN overlapping are placed in separate columns instead of stacked in the same pixels.
  */
 function layoutDayTasks(tasks: Task[]): LaidOutTask[] {
   const intervals = tasks
@@ -88,7 +101,7 @@ function layoutDayTasks(tasks: Task[]): LaidOutTask[] {
     })
     .filter((item): item is NonNullable<typeof item> => item != null);
 
-  return layoutIntervals(intervals).map(({ item, col, span, cols }) => ({
+  return layoutIntervals(intervals, MIN_TASK_MINS).map(({ item, col, span, cols }) => ({
     task: item.task,
     due: item.due,
     start: item.startDate,
@@ -246,7 +259,9 @@ function DayGrid({
         <div className="absolute inset-y-0 left-16 right-2">
           {laidOutTasks.map(({ task, due, start, startH, endH, col, span, cols }) => {
             const top = startH * HOUR_H;
-            const height = Math.max(44, (endH - startH) * HOUR_H - 4);
+            // Same floor the layout engine was told about (MIN_TASK_MINS), so what collides and
+            // what is drawn can never drift apart again.
+            const height = Math.max(MIN_TASK_H, (endH - startH) * HOUR_H - 4);
             const st = taskStyle(task, now);
             const status = taskStatus(task, now);
             const progress = taskProgress(task, now);

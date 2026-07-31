@@ -768,9 +768,10 @@ sections with correct membership; (b) **pin/unpin** a course from a hub card and
 
 Time-blocked scheduling with an Intelligent Adjustment engine, an advisory pre-mortem, learned
 pace, and schedule-adherence scoring. **ALL phases (A–F) are DONE**: `cargo test --lib`
-**130 passed** (was 14), no new clippy warnings; `npm run build` + `tsc --noEmit` clean.
-**37 plan commands** registered. Post-QA fixes in §14.11 (tracking attribution, timeline geometry,
-timer visibility). Still owed: a live smoke test against a real pre-v9 DB (§14.12).
+**137 passed** (was 14), no new clippy warnings; `npm run build` + `tsc --noEmit` clean.
+**38 plan commands** registered. Post-QA fixes in §14.11 (tracking attribution, timeline geometry,
+timer visibility) and §14.12 (revision credit, rendered-space collisions, progress visibility,
+routines UI, sidebar Study Meter). Still owed: a live smoke test against a real pre-v9 DB (§14.13).
 
 ### 14.0 Architectural decisions (pushbacks accepted by the user)
 These were argued *against* the original brief and approved — they are load-bearing, not
@@ -869,7 +870,7 @@ tree doesn't have. `NextUpItem` now carries `node_id`/`node_name` (immediate fol
 - **Frontend (DTO absorption only):** `lib/types.ts`, `components/dashboard/NextUp.tsx`,
   `components/planning/PlannerTab.tsx`.
 
-### 14.6 Command surface (37 registered, untested live)
+### 14.6 Command surface (38 registered, untested live)
 **Blocks & day (A–B):** `plan_day`, `upsert_plan_block`, `delete_plan_block`,
 `set_plan_block_status`, `start_plan_block`, `active_plan_block`, `set_plan_day_window`,
 `reconcile_plan`, `score_summary`.
@@ -882,7 +883,8 @@ tree doesn't have. `NextUpItem` now carries `node_id`/`node_name` (immediate fol
 `delete_plan_template_block`, `save_day_as_template`, `suggested_plan_template`.
 **Exams (F, v10):** `list_exams`, `upsert_exam`, `delete_exam`, `exam_plans`.
 **Insight & commitment (F):** `peak_hours`, `streak_status`, `commit_focus`, `resolve_focus`,
-`focus_contract`, `focus_record`.
+`focus_contract`, `focus_record`, `study_meter` (§14.12; takes BOTH the local day and the UTC
+offset, because sessions are stored in UTC).
 
 Every command that needs "today"/"now"/a weekday/a UTC offset takes it as a **parameter**. This
 is now enforced across the whole surface — Phase E found `score_window` and `consistency_summary`
@@ -1181,7 +1183,85 @@ which the ring colour and play/pause icon already convey) via the existing `useA
 Dashboard the binding was invisible, and a timer that doesn't say what it's counting toward reads as
 a stopwatch, not as progress against today's plan.
 
-### 14.12 Still owed
+### 14.12 Second QA pass — revision credit, rendered-space collisions, meter (no migration)
+`cargo test --lib` **137 passed** (was 130); `tsc --noEmit` + `npm run build` clean; clippy still 18
+pre-existing warnings. Schema stays v10.
+
+**Revision credit — the transition gate was the wrong invariant.** §14.11 credited an item only on a
+material's not-completed → completed crossing. That stopped a finished video from spamming its own
+block, but it also made the **revision workflow** unrewardable: re-watching a lecture finished last
+month never transitions again, so a "2 lectures" revision block could never move. The fix replaces
+the gate with the invariant that was actually wanted — **one block counts one material at most
+once** — enforced against the `plan_events` ledger (`kind = 'credited'`, `meta = {"material":N}`).
+One rule buys both properties: a video can't spam its own block (the second call finds the event),
+and a *different* block credits the same file normally, because revision is a different block. The
+ledger was chosen over a new column because it is already append-only, cascade-deleted with its
+block and indexed by `block_id` — so this needed no migration. `meta` is compared exactly, never
+with `LIKE`, or material 12 would satisfy the check for material 123. The credit event is written
+*before* the increment: a failure between them must not leave a counted item with no record of
+having been counted. `save_progress` no longer reads the prior completed flag at all, which also
+removes the read-before-write race that gate implied.
+
+**Timeline overlap, again — and the algorithm was never the bug.** The report blamed
+"column-span expansion" for stacking same-slot blocks in one pixel space. Traced by hand, two blocks
+at 10:00–11:00 come out `col 0/span 1` and `col 1/span 1` of 2 columns, which renders side by side;
+that path was correct. The real defect was that collisions were measured in **scheduled** space while
+blocks are drawn in **rendered** space. Both surfaces floor block height for tappability
+(`MIN_BLOCK_H = 46` on the Today axis, 44px in the Calendar Day view), and at `HOUR_H = 64` a 46px
+floor is ~43 minutes of axis. So two 15-minute blocks at 10:00 and 10:15 don't overlap *as schedule*
+— the engine gave both column 0 at full width — and were then drawn 43px tall, 16px apart, one over
+the other. `layoutIntervals` now takes `minMins` (the caller's own floor, in minutes) and every
+collision decision compares `max(end, start + minMins)`: cluster breaks, column assignment, and
+span expansion. Scheduled times are still what gets *displayed*; this only changes who shares width.
+Both call sites pass their real floor, and `CalendarTimeline`'s magic `44` is now the same constant
+the engine is told about, so the two can't drift apart again.
+
+**Progress visibility — `blockProgressLabel` in `planningUtils`.** The backend had tracked
+intermediate progress since §14.11 and no surface showed it, which is indistinguishable from a
+broken tracker. The unit follows the block's own contract, because that is what the student agreed
+to: `node_count` → "1 / 2 lessons" (items, with minutes still on the bar); `node_minutes` and
+freeform → "15m / 1h"; `material` → "Watched" or nothing, since "0 / 1 lessons" is noise for a block
+whose title already names the one video. Returns `null` when there is nothing honest to say, so an
+untouched block stays quiet instead of advertising "0m". Shown on the timeline block and in
+"What's next". A `node_count` block's bar now fills by **items** rather than minutes — half of a
+"2 lessons" block is one lesson, however long it took.
+
+**Routine templates UI — built, then unreachable.** `useTemplates`, `RoutinesModal` and all six
+commands existed; the only entry point was the empty-day offer. So the feature vanished the moment a
+day had blocks, and "save *this* day as a routine" was unreachable **by definition** — capture needs
+a day with blocks in it, which is exactly the state that hid the button. Added a "Routines" control
+to `DayHeader`, which is on screen whether or not the day is empty. No new modal: the existing one
+already does capture, apply, per-block editing and delete.
+
+**Sidebar Study Meter (`study_meter` command + `StudyMeter`/`useStudyMeter`).**
+- **Local day via the caller's offset.** `study_sessions.started_at` is UTC and its `session_date`
+  generated column is therefore a UTC date. Reading that column — as `weekly_activity` and
+  `day_facts` still do — mis-files evening study west of Greenwich: at 19:00 in New York it is
+  already tomorrow in UTC, so the meter would read zero while the student was actively using the
+  app. `study_meter` shifts `started_at` by `utc_offset_mins` first (the `peak_hours` precedent) and
+  compares against the local `day` the frontend passes in. Offset is range-checked, not trusted.
+- **The goal prefers the plan.** A meter needs a denominator, and the honest one is what the student
+  already committed to: the sum of today's live blocks. It re-derives when they re-plan, and reads
+  "you said 3h, you've done 40m" instead of comparing real work to an arbitrary constant. Falls back
+  to `study.daily_goal_mins`, then to a 2h default. **Skipped and spilled blocks are excluded** —
+  time deliberately given up is not still owed, and counting it would make the meter recede as the
+  day is triaged, punishing exactly the students who are honest about what they dropped. A blank or
+  junk setting can never become the denominator (test covers `""`, `"abc"`, `"0"`, `"-30"`).
+- **Breaks excluded**, consistent with adherence and the activity chart: a meter fillable by walking
+  away measures nothing.
+- **Collapsed state is a different composition, not a squeeze.** At 96px the meter becomes a 44px
+  conic-gradient ring with an hour count inside — the ring *is* the information, so nothing must be
+  read at that width, and `title`/`aria-label` carry the full sentence. Zero renders as "–", because
+  "0m" inside a glowing ring reads as broken rather than as "not started".
+- **Costs one query a minute.** The sidebar is mounted on every route for the whole session, which
+  makes it the most expensive place in the app to put a timer; `useStudyMeter` subscribes to the
+  shared `useScheduleClock` minute tick instead of owning an interval (the `useActiveBlock` rule).
+  Minutes are also the display resolution, so a faster refresh couldn't change a pixel. Invalidated
+  by the minute tick, `usePlanRevision` (the goal depends on today's blocks) and the local day
+  rolling over. Fills are CSS gradients driven by one custom property — no JS animation, no SVG.
+  Colour carries state (cyan → orange → lime) and is never red: an unfinished day is not a failure.
+
+### 14.13 Still owed
 - **Live smoke test against a real pre-v9 DB.** Everything above is compile-, test- and
   build-verified only. The v9→v10 migration path is covered by unit tests but has never run
   against a real user database. The attribution funnel in particular has never been exercised

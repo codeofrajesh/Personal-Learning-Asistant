@@ -28,6 +28,7 @@ import {
   ChevronRight,
   Circle,
   Gauge,
+  Layers,
   Link2,
   Play,
   Plus,
@@ -46,6 +47,7 @@ import { useTemplates } from "./useTemplates";
 import {
   BLOCK_STATE_META,
   blockDetail,
+  blockProgressLabel,
   blockStartMins,
   blockVisualState,
   fmtHhmmLabel,
@@ -62,6 +64,15 @@ import type { DayPlanState } from "./useDayPlan";
 const HOUR_H = 64; // px per hour, matching CalendarTimeline so the two read as one system.
 /** Minimum rendered block height, so a 15-minute block is still tappable. */
 const MIN_BLOCK_H = 46;
+/**
+ * `MIN_BLOCK_H` expressed in minutes of axis (~43 at 64px/hour).
+ *
+ * The layout engine has to know this: a 15-minute block is DRAWN 46px tall, so it physically
+ * covers the next ~28 minutes of timeline. Without this floor the engine sees no collision
+ * between back-to-back short blocks, gives both the full width and the same `left`, and they
+ * render one on top of the other with their text interleaved.
+ */
+const MIN_BLOCK_MINS = (MIN_BLOCK_H / HOUR_H) * 60;
 
 interface Props {
   schedule: DayPlanState;
@@ -128,7 +139,11 @@ export default function TodayTab({ schedule }: Props) {
     <div className="grid grid-cols-1 gap-6 xl:grid-cols-[1.7fr_1fr]">
       {/* ── The day axis ── */}
       <section className="plan-panel flex min-h-[34rem] flex-col rounded-[24px] border border-white/[0.06] bg-white/[0.02] p-5 shadow-2xl backdrop-blur-xl">
-        <DayHeader schedule={schedule} onAdd={() => openBlock(null)} />
+        <DayHeader
+          schedule={schedule}
+          onAdd={() => openBlock(null)}
+          onRoutines={() => setRoutinesOpen(true)}
+        />
 
         {loaded && blocks.length === 0 ? (
           <EmptyDay
@@ -202,7 +217,15 @@ export default function TodayTab({ schedule }: Props) {
 
 // ── Header / navigator ───────────────────────────────────────────────────────
 
-function DayHeader({ schedule, onAdd }: { schedule: DayPlanState; onAdd: () => void }) {
+function DayHeader({
+  schedule,
+  onAdd,
+  onRoutines,
+}: {
+  schedule: DayPlanState;
+  onAdd: () => void;
+  onRoutines: () => void;
+}) {
   const { day, isToday, plan, shiftDay, goToToday } = schedule;
   const label = useMemo(() => {
     const [y, m, d] = day.split("-").map(Number);
@@ -264,6 +287,19 @@ function DayHeader({ schedule, onAdd }: { schedule: DayPlanState; onAdd: () => v
             <ChevronRight size={14} strokeWidth={2} aria-hidden />
           </button>
         </div>
+        {/* Routines. Previously reachable ONLY from the empty-day offer, which made the whole
+            feature invisible the moment a day had blocks — and made "save THIS day as a routine"
+            unreachable by definition, since capture needs a day with blocks in it. */}
+        <button
+          type="button"
+          onClick={onRoutines}
+          aria-label="Routine days: save this day as a routine, or apply one"
+          title="Routine days"
+          className="flex items-center gap-1.5 rounded-full border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs font-medium text-content-secondary transition-colors hover:bg-white/[0.06] hover:text-content-primary"
+        >
+          <Layers size={13} strokeWidth={2} aria-hidden />
+          Routines
+        </button>
         <button
           type="button"
           onClick={onAdd}
@@ -335,6 +371,9 @@ type Laid = { block: PlanBlock; startMins: number; col: number; span: number; co
  * The rank argument is the part specific to this surface: OPEN work claims the leftmost, widest
  * column, so an active block sharing a slot with a skipped or finished one is the block that
  * reads as primary. Settled work is history — it should be visible without competing.
+ *
+ * `MIN_BLOCK_MINS` is handed to the engine so that two short blocks scheduled minutes apart are
+ * treated as colliding (because they will be drawn overlapping) and get separate columns.
  */
 function layoutBlocks(blocks: PlanBlock[]): Laid[] {
   const intervals = blocks
@@ -354,7 +393,9 @@ function layoutBlocks(blocks: PlanBlock[]): Laid[] {
     })
     .filter((x): x is NonNullable<typeof x> => x != null);
 
-  return layoutIntervals(intervals).map(({ item, col, span, cols }) => ({
+  // The rendered floor is passed in so collisions are measured in the space blocks actually
+  // occupy, not the space the schedule claims. See MIN_BLOCK_MINS.
+  return layoutIntervals(intervals, MIN_BLOCK_MINS).map(({ item, col, span, cols }) => ({
     block: item.block,
     startMins: item.startMins,
     col,
@@ -533,7 +574,19 @@ function BlockCard({
   }, [block]);
 
   // Executed-vs-planned, the one number that says whether the block is actually happening.
-  const progress = Math.max(0, Math.min(1, block.executed_mins / Math.max(1, block.effective_mins)));
+  // A counted block fills by ITEMS instead: a "2 lessons" block that has finished one is half
+  // done in the only unit the student stated, however long it happened to take.
+  const counted =
+    block.target_kind === "node_count" && (block.target_count ?? 0) > 0
+      ? Math.min(1, Math.max(0, block.progress_count) / (block.target_count as number))
+      : null;
+  const progress =
+    counted ?? Math.max(0, Math.min(1, block.executed_mins / Math.max(1, block.effective_mins)));
+  const progressLabel = blockProgressLabel(block);
+  const progressTitle =
+    counted != null
+      ? "Lessons finished while this block was running"
+      : "Time actually logged against this block";
 
   // Shared geometry (see timelineLayout): a block only loses width to blocks it genuinely
   // overlaps, so a long block beside short ones no longer squeezes all of them.
@@ -633,15 +686,18 @@ function BlockCard({
       )}
 
       {detail === "full" && (
-        <div className="mt-auto flex shrink-0 items-center gap-2 pt-1" title="Time actually logged against this block">
+        <div className="mt-auto flex shrink-0 items-center gap-2 pt-1" title={progressTitle}>
           <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/[0.08]">
             <div
               className={cn("h-full rounded-full transition-[width] duration-500", meta.rail)}
               style={{ width: `${Math.round(progress * 100)}%` }}
             />
           </div>
+          {/* The block's progress in its OWN unit ("1 / 2 lessons" for a counted block, minutes
+              for a time box) rather than only elapsed minutes — a counted block that has finished
+              one of two lessons was previously indistinguishable from one that had done none. */}
           <span className={cn("shrink-0 text-[0.56rem] font-medium", meta.text)}>
-            {block.executed_mins > 0 ? fmtMins(block.executed_mins) : "Not started"}
+            {progressLabel ?? (block.executed_mins > 0 ? fmtMins(block.executed_mins) : "Not started")}
           </span>
         </div>
       )}
@@ -762,6 +818,7 @@ function UpNextCard({
         <div className="-mx-1 flex flex-col">
           {upcoming.slice(0, 4).map((b, i) => {
             const meta = BLOCK_STATE_META[blockVisualState(b, nowMins, isToday)];
+            const done = blockProgressLabel(b);
             return (
               <div key={b.id} className="rounded-[12px] px-3 py-2.5">
                 <div className="flex items-center gap-3">
@@ -786,6 +843,9 @@ function UpNextCard({
                     <p className="truncate text-sm text-content-primary">{b.title}</p>
                     <p className={cn("truncate text-[0.7rem]", meta.text)}>
                       {fmtHhmmLabel(b.effective_start)} · {fmtMins(b.effective_mins)} · {meta.label}
+                      {/* Progress in the block's own unit, so the leading card acknowledges work
+                          already done instead of only naming the commitment. */}
+                      {done && ` · ${done}`}
                     </p>
                   </button>
                 </div>

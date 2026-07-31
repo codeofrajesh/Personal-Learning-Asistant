@@ -9,11 +9,16 @@
  * arrow-key navigation between items, accent focus-visible ring (from index.css),
  * and `aria-current="page"` on the active link. Icons are aria-hidden; the text
  * label (or aria-label when collapsed) names each link.
+ *
+ * The bottom of the rail carries the ambient `StudyMeter` (today's real time on task). It is
+ * deliberately the LAST thing in the column: navigation is what this surface is for, and a
+ * progress readout that displaced it would trade the primary job for a secondary one.
  */
 
 import { useRef } from "react";
 import { Link, matchPath, useLocation } from "react-router-dom";
 import { NAV_ITEMS, type NavItem } from "./nav";
+import StudyMeter from "./StudyMeter";
 import { GraduationIcon, SearchIcon } from "../ui/icons";
 import { navSource } from "../../lib/navigation";
 import { cn } from "../../lib/utils";
@@ -165,11 +170,17 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
         </ul>
       </nav>
 
-      {/* Footer / version */}
-      <div className="mt-auto px-2 pb-1">
-        {!collapsed && (
-          <div className="text-[11px] text-content-faint">v0.1.0 · local-first</div>
-        )}
+      {/* Study meter + footer.
+          Pinned to the bottom (`mt-auto`) and BELOW the nav on purpose: it is ambient feedback,
+          not a destination, so it must never push navigation off-centre or compete with it for
+          the eye. It adapts to `collapsed` itself — see StudyMeter. */}
+      <div className="mt-auto">
+        <StudyMeter collapsed={collapsed} />
+        <div className="px-2 pb-1 pt-3">
+          {!collapsed && (
+            <div className="text-[11px] text-content-faint">v0.1.0 · local-first</div>
+          )}
+        </div>
       </div>
     </aside>
   );

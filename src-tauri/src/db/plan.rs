@@ -804,18 +804,64 @@ pub fn attribute_time(conn: &Connection, material_id: Option<i64>, mins: f64) ->
     add_executed_mins(conn, block.id, mins)
 }
 
+/// Event kind marking "this block has counted this material once". See
+/// [`already_credited`] — this is the idempotency record that lets revision earn credit.
+const CREDIT_KIND: &str = "credited";
+
+/// Has `block` already counted `material_id` as one of its finished items?
+///
+/// The ledger is the source of truth rather than a new column, for two reasons: `plan_events` is
+/// already append-only, cascade-deleted with its block and indexed by `block_id`, and this needs
+/// no migration on a v10 database.
+///
+/// `meta` is compared as an exact string, not with `LIKE`. A substring match would let material
+/// 12 satisfy the check for material 123.
+fn already_credited(conn: &Connection, block_id: i64, material_id: i64) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM plan_events
+          WHERE block_id = ?1 AND kind = ?2 AND meta = ?3 LIMIT 1",
+        rusqlite::params![block_id, CREDIT_KIND, credit_meta(material_id)],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// The exact `meta` payload for a credit event, so the write and the check can never disagree.
+fn credit_meta(material_id: i64) -> String {
+    format!("{{\"material\":{material_id}}}")
+}
+
 /// Credit ONE finished item to the active block, and auto-complete the block when its target
 /// is met.
 ///
-/// Called only on the not-completed → completed TRANSITION of a material (see
-/// `queries::save_progress`). That matters: `save_progress` fires every few seconds for the rest
-/// of a finished video, and counting each of those as an item would race a 2-lecture block to
-/// "done" inside a minute.
+/// ## Idempotency is per BLOCK + MATERIAL, not per lifetime
 ///
-/// This is what finally makes `progress_count` mean something. The column has existed since v9,
-/// was selected by `BLOCK_SELECT`, mapped into the DTO and exported to TypeScript — and written
-/// by nothing, which is precisely why a "2 lectures of Physics" block could watch both lectures
-/// and still sit at 0.
+/// This used to be called only on a material's not-completed → completed transition. That stopped
+/// `save_progress` (which fires every few seconds while a finished video plays out) from racing a
+/// 2-lecture block to done — but it also broke revision, and revision is a first-class study
+/// activity: re-watching a lecture you finished last month is real work, and a "2 lectures"
+/// revision block could never move because both lectures were already `completed` and no
+/// transition would ever happen again.
+///
+/// The transition was the wrong invariant. What actually has to be true is that ONE BLOCK counts
+/// ONE MATERIAL at most ONCE, which is enforced here against the `plan_events` ledger. That gets
+/// both properties from a single rule:
+///
+///   * a video cannot spam its own block — the second call finds the credit event and returns;
+///   * a *revision* block credits normally, because a different block has no such event, so
+///     re-watching two finished lectures completes a fresh "2 lectures" block exactly as
+///     watching them the first time would.
+///
+/// The caller no longer needs to know whether this was a first watch (see
+/// `queries::save_progress`), which also removes the read-before-write race that gate implied.
+///
+/// This is also what makes `progress_count` mean anything. The column has existed since v9, was
+/// selected by `BLOCK_SELECT`, mapped into the DTO and exported to TypeScript — and written by
+/// nothing, which is precisely why a "2 lectures of Physics" block could watch both lectures and
+/// still sit at 0.
 pub fn attribute_completion(conn: &Connection, material_id: i64) -> AppResult<()> {
     let Some(block) = active_block(conn)? else {
         return Ok(());
@@ -823,6 +869,21 @@ pub fn attribute_completion(conn: &Connection, material_id: i64) -> AppResult<()
     if !block_covers_material(conn, &block, material_id) {
         return Ok(());
     }
+    // The spam guard. Cheap, indexed by `block_id`, and true for every `save_progress` after the
+    // first on the same material.
+    if already_credited(conn, block.id, material_id) {
+        return Ok(());
+    }
+    // Written BEFORE the increment so a failure here cannot leave a counted item with no record
+    // of having been counted — that would let the same video credit the block again.
+    log_event(
+        conn,
+        Some(block.id),
+        &block.day,
+        CREDIT_KIND,
+        None,
+        Some(&credit_meta(material_id)),
+    )?;
 
     conn.execute(
         "UPDATE plan_blocks SET progress_count = progress_count + 1,
@@ -2276,6 +2337,102 @@ pub fn peak_hours(
     Ok(out)
 }
 
+// ── Study meter (today's real time on task) ───────────────────────────────────
+
+/// Default daily goal when the student has neither planned the day nor set a target.
+/// Two hours: enough to feel like a real session, low enough to be reachable on a work night.
+const DEFAULT_GOAL_MINS: i64 = 120;
+
+/// Settings key for an explicit daily study target, in minutes.
+pub const SETTING_DAILY_GOAL: &str = "study.daily_goal_mins";
+
+/// Today's time on task, and what it is being measured against.
+#[derive(Debug, Clone, Serialize)]
+pub struct StudyMeter {
+    /// Real minutes of `work` sessions that started on the caller's LOCAL day.
+    pub studied_mins: f64,
+    /// The target those minutes are measured against; always ≥ 1 so the UI can divide.
+    pub goal_mins: i64,
+    /// Where the goal came from: `plan` (today's own blocks), `setting`, or `default`.
+    /// Surfaced so the meter can explain itself rather than showing an unexplained number.
+    pub goal_source: String,
+    /// How many work sessions made up the total — "5m" from one sitting reads differently
+    /// from "5m" spread over six abandoned starts.
+    pub sessions: i64,
+}
+
+/// Today's studied minutes against the day's goal, for the sidebar Study Meter.
+///
+/// ## Local day, via the caller's offset
+///
+/// `study_sessions.started_at` is written in UTC (`datetime('now')`), and its `session_date`
+/// generated column is therefore a UTC date. Reading that column directly — as `weekly_activity`
+/// and `day_facts` do — silently mis-files evening study for anyone west of Greenwich: at 19:00
+/// in New York it is already tomorrow in UTC, so a student's whole evening would land on the wrong
+/// day. This function shifts `started_at` by the caller's offset first, the same way
+/// [`peak_hours`] does, and compares against the LOCAL `day` the frontend passes in.
+///
+/// ## Why the goal prefers the plan
+///
+/// A meter needs a denominator, and the honest one is what the student already committed to: the
+/// sum of today's live blocks. It is their own stated intent, it moves when they re-plan, and it
+/// makes the meter read "you said 3h, you've done 40m" rather than comparing real work against an
+/// arbitrary constant. Only when nothing is planned does it fall back to an explicit setting, then
+/// to [`DEFAULT_GOAL_MINS`].
+///
+/// Skipped and spilled blocks are excluded: time deliberately given up is not part of today's
+/// target, and counting it would make the meter recede as the day is triaged — punishing exactly
+/// the students who are honest about what they dropped.
+pub fn study_meter(conn: &Connection, day: &str, utc_offset_mins: i64) -> AppResult<StudyMeter> {
+    if !(-12 * 60..=14 * 60).contains(&utc_offset_mins) {
+        return Err(AppError::Invalid(format!(
+            "utc_offset_mins {utc_offset_mins} out of range"
+        )));
+    }
+    let shift = format!("{utc_offset_mins} minutes");
+
+    let (secs, sessions) = conn.query_row(
+        "SELECT COALESCE(SUM(duration_secs), 0), COUNT(*)
+           FROM study_sessions
+          WHERE COALESCE(session_type, 'work') = 'work'
+            AND date(datetime(started_at, ?1)) = ?2",
+        rusqlite::params![shift, day],
+        |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
+    )?;
+
+    // The day's own commitment, in effective minutes (a recovery-moved block counts where it
+    // actually sits).
+    let planned: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(COALESCE(actual_mins, planned_mins)), 0)
+               FROM plan_blocks
+              WHERE day = ?1 AND status NOT IN ('skipped', 'spilled')",
+            [day],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+
+    let (goal, source) = if planned > 0 {
+        (planned, "plan")
+    } else {
+        match crate::db::queries::get_setting(conn, SETTING_DAILY_GOAL)?
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0)
+        {
+            Some(v) => (v, "setting"),
+            None => (DEFAULT_GOAL_MINS, "default"),
+        }
+    };
+
+    Ok(StudyMeter {
+        studied_mins: secs / 60.0,
+        goal_mins: goal.max(1),
+        goal_source: source.into(),
+        sessions,
+    })
+}
+
 /// Node ids with an active exam still ahead of `today`, including every ancestor of the exam's
 /// node.
 ///
@@ -3466,6 +3623,99 @@ mod tests {
         assert!(peak_hours(&conn, 99_999, 30).is_err());
     }
 
+    // ── Study meter ──────────────────────────────────────────────────────────
+
+    /// The meter must attribute a session to the student's LOCAL day.
+    ///
+    /// This is the bug the existing `weekly_activity` / `day_facts` queries still carry: they read
+    /// the `session_date` generated column, which is `date(started_at)` in UTC. At 19:00 in New
+    /// York it is already tomorrow in UTC, so an evening of study would land on the wrong day and
+    /// today's meter would read zero while the student was actively using the app.
+    #[test]
+    fn the_meter_counts_todays_sessions_in_local_time() {
+        let conn = test_conn();
+        // 2026-07-31 02:00 UTC — still 2026-07-30 in the Americas.
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES('2026-07-31 02:00:00', 1800, 'work')",
+            [],
+        )
+        .unwrap();
+
+        let utc = study_meter(&conn, DAY, 0).unwrap();
+        assert!((utc.studied_mins - 30.0).abs() < 0.01, "30m on the UTC day");
+        assert_eq!(utc.sessions, 1);
+
+        // UTC-5 → 21:00 on the 30th, so it is NOT today's study.
+        let est = study_meter(&conn, DAY, -300).unwrap();
+        assert_eq!(est.studied_mins, 0.0, "that session belongs to the student's yesterday");
+        assert_eq!(est.sessions, 0);
+
+        assert!(study_meter(&conn, DAY, 99_999).is_err(), "a nonsense offset is refused");
+    }
+
+    /// Breaks are excluded, exactly as they are from adherence and the activity chart: time on a
+    /// break is not time on task, and a meter that counted it could be filled by walking away.
+    #[test]
+    fn the_meter_ignores_breaks() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES('2026-07-31 10:00:00', 1800, 'work'),
+                   ('2026-07-31 11:00:00', 1800, 'short_break'),
+                   ('2026-07-31 12:00:00', 3600, 'long_break')",
+            [],
+        )
+        .unwrap();
+        let m = study_meter(&conn, DAY, 0).unwrap();
+        assert!((m.studied_mins - 30.0).abs() < 0.01, "only the work session counts");
+        assert_eq!(m.sessions, 1);
+    }
+
+    /// The goal prefers the day's own commitment, falls back to the setting, then to the default —
+    /// and skipped work is not part of the target.
+    #[test]
+    fn the_meter_goal_prefers_the_plan_then_the_setting() {
+        let conn = test_conn();
+
+        // Nothing planned, nothing configured.
+        let m = study_meter(&conn, DAY, 0).unwrap();
+        assert_eq!(m.goal_mins, DEFAULT_GOAL_MINS);
+        assert_eq!(m.goal_source, "default");
+
+        // An explicit target is used while the day is empty.
+        crate::db::queries::set_setting(&conn, SETTING_DAILY_GOAL, "180").unwrap();
+        let m = study_meter(&conn, DAY, 0).unwrap();
+        assert_eq!(m.goal_mins, 180);
+        assert_eq!(m.goal_source, "setting");
+
+        // Once the day is planned, the plan is the goal: it is what the student actually committed
+        // to today, and it re-derives whenever they re-plan.
+        let a = upsert_block(&conn, &dto(DAY, "06:00", 60, "Physics", 2)).unwrap();
+        upsert_block(&conn, &dto(DAY, "08:00", 30, "History", 2)).unwrap();
+        let m = study_meter(&conn, DAY, 0).unwrap();
+        assert_eq!(m.goal_mins, 90);
+        assert_eq!(m.goal_source, "plan");
+
+        // Skipping work removes it from the target rather than leaving an unreachable goal.
+        set_block_status(&conn, a, "skipped", None).unwrap();
+        let m = study_meter(&conn, DAY, 0).unwrap();
+        assert_eq!(m.goal_mins, 30, "time deliberately given up is not still owed");
+    }
+
+    /// A blank or junk setting must not become the denominator — dividing by it would render an
+    /// empty or infinite meter.
+    #[test]
+    fn the_meter_rejects_a_junk_goal_setting() {
+        let conn = test_conn();
+        for bad in ["", "   ", "abc", "0", "-30"] {
+            crate::db::queries::set_setting(&conn, SETTING_DAILY_GOAL, bad).unwrap();
+            let m = study_meter(&conn, DAY, 0).unwrap();
+            assert_eq!(m.goal_mins, DEFAULT_GOAL_MINS, "'{bad}' is not a goal");
+            assert_eq!(m.goal_source, "default");
+        }
+    }
+
     /// Breaks are not peaks: this measures focus, and a long break at 21:00 is not a good hour
     /// to schedule hard work in.
     #[test]
@@ -3959,6 +4209,80 @@ mod tests {
 
         attribute_time(&conn, None, 25.0).unwrap();
         assert_eq!(get_block(&conn, id).unwrap().executed_mins, 25.0);
+    }
+
+    /// One block counts one material ONCE, however many times it is reported.
+    ///
+    /// This is the invariant that replaced the "first ever completion" gate: it stops a single
+    /// video from spamming its own block (the reason the gate existed) without also making
+    /// revision unrewardable (the reason the gate was wrong).
+    #[test]
+    fn a_block_counts_the_same_material_only_once() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 3, 20.0);
+        let mut d = dto(DAY, "06:00", 90, "Physics lectures", 2);
+        d.target_kind = "node_count".into();
+        d.target_node_id = Some(node);
+        d.target_count = Some(3);
+        let id = upsert_block(&conn, &d).unwrap();
+        start_block(&conn, id).unwrap();
+
+        let mat: i64 = conn
+            .query_row("SELECT id FROM materials ORDER BY id LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        for _ in 0..5 {
+            attribute_completion(&conn, mat).unwrap();
+        }
+
+        let b = get_block(&conn, id).unwrap();
+        assert_eq!(b.progress_count, 1, "the same lecture is one item, not five");
+        assert_eq!(b.status, "active", "and it cannot spam a 3-lesson block to done");
+
+        // Exactly one ledger row backs that guarantee.
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plan_events WHERE block_id = ?1 AND kind = 'credited'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    /// A DIFFERENT block credits the same material again — that is revision, and it is the
+    /// behaviour the per-lifetime gate made impossible.
+    #[test]
+    fn a_second_block_credits_the_same_material_again() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 1, 30.0);
+        let mat: i64 = conn
+            .query_row("SELECT id FROM materials ORDER BY id LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        let mut first = dto(DAY, "06:00", 30, "Physics", 2);
+        first.target_kind = "node_count".into();
+        first.target_node_id = Some(node);
+        first.target_count = Some(1);
+        let a = upsert_block(&conn, &first).unwrap();
+        start_block(&conn, a).unwrap();
+        attribute_completion(&conn, mat).unwrap();
+        assert_eq!(get_block(&conn, a).unwrap().status, "done");
+
+        let mut second = dto(DAY, "20:00", 30, "Physics revision", 2);
+        second.target_kind = "node_count".into();
+        second.target_node_id = Some(node);
+        second.target_count = Some(1);
+        let b = upsert_block(&conn, &second).unwrap();
+        start_block(&conn, b).unwrap();
+        attribute_completion(&conn, mat).unwrap();
+
+        assert_eq!(
+            get_block(&conn, b).unwrap().progress_count,
+            1,
+            "the revision block earns its own credit"
+        );
+        assert_eq!(get_block(&conn, a).unwrap().progress_count, 1, "the first block is unchanged");
     }
 
     /// A block naming ONE file is finished by that file, and is not credited by a different one.
