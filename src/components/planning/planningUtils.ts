@@ -317,6 +317,38 @@ export function isBlockOpen(block: PlanBlock): boolean {
   return block.status === "pending" || block.status === "active";
 }
 
+/**
+ * How much of a timeline block's content actually fits in its rendered height.
+ *
+ * A calendar block is a fixed-height flex column, and its rows do NOT declare `shrink-0` by
+ * accident of writing them: flex's default `shrink: 1` means an overfull column compresses its
+ * children BELOW their content height instead of clipping, which is what made the title and the
+ * time/course line render on top of each other. Two things fix that together — the rows are now
+ * `shrink-0` (so overflow clips at the rounded edge, the honest failure), and a row is only
+ * mounted when the block is genuinely tall enough for it.
+ *
+ * The numbers are the real laid-out heights, not what the font size suggests: the meta row holds
+ * `h-6` (24px) icon buttons for the linked lesson and skip, so it is 24px tall, not ~14px. The
+ * old `height < 72` gate under-counted exactly that, so every block between 72px and 84px mounted
+ * three rows into space for two.
+ *
+ *   p-2 top+bottom     16
+ *   title row          24  → 40  (title only)
+ *   mt-1 + meta row  4+24  → 68  (+ time range · state)
+ *   pt-1 + progress  4+12  → 84  (+ executed bar)
+ */
+const BLOCK_H_META = 68;
+const BLOCK_H_FULL = 84;
+
+export type BlockDetail = "title" | "meta" | "full";
+
+/** Which rows a block of `height` px can show without crushing its own text. */
+export function blockDetail(height: number): BlockDetail {
+  if (height >= BLOCK_H_FULL) return "full";
+  if (height >= BLOCK_H_META) return "meta";
+  return "title";
+}
+
 /** `"1h 20m"` / `"45m"` — matches the Rust `fmt_duration` so both sides read identically. */
 export function fmtMins(mins: number): string {
   const m = Math.max(0, Math.round(mins));

@@ -19,6 +19,7 @@ import { gsap } from "gsap";
 import { ChevronLeft, ChevronRight, Check, Link2 } from "lucide-react";
 import {
   statusStyle, taskProgress, taskStatus, deadlineLabel, parseDue, isoDay, sameDay, fmtTime,
+  blockDetail,
 } from "./planningUtils";
 import TaskGlyph from "./TaskGlyph";
 import TimelineLegend from "./TimelineLegend";
@@ -239,7 +240,8 @@ function DayGrid({
             const st = taskStyle(task, now);
             const status = taskStatus(task, now);
             const progress = taskProgress(task, now);
-            const compact = height < 72;
+            // Shared with TodayTab: how many rows this height can hold without crushing them.
+            const detail = blockDetail(height);
             const relative = task.done ? "Done" : deadlineLabel(task.due_at ?? "", false, now).text;
             return (
               <div
@@ -252,7 +254,7 @@ function DayGrid({
               >
                 <span className={cn("absolute inset-y-0 left-0 w-1.5 rounded-l-[12px]", st.rail)} aria-hidden />
 
-                <div className="flex items-start gap-1">
+                <div className="flex shrink-0 items-start gap-1">
                   <button
                     type="button"
                     onClick={() => onToggleDone(task)}
@@ -272,8 +274,8 @@ function DayGrid({
                   </button>
                 </div>
 
-                {!compact && (
-                  <div className={cn("mt-1 flex min-w-0 items-center gap-1 text-[0.62rem]", st.text)}>
+                {detail !== "title" && (
+                  <div className={cn("mt-1 flex min-w-0 shrink-0 items-center gap-1 text-[0.62rem]", st.text)}>
                     <button type="button" onClick={() => onOpenTask(task)} className="min-w-0 flex-1 truncate text-left">
                       {fmtTime(start)} – {fmtTime(due)} · {relative}
                     </button>
@@ -285,8 +287,8 @@ function DayGrid({
                   </div>
                 )}
 
-                {!compact && (
-                  <div className="mt-auto flex items-center gap-2 pt-1" title="Elapsed portion of the derived deadline window">
+                {detail === "full" && (
+                  <div className="mt-auto flex shrink-0 items-center gap-2 pt-1" title="Elapsed portion of the derived deadline window">
                     <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/[0.08]">
                       <div
                         className={cn("h-full rounded-full transition-[width] duration-500", st.rail, status === "done" && "opacity-80")}

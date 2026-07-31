@@ -12,7 +12,9 @@
  * ## The ladder
  *
  * Per open block, in order:
- *   * `T-10`  — "Physics starts in 10 minutes" (info). Enough time to actually arrive.
+ *   * `T-10`  — "Physics starts in 10 minutes" (info). Enough time to actually arrive. The lead
+ *               is the TARGET, not a promise: a block created 3 minutes before it starts fires
+ *               this rung late (see the replay window below) and says "starts in 3 min".
  *   * `start` — "Physics starts now", with a one-tap Start action + the shared `playChime()`.
  *   * `over`  — fires ~5 min past the block's end if it is still `active`: the student is in
  *               overrun, which is the moment the recovery card is worth surfacing.
@@ -66,6 +68,9 @@ interface Due {
   block: PlanBlock;
   rung: Rung;
   atMs: number;
+  /** The block's own start instant, so a rung can describe the real time left rather than its
+   *  nominal lead. See `fire`. */
+  startMs: number;
 }
 
 /** All rungs a block still owes, as absolute instants. */
@@ -78,16 +83,27 @@ function rungsFor(block: PlanBlock): Due[] {
 
   // A block already finished (or deliberately abandoned) has nothing left to announce.
   if (block.status === "pending") {
-    out.push({ key: `block-${block.id}-t10`, block, rung: "t10", atMs: startMs - LEAD_MINS * 60_000 });
-    out.push({ key: `block-${block.id}-start`, block, rung: "start", atMs: startMs });
+    out.push({ key: `block-${block.id}-t10`, block, rung: "t10", atMs: startMs - LEAD_MINS * 60_000, startMs });
+    out.push({ key: `block-${block.id}-start`, block, rung: "start", atMs: startMs, startMs });
   }
   if (block.status === "pending" || block.status === "active") {
-    out.push({ key: `block-${block.id}-over`, block, rung: "over", atMs: endMs + OVERRUN_MINS * 60_000 });
+    out.push({ key: `block-${block.id}-over`, block, rung: "over", atMs: endMs + OVERRUN_MINS * 60_000, startMs });
   }
   return out;
 }
 
-function fire(due: Due) {
+/**
+ * Minutes from `now` until a block starts, rounded the way a person reads a clock.
+ *
+ * `Math.round` is wrong here: at 3 minutes 29 seconds out it says "3 min", and the student who
+ * looks at the clock sees 3 minutes they do not have. Rounding UP never promises time that has
+ * already gone. Returns at least 1, because "starts in 0 min" is what the `start` rung is for.
+ */
+function minsUntil(startMs: number, nowMs: number): number {
+  return Math.max(1, Math.ceil((startMs - nowMs) / 60_000));
+}
+
+function fire(due: Due, nowMs: number) {
   const { block, rung } = due;
   const name = block.title;
   const snooze = {
@@ -99,9 +115,15 @@ function fire(due: Due) {
   };
 
   if (rung === "t10") {
+    // The lead is NOT always 10 minutes. A block created 3 minutes before it starts has its
+    // T-10 instant already in the past, and the pump still fires it (that is the STALE_MINS
+    // replay window doing its job — the heads-up is the only warning that block will get).
+    // Hardcoding "10 min" there tells the student a flat lie about their own schedule, so the
+    // text is computed from the gap that actually remains at the moment of firing.
+    const left = minsUntil(due.startMs, nowMs);
     toast({
       tone: "info",
-      title: `${name} starts in ${LEAD_MINS} min`,
+      title: `${name} starts in ${left} min`,
       body: block.target_name ? `Up next: ${block.target_name}` : undefined,
       key: due.key,
       action: snooze,
@@ -163,6 +185,12 @@ export function armReminders(blocks: PlanBlock[]): () => void {
     const pending = blocks
       .flatMap(rungsFor)
       .filter((d) => d.atMs <= nowMs && d.atMs > nowMs - STALE_MINS * 60_000)
+      // A heads-up for a block that has ALREADY started is not a heads-up. This is reachable
+      // whenever the T-10 instant is inside the replay window but the start is behind us (a
+      // block added a few minutes late, or the app opened just after one began) — the `start`
+      // rung is queued in the same pass and says the true thing, so firing both would mean
+      // "starts in 1 min" immediately followed by "starts now".
+      .filter((d) => d.rung !== "t10" || d.startMs > nowMs)
       .sort((a, b) => a.atMs - b.atMs);
 
     for (const due of pending) {
@@ -170,7 +198,10 @@ export function armReminders(blocks: PlanBlock[]): () => void {
       try {
         // The claim is the gate: `false` means another tab, an earlier run, or a pre-restart
         // session already fired this rung, or it is snoozed.
-        if (await ipc.claimReminder(due.key, localDateTime(new Date(due.atMs)))) fire(due);
+        // `Date.now()` rather than the loop's `nowMs`: each claim is an awaited round-trip, so by
+        // the time a later rung fires the captured instant is seconds stale — and this number is
+        // shown to the student.
+        if (await ipc.claimReminder(due.key, localDateTime(new Date(due.atMs)))) fire(due, Date.now());
       } catch {
         // A failed claim must not silence the ladder for the rest of the day; the next
         // wakeup retries, and the ledger still guarantees at-most-once.

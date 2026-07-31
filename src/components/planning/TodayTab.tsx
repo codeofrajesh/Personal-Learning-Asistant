@@ -45,6 +45,7 @@ import { useRecovery } from "./useRecovery";
 import { useTemplates } from "./useTemplates";
 import {
   BLOCK_STATE_META,
+  blockDetail,
   blockStartMins,
   blockVisualState,
   fmtHhmmLabel,
@@ -501,7 +502,8 @@ function BlockCard({
 }) {
   const state = blockVisualState(block, nowMins, isToday);
   const meta = BLOCK_STATE_META[state];
-  const compact = height < 74;
+  // Shared with CalendarTimeline: how many rows this height can hold without crushing them.
+  const detail = blockDetail(height);
   const open = isBlockOpen(block);
   const endLabel = useMemo(() => {
     const s = blockStartMins(block);
@@ -527,7 +529,7 @@ function BlockCard({
     >
       <span className={cn("absolute inset-y-0 left-0 w-1.5 rounded-l-[12px]", meta.rail)} aria-hidden />
 
-      <div className="flex items-start gap-1.5">
+      <div className="flex shrink-0 items-start gap-1.5">
         {/* Complete / re-open. `partial` is reachable from the side rail; this is the fast path. */}
         <button
           type="button"
@@ -572,8 +574,8 @@ function BlockCard({
         )}
       </div>
 
-      {!compact && (
-        <div className={cn("mt-1 flex min-w-0 items-center gap-1.5 text-[0.62rem]", meta.text)}>
+      {detail !== "title" && (
+        <div className={cn("mt-1 flex min-w-0 shrink-0 items-center gap-1.5 text-[0.62rem]", meta.text)}>
           <span className="min-w-0 flex-1 truncate">
             {fmtHhmmLabel(block.effective_start)} – {endLabel} · {meta.label}
             {block.spill_count > 0 && ` · moved ${block.spill_count}×`}
@@ -601,8 +603,8 @@ function BlockCard({
         </div>
       )}
 
-      {!compact && (
-        <div className="mt-auto flex items-center gap-2 pt-1" title="Time actually logged against this block">
+      {detail === "full" && (
+        <div className="mt-auto flex shrink-0 items-center gap-2 pt-1" title="Time actually logged against this block">
           <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/[0.08]">
             <div
               className={cn("h-full rounded-full transition-[width] duration-500", meta.rail)}
