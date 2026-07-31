@@ -22,7 +22,7 @@ import { PRIORITY_META } from "./planningUtils";
 import { hhmmToMins, minsToHhmm } from "../../lib/scheduleClock";
 import { ipc, isTauri } from "../../lib/ipc";
 import { cn } from "../../lib/utils";
-import type { BlockInput, BlockTargetKind, PlanBlock, SearchResult } from "../../lib/types";
+import type { BlockInput, BlockTargetKind, NodeCard, PlanBlock, SearchResult } from "../../lib/types";
 
 interface Props {
   open: boolean;
@@ -31,7 +31,12 @@ interface Props {
   day: string;
   /** The block being edited, or null to create. */
   block: PlanBlock | null;
-  onSave: (input: BlockInput) => void;
+  /**
+   * Persist the block. Resolves `null` on success, or the reason it was refused (e.g. an
+   * overlap with an existing block) — in which case the modal STAYS OPEN holding the student's
+   * input, so they can fix the time instead of retyping everything.
+   */
+  onSave: (input: BlockInput) => Promise<string | null>;
   onDelete?: (block: PlanBlock) => void;
 }
 
@@ -53,9 +58,14 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
   const [nodeId, setNodeId] = useState<number | null>(null);
   const [targetName, setTargetName] = useState<string | null>(null);
   const [count, setCount] = useState<number | null>(null);
+  // A refused save (an overlap) is a normal outcome, so it needs somewhere to be shown.
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
+    setError(null);
+    setSaving(false);
     setTitle(block?.title ?? "");
     // Edit the PLANNED position, not the effective one: editing a block that a recovery shifted
     // should change the intention, not silently bake the adjustment in as the new plan.
@@ -77,11 +87,25 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
     () => (startMins == null ? "—" : minsToHhmm(Math.min(startMins + mins, 1439))),
     [startMins, mins],
   );
-  const canSave = title.trim().length > 0 && startMins != null && mins >= 1 && mins <= 1440;
+  const canSave =
+    title.trim().length > 0 && startMins != null && mins >= 1 && mins <= 1440 && !saving;
 
-  const submit = () => {
+  /**
+   * Offer the free time the backend named, as a one-tap fix.
+   *
+   * The message is authored server-side (it knows the whole day), so the time is parsed back out
+   * of it rather than duplicating the conflict search here — two implementations of "where does
+   * this fit" would drift, and the one in the modal would be the wrong one.
+   */
+  const suggested = useMemo(() => {
+    const m = /that fits is (\d{2}:\d{2})/.exec(error ?? "");
+    return m ? m[1] : null;
+  }, [error]);
+
+  const submit = async () => {
     if (!canSave) return;
-    onSave({
+    setSaving(true);
+    const reason = await onSave({
       id: block?.id ?? null,
       day: block?.day ?? day,
       planned_start: start,
@@ -99,7 +123,24 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
       min_viable_mins: minViable != null ? Math.min(minViable, mins) : null,
       notes: notes.trim() || null,
     });
+    setSaving(false);
+    if (reason) {
+      // Keep the form exactly as they left it. Closing here is what made the earlier behaviour
+      // look like the block silently disappearing.
+      setError(reason);
+      return;
+    }
     onClose();
+  };
+
+  /** Clear a stale conflict message as soon as they change the thing it was about. */
+  const editTime = (next: string) => {
+    setStart(next);
+    setError(null);
+  };
+  const editMins = (next: number) => {
+    setMins(next);
+    setError(null);
   };
 
   return (
@@ -136,23 +177,43 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
           </button>
           <button
             type="button"
-            onClick={submit}
+            onClick={() => void submit()}
             disabled={!canSave}
             className="rounded-btn bg-lime px-4 py-2 text-sm font-semibold text-ink-900 shadow-glow-lime transition-transform hover:scale-[1.02] disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {editing ? "Save changes" : "Add block"}
+            {saving ? "Saving…" : editing ? "Save changes" : "Add block"}
           </button>
         </>
       }
     >
       <div className="flex flex-col gap-5">
+        {/* The refusal, with the fix attached. `alert` because the student pressed Save and is
+            waiting on the outcome — this is the answer to their action, not ambient news. */}
+        {error && (
+          <div
+            role="alert"
+            className="flex flex-col gap-2 rounded-btn border border-amber-400/25 bg-amber-400/[0.06] px-3 py-2.5"
+          >
+            <p className="text-xs leading-snug text-amber-200">{error}</p>
+            {suggested && (
+              <button
+                type="button"
+                onClick={() => editTime(suggested)}
+                className="w-fit rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1 text-[0.7rem] font-semibold text-amber-200 transition-colors hover:bg-amber-400/20"
+              >
+                Move it to {suggested}
+              </button>
+            )}
+          </div>
+        )}
+
         <label className="flex flex-col gap-2">
           <span className="text-xs font-medium text-content-secondary">Block</span>
           <input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit();
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void submit();
             }}
             placeholder="Physics — rotational motion"
             aria-label="Block title"
@@ -172,7 +233,7 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
             <input
               type="time"
               value={start}
-              onChange={(e) => setStart(e.target.value)}
+              onChange={(e) => editTime(e.target.value)}
               aria-label="Start time"
               className="rounded-btn border border-white/[0.08] bg-black/30 px-3 py-2 text-sm text-content-primary focus:border-lime/30 focus:outline-none [color-scheme:dark]"
             />
@@ -181,7 +242,7 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
                 <button
                   key={t}
                   type="button"
-                  onClick={() => setStart(t)}
+                  onClick={() => editTime(t)}
                   className={cn(
                     "rounded-full border px-2.5 py-1 text-[0.7rem] transition-colors",
                     start === t
@@ -208,7 +269,7 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
               max={1440}
               step={5}
               value={mins}
-              onChange={(e) => setMins(Math.max(1, Math.min(1440, Number(e.target.value) || 0)))}
+              onChange={(e) => editMins(Math.max(1, Math.min(1440, Number(e.target.value) || 0)))}
               aria-label="Length in minutes"
               className="w-20 rounded-btn border border-white/[0.08] bg-black/30 px-3 py-2 text-sm text-content-primary focus:border-lime/30 focus:outline-none"
             />
@@ -218,7 +279,7 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
                 <button
                   key={d}
                   type="button"
-                  onClick={() => setMins(d)}
+                  onClick={() => editMins(d)}
                   className={cn(
                     "rounded-full border px-2.5 py-1 text-[0.7rem] transition-colors",
                     mins === d
@@ -314,10 +375,16 @@ export default function BlockModal({ open, onClose, day, block, onSave, onDelete
           targetName={targetName}
           count={count}
           setCount={setCount}
+          nodeId={nodeId}
           onPickMaterial={(m) => {
             setMaterialId(m.id);
             setTargetName(m.file_name);
             if (!title.trim()) setTitle(m.file_name);
+          }}
+          onPickNode={(n) => {
+            setNodeId(n?.id ?? null);
+            setTargetName(n?.name ?? null);
+            if (n && !title.trim()) setTitle(n.name);
           }}
           onClearTarget={() => {
             setMaterialId(null);
@@ -353,7 +420,9 @@ function TargetPicker({
   targetName,
   count,
   setCount,
+  nodeId,
   onPickMaterial,
+  onPickNode,
   onClearTarget,
   hasTarget,
 }: {
@@ -362,7 +431,9 @@ function TargetPicker({
   targetName: string | null;
   count: number | null;
   setCount: (n: number | null) => void;
+  nodeId: number | null;
   onPickMaterial: (m: SearchResult) => void;
+  onPickNode: (n: NodeCard | null) => void;
   onClearTarget: () => void;
   hasTarget: boolean;
 }) {
@@ -493,10 +564,81 @@ function TargetPicker({
       )}
 
       {(kind === "node_count" || kind === "node_minutes") && (
-        <p className="text-[0.68rem] leading-snug text-white/35">
-          Pick the course from the Today list after saving — progress then tracks itself as you watch.
-        </p>
+        <CoursePicker nodeId={nodeId} onPick={onPickNode} />
       )}
     </div>
+  );
+}
+
+/**
+ * Course picker for the `node_*` kinds — the fix for "it is impossible to link a block to a
+ * course".
+ *
+ * The modal used to say "pick the course from the Today list after saving", and no such control
+ * existed anywhere: the block saved with `target_node_id = null`, so the automatic progress
+ * tracking those two kinds exist for could never fire. Linking has to happen HERE, while the
+ * student is already deciding what the block is for.
+ *
+ * Roots only, matching `ExamsCard`: a course is a root node, and offering the whole tree would
+ * turn one field into a file browser. A native `<select>` is deliberate — the list is short, and
+ * keyboard/screen-reader behaviour comes free. Options are explicitly dark-styled (see the
+ * white-on-white bug the exam picker had).
+ */
+function CoursePicker({
+  nodeId,
+  onPick,
+}: {
+  nodeId: number | null;
+  onPick: (n: NodeCard | null) => void;
+}) {
+  const [courses, setCourses] = useState<NodeCard[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!isTauri()) {
+      setLoaded(true);
+      return;
+    }
+    let alive = true;
+    void ipc
+      .nodeChildren(null)
+      .then((c) => {
+        if (alive) setCourses(c);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (alive) setLoaded(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-[0.68rem] font-medium text-content-secondary">Which course</span>
+      <select
+        value={nodeId ?? ""}
+        onChange={(e) =>
+          onPick(e.target.value === "" ? null : courses.find((c) => c.id === Number(e.target.value)) ?? null)
+        }
+        aria-label="Course for this block"
+        className="rounded-btn border border-white/[0.08] bg-black/30 px-3 py-2 text-xs text-content-primary [color-scheme:dark] focus:border-lime/30 focus:outline-none"
+      >
+        <option value="" className="bg-ink-850 text-content-primary">
+          {loaded && courses.length === 0 ? "No courses imported yet" : "Choose a course…"}
+        </option>
+        {courses.map((c) => (
+          <option key={c.id} value={c.id} className="bg-ink-850 text-content-primary">
+            {c.name}
+          </option>
+        ))}
+      </select>
+      <span className="text-[0.68rem] leading-snug text-white/35">
+        {nodeId == null
+          ? "Without a course this block can't track itself — you'll have to confirm it by hand."
+          : "Progress tracks itself as you watch lessons in this course."}
+      </span>
+    </label>
   );
 }

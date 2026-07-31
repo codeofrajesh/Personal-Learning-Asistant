@@ -262,14 +262,22 @@ function ExamEditor({
         </label>
         <label className="flex-1 text-[0.62rem] uppercase tracking-wide text-white/40">
           Course
+          {/* The dropdown LIST is drawn by the OS, not by us: it ignores the trigger's
+              translucent `bg-white/[0.03]` and falls back to the platform default (white on
+              Windows), so white option text rendered invisible until hovered. Each option needs an
+              opaque colour of its own, and `[color-scheme:dark]` tells the platform widget which
+              palette to use for the parts CSS can't reach (scrollbar, focus ring). */}
           <select
             value={nodeId ?? ""}
             onChange={(e) => setNodeId(e.target.value === "" ? null : Number(e.target.value))}
-            className="mt-1 w-full rounded-[10px] border border-white/[0.08] bg-white/[0.03] px-2.5 py-1.5 text-xs text-content-primary outline-none focus:border-lime/40"
+            aria-label="Course this exam covers"
+            className="mt-1 w-full rounded-[10px] border border-white/[0.08] bg-white/[0.03] px-2.5 py-1.5 text-xs text-content-primary outline-none [color-scheme:dark] focus:border-lime/40"
           >
-            <option value="">Not linked</option>
+            <option value="" className="bg-ink-850 text-content-primary">
+              Not linked
+            </option>
             {courses.map((c) => (
-              <option key={c.id} value={c.id}>
+              <option key={c.id} value={c.id} className="bg-ink-850 text-content-primary">
                 {c.name}
               </option>
             ))}

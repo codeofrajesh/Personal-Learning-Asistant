@@ -39,6 +39,10 @@ export default function RecoveryCard({ recovery }: { recovery: RecoveryState }) 
   if (canOpen && report) return <ReopenRow driftMins={report.drift_mins} onOpen={open} />;
   if (!visible || !report) return null;
 
+  // Past the hard stop: work is still open but there is no schedulable time left, so the only
+  // move is forward. The backend signals this as "doesn't fit AND nothing can be placed".
+  const outOfTime = !report.fits && report.usable_mins <= 0;
+
   return (
     <section
       // `polite`, not `assertive`: this is an offer, and it must not interrupt a screen reader
@@ -49,16 +53,27 @@ export default function RecoveryCard({ recovery }: { recovery: RecoveryState }) 
       <header className="mb-1 flex items-center gap-2">
         <LifeBuoy size={16} strokeWidth={2} className="text-amber-300" aria-hidden />
         <h3 className="text-sm font-semibold text-content-primary">
-          {report.fits ? "The day still fits — just later" : "This day needs a rethink"}
+          {report.fits
+            ? "The day still fits — just later"
+            : outOfTime
+              ? "Today's over — move this to tomorrow"
+              : "This day needs a rethink"}
         </h3>
       </header>
 
+      {/* Three states, because they need three different sentences. Telling a student at 23:25
+          that they have "0m left" to fit "1h" of work is arithmetic, not help — past the hard
+          stop the only honest thing to say is that the work moves. */}
       <p className="text-sm leading-relaxed text-content-secondary">
         {report.fits
           ? `You're about ${fmtMins(report.drift_mins)} behind. Everything still fits if it shifts.`
-          : `You're about ${fmtMins(report.drift_mins)} behind, with ${fmtMins(
-              report.usable_mins,
-            )} left and ${fmtMins(report.required_mins)} still planned.`}
+          : outOfTime
+            ? `There's no time left today, and ${fmtMins(
+                report.required_mins,
+              )} still unfinished. Carry it to tomorrow so it isn't lost.`
+            : `You're about ${fmtMins(report.drift_mins)} behind, with ${fmtMins(
+                report.usable_mins,
+              )} left and ${fmtMins(report.required_mins)} still planned.`}
       </p>
 
       <div className="mt-4 flex flex-col gap-2">

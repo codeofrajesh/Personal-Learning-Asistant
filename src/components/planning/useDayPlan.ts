@@ -20,6 +20,19 @@ import { bumpPlanRevision } from "../../lib/scheduleReminders";
 import { dayOffset, localDay, useScheduleClock } from "../../lib/scheduleClock";
 import type { BlockInput, BlockStatus, DayPlan, PlanBlock } from "../../lib/types";
 
+/**
+ * Turn a Tauri IPC rejection into something worth showing a student.
+ *
+ * `AppError` serializes as its `Display` string, so an invalid input arrives as
+ * `"invalid input: That overlaps “Physics” (11:10–11:55)."`. The prefix is for our logs, not for
+ * the person who just tried to save a block, so it is stripped.
+ */
+function cleanIpcError(e: unknown): string {
+  const raw = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+  const msg = raw.replace(/^invalid input:\s*/i, "").trim();
+  return msg.length > 0 ? msg : "That block couldn't be saved.";
+}
+
 export interface DayPlanState {
   day: string;
   /** True when `day` is the real local today (drives the now-line + reminders). */
@@ -31,7 +44,8 @@ export interface DayPlanState {
   shiftDay: (delta: number) => void;
   goToToday: () => void;
   reload: () => Promise<void>;
-  saveBlock: (input: BlockInput) => Promise<void>;
+  /** Resolves `null` on success, or a human-readable reason the save was refused. */
+  saveBlock: (input: BlockInput) => Promise<string | null>;
   removeBlock: (block: PlanBlock) => Promise<void>;
   setStatus: (block: PlanBlock, status: BlockStatus, executedMins?: number | null) => Promise<void>;
   startBlock: (block: PlanBlock) => Promise<void>;
@@ -101,10 +115,16 @@ export function useDayPlan(): DayPlanState {
   }, []);
 
   const saveBlock = useCallback(
-    async (input: BlockInput) => {
-      if (!isTauri()) return;
+    async (input: BlockInput): Promise<string | null> => {
+      if (!isTauri()) return null;
       try {
         await ipc.upsertPlanBlock({ ...input, day: input.day || day });
+        return null;
+      } catch (e) {
+        // A rejected save is a NORMAL outcome now that overlaps are refused, not a crash: the
+        // reason has to reach the student, and the modal has to stay open holding their input.
+        // Swallowing it would look exactly like the block silently failing to appear.
+        return cleanIpcError(e);
       } finally {
         // Always refetch: the backend recomputes the pre-mortem verdict and pace-adjusted
         // durations, so a locally-patched block would show numbers the solver disagrees with.

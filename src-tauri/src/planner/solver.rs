@@ -664,21 +664,57 @@ pub fn build_recovery_plans(snapshot: &DaySnapshot, now_mins: i32) -> RecoveryRe
     let demand_full: i32 = flex.iter().map(|&i| blocks[i].remaining_mins()).sum();
     let fits = demand_full <= usable;
 
-    if open.is_empty() || gaps.is_empty() {
-        // Nothing open, or no time left at all. There is no honest adjustment to offer; the
-        // caller shows an end-of-day review instead of a recovery card.
+    if open.is_empty() {
+        // Everything is settled. There is no adjustment to offer; the caller shows an
+        // end-of-day review instead of a recovery card.
         return RecoveryReport {
             day: snapshot.day.clone(),
             drift_mins,
             usable_mins: usable,
             required_mins,
-            fits: open.is_empty(),
+            fits: true,
             nothing_to_do: true,
             plans: Vec::new(),
         };
     }
 
     let mut plans: Vec<RecoveryPlan> = Vec::new();
+
+    // ── No time left, but work still open: the day is over and the debt is real. ──
+    //
+    // This used to return `nothing_to_do`, which is where the "Recovery Card never appears"
+    // bug came from: at 23:25 with a 22:00 hard stop, `free_gaps` is empty, so the ONE moment
+    // the student most needs an escape hatch was the one moment the card refused to appear.
+    //
+    // "No adjustment is possible today" is true, and it is not the same as "nothing to do":
+    // the honest offer is to carry the unfinished work to tomorrow, which is exactly what
+    // `apply_recovery` does with a `Drop` (spill forward with provenance, never a delete).
+    // One plan only — Triage and Compress would both reduce to the same "everything moves"
+    // outcome, and three identical options dressed as a choice is worse than one clear one.
+    if gaps.is_empty() {
+        let (placed, _) = place_in_gaps(&[], &gaps, prefs.transition_mins);
+        plans.push(assemble_plan(
+            PlanKind::Cascade,
+            &open,
+            blocks,
+            &placed,
+            &gaps,
+            anchors_lost,
+            anchors.len(),
+        ));
+        if let Some(p) = plans.first_mut() {
+            p.recommended = true;
+        }
+        return RecoveryReport {
+            day: snapshot.day.clone(),
+            drift_mins,
+            usable_mins: usable,
+            required_mins,
+            fits: false,
+            nothing_to_do: false,
+            plans,
+        };
+    }
 
     // ── A. Cascade — preserve order, full durations, drop from the tail. ──
     {
@@ -1049,13 +1085,40 @@ mod tests {
         );
     }
 
-    /// Past the hard stop there is no honest adjustment to offer.
+    /// Past the hard stop with work still open, the day cannot be rescued — but the student
+    /// still needs the way out. Offer exactly one plan: carry it to tomorrow.
+    ///
+    /// This is the regression test for "the Recovery Card never appears": the old code returned
+    /// `nothing_to_do` here, so the card stayed hidden at 23:25 with a ruined day on screen.
     #[test]
-    fn past_hard_stop_yields_nothing_to_do() {
+    fn past_hard_stop_still_offers_a_carry_over() {
         let s = snapshot(vec![block(1, "Physics", 360, 60, 3)]);
         let r = build_recovery_plans(&s, 1380); // 23:00, hard stop 22:00
-        assert!(r.nothing_to_do);
-        assert!(r.plans.is_empty(), "don't invent a plan for time that doesn't exist");
+
+        assert!(!r.nothing_to_do, "open work past the hard stop is not 'nothing to do'");
+        assert!(!r.fits);
+        assert_eq!(r.plans.len(), 1, "one honest option, not three identical ones");
+
+        let p = &r.plans[0];
+        assert_eq!(p.kind, PlanKind::Cascade);
+        assert!(p.recommended);
+        assert_eq!(p.dropped_count, 1, "the block moves to tomorrow");
+        assert_eq!(p.scheduled_mins, 0, "nothing can be scheduled in zero time");
+        assert_eq!(p.dropped_titles, vec!["Physics".to_string()]);
+    }
+
+    /// A block that ran past the hard stop but is anchored still counts as a lost commitment
+    /// rather than something to carry forward.
+    #[test]
+    fn past_hard_stop_reports_anchors_as_kept_not_dropped() {
+        let mut s = snapshot(vec![block(1, "Coaching", 1140, 60, 3)]);
+        s.blocks[0].is_anchored = true;
+        let r = build_recovery_plans(&s, 1380); // 23:00
+
+        assert!(!r.nothing_to_do);
+        let p = &r.plans[0];
+        assert_eq!(p.dropped_count, 0, "an anchor is never spilled by the solver");
+        assert!(p.integrity < 1.0, "but its missed window dents integrity");
     }
 
     /// A day with no open blocks is "nothing to do", not "everything dropped".

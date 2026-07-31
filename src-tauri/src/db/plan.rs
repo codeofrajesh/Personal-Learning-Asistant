@@ -30,7 +30,7 @@ use crate::planner::solver::{
     self, AdjustPrefs, BlockInput, BlockState, DaySnapshot, IntegrityVerdict, MoveAction, PlanKind,
     RecoveryReport,
 };
-use crate::planner::{fmt_hhmm, parse_hhmm, DEFAULT_HARD_STOP, DEFAULT_WAKE};
+use crate::planner::{fmt_hhmm, parse_hhmm, DEFAULT_HARD_STOP, DEFAULT_WAKE, MINUTES_PER_DAY};
 use crate::utils::errors::{AppError, AppResult};
 
 /// Settings key holding the global fallback hard stop ('HH:MM').
@@ -428,7 +428,102 @@ pub fn log_event(
     Ok(())
 }
 
+/// A block whose time collides with a proposed one.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockConflict {
+    pub id: i64,
+    pub title: String,
+    /// Effective position of the existing block, `HH:MM`.
+    pub start: String,
+    pub mins: i64,
+    /// First `HH:MM` at or after the proposed start where the block would fit, when one exists
+    /// before midnight. The UI offers this as a one-tap fix.
+    pub next_free: Option<String>,
+}
+
+/// Find an OPEN block on `day` whose effective time overlaps `[start, start+mins)`.
+///
+/// Only `pending` / `active` blocks conflict. A `done` block records time that has already been
+/// spent and a `skipped` / `spilled` one records time deliberately given up — refusing to let a
+/// student plan over either would make the schedule un-editable after the fact, which is a
+/// worse bug than the one being fixed.
+///
+/// Comparison uses the EFFECTIVE position (`actual_*` when a recovery moved the block, else
+/// `planned_*`), because that is where the block actually sits on the timeline and therefore what
+/// "you can't be in two places at once" refers to.
+pub fn find_conflict(
+    conn: &Connection,
+    day: &str,
+    start_mins: i32,
+    mins: i64,
+    exclude_id: Option<i64>,
+) -> AppResult<Option<BlockConflict>> {
+    // Every open block on the day, as (id, title, effective start, effective mins).
+    let mut stmt = conn.prepare(
+        "SELECT id, title,
+                COALESCE(actual_start, planned_start) AS eff_start,
+                COALESCE(actual_mins, planned_mins)   AS eff_mins
+           FROM plan_blocks
+          WHERE day = ?1
+            AND status IN ('pending', 'active')
+            AND (?2 IS NULL OR id <> ?2)
+          ORDER BY eff_start",
+    )?;
+    let rows: Vec<(i64, String, i32, i64)> = stmt
+        .query_map(rusqlite::params![day, exclude_id], |r| {
+            let start: String = r.get(2)?;
+            Ok((r.get(0)?, r.get(1)?, start, r.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .filter_map(|(id, title, s, m): (i64, String, String, i64)| {
+            parse_hhmm(&s).map(|sm| (id, title, sm, m))
+        })
+        .collect();
+
+    // Half-open intervals: a block ending exactly when the next begins is back-to-back, not a
+    // clash. Getting this wrong would reject every tidily-packed day.
+    let start = i64::from(start_mins);
+    let overlaps = |at: i64, s: i32, m: i64| {
+        let bs = i64::from(s);
+        bs < at + mins && at < bs + m
+    };
+    let hit = rows.iter().find(|(_, _, s, m)| overlaps(start, *s, *m));
+
+    let Some((id, title, s, m)) = hit else {
+        return Ok(None);
+    };
+
+    // Walk the occupied intervals forward from the proposed start to find the first slot the
+    // block fits in whole. Suggesting a time it still won't fit would be a worse offer than none.
+    let day_end = i64::from(MINUTES_PER_DAY);
+    let mut cursor = start;
+    let mut next_free = None;
+    while cursor + mins <= day_end {
+        match rows.iter().find(|(_, _, s, m)| overlaps(cursor, *s, *m)) {
+            Some((_, _, s, m)) => cursor = i64::from(*s) + *m,
+            None => {
+                next_free = Some(fmt_hhmm(cursor as i32));
+                break;
+            }
+        }
+    }
+
+    Ok(Some(BlockConflict {
+        id: *id,
+        title: title.clone(),
+        start: fmt_hhmm(*s),
+        mins: *m,
+        next_free,
+    }))
+}
+
 /// Create or update a block. Returns its id.
+///
+/// Rejects a block that would overlap an open one (see [`find_conflict`]): the solver's whole
+/// model is that a block is time the student will actually be sitting down, so two of them at
+/// once is not an ambitious plan, it is an impossible one. Note this differs from
+/// over-commitment, which IS allowed and merely advised against by the pre-mortem — an
+/// overcommitted day is a judgement call, a double-booked hour is arithmetic.
 pub fn upsert_block(conn: &Connection, input: &BlockInputDto) -> AppResult<i64> {
     let title = input.title.trim();
     if title.is_empty() {
@@ -452,6 +547,25 @@ pub fn upsert_block(conn: &Connection, input: &BlockInputDto) -> AppResult<i64> 
         ));
     }
     let weight = input.weight.clamp(0, 3);
+
+    // Refuse a double-booking. Checked here rather than in the command layer so every writer
+    // (modal, quick-add, a future importer) inherits it — this is an invariant of the table, not
+    // a property of one screen.
+    let start_mins = parse_hhmm(&input.planned_start)
+        .ok_or_else(|| AppError::Invalid("invalid start".to_string()))?;
+    if let Some(c) = find_conflict(conn, &input.day, start_mins, input.planned_mins, input.id)? {
+        let suggestion = match &c.next_free {
+            Some(t) => format!(" The next free slot that fits is {t}."),
+            None => String::new(),
+        };
+        return Err(AppError::Invalid(format!(
+            "That overlaps “{}” ({}–{}).{}",
+            c.title,
+            fmt_hhmm(parse_hhmm(&c.start).unwrap_or(0)),
+            fmt_hhmm(parse_hhmm(&c.start).unwrap_or(0) + c.mins as i32),
+            suggestion
+        )));
+    }
 
     // Ensure the day row exists so the window/adjust state have somewhere to live.
     conn.execute(
@@ -2287,6 +2401,80 @@ mod tests {
 
         let blank = dto(DAY, "06:00", 60, "   ", 2);
         assert!(upsert_block(&conn, &blank).is_err(), "blank title");
+    }
+
+    /// A student cannot be in two places at once, so an overlapping block is rejected outright
+    /// — unlike over-commitment, which is allowed and merely advised against.
+    #[test]
+    fn rejects_a_block_that_overlaps_an_open_one() {
+        let conn = test_conn();
+        upsert_block(&conn, &dto(DAY, "11:10", 45, "Physics", 3)).unwrap(); // 11:10–11:55
+
+        // The exact case from QA: a shorter block nested inside the first.
+        let err = upsert_block(&conn, &dto(DAY, "11:20", 20, "Chemistry", 2)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Physics"), "names the block it collides with: {msg}");
+
+        // NOTE: `BlockModal` parses this exact phrase to offer a one-tap "Move it to 11:55".
+        // Reword it and the button silently stops appearing, so the wording is pinned here.
+        assert!(
+            msg.contains("The next free slot that fits is 11:55."),
+            "must carry the machine-readable suggestion: {msg}"
+        );
+
+        // Straddling either edge is equally impossible.
+        assert!(upsert_block(&conn, &dto(DAY, "10:50", 30, "Early", 2)).is_err());
+        assert!(upsert_block(&conn, &dto(DAY, "11:50", 30, "Late", 2)).is_err());
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plan_blocks WHERE day = ?1", [DAY], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "no rejected block was written");
+    }
+
+    /// Back-to-back blocks are the normal case and must not be mistaken for a clash: the
+    /// intervals are half-open, so one ending at 12:00 and the next starting at 12:00 is fine.
+    #[test]
+    fn allows_back_to_back_blocks() {
+        let conn = test_conn();
+        upsert_block(&conn, &dto(DAY, "11:00", 60, "Physics", 3)).unwrap();
+        assert!(upsert_block(&conn, &dto(DAY, "12:00", 60, "Math", 2)).is_ok());
+        assert!(upsert_block(&conn, &dto(DAY, "10:00", 60, "Chem", 2)).is_ok());
+    }
+
+    /// Editing a block must not collide with ITSELF, and a finished block never blocks new
+    /// planning — otherwise the day becomes un-editable the moment anything is completed.
+    #[test]
+    fn conflict_check_ignores_self_and_settled_blocks() {
+        let conn = test_conn();
+        let id = upsert_block(&conn, &dto(DAY, "11:00", 60, "Physics", 3)).unwrap();
+
+        // Same block, same slot, new title: an edit, not a conflict.
+        let mut edit = dto(DAY, "11:00", 60, "Physics revised", 3);
+        edit.id = Some(id);
+        assert!(upsert_block(&conn, &edit).is_ok(), "a block cannot conflict with itself");
+
+        // Once it's done, its time is history and can be planned over.
+        set_block_status(&conn, id, "done", None).unwrap();
+        assert!(
+            upsert_block(&conn, &dto(DAY, "11:15", 30, "Recap", 2)).is_ok(),
+            "a completed block must not lock its slot forever"
+        );
+    }
+
+    /// The suggested slot has to be one the block actually FITS in, not merely the end of the
+    /// thing it hit — otherwise the one-tap fix lands on another conflict.
+    #[test]
+    fn conflict_suggests_a_slot_the_block_actually_fits() {
+        let conn = test_conn();
+        upsert_block(&conn, &dto(DAY, "11:00", 60, "A", 2)).unwrap(); // 11:00–12:00
+        upsert_block(&conn, &dto(DAY, "12:00", 30, "B", 2)).unwrap(); // 12:00–12:30
+
+        // A 60-minute block at 11:30 hits A; 12:00 is free of A but B is there, so the answer
+        // must skip past B to 12:30.
+        let c = find_conflict(&conn, DAY, 11 * 60 + 30, 60, None).unwrap().unwrap();
+        assert_eq!(c.title, "A", "reports the first thing it hits");
+        assert_eq!(c.next_free.as_deref(), Some("12:30"));
     }
 
     /// Window precedence: per-day override → global setting → built-in default.

@@ -91,6 +91,29 @@ export default function TodayTab({ schedule }: Props) {
     setModalOpen(true);
   };
 
+  /**
+   * Start a block AND take the student to the work.
+   *
+   * `startBlock` alone only flips the status, which from the student's side looks like the button
+   * does nothing — the reported "dead Play button". Starting a block is a statement of intent
+   * ("I am doing this now"), so the useful completion of that intent is to open what they're
+   * meant to be working on:
+   *
+   *   * a linked lesson  → straight into the player;
+   *   * a course         → that course, so they pick the next lesson themselves (we deliberately
+   *                        don't auto-pick: guessing wrong wastes more time than choosing);
+   *   * freeform         → nowhere to go, so stay put. The status change is the whole action, and
+   *                        the block visibly turns active.
+   */
+  const startAndOpen = async (b: PlanBlock) => {
+    await startBlock(b);
+    if (b.target_material_id != null) {
+      navigate(`/library/material/${b.target_material_id}`, { state: { source: "courses" } });
+    } else if (b.target_node_id != null) {
+      navigate(`/courses/${b.target_node_id}`);
+    }
+  };
+
   const laidOut = useMemo(() => layoutBlocks(blocks), [blocks]);
   const remaining = useMemo(
     () =>
@@ -125,7 +148,7 @@ export default function TodayTab({ schedule }: Props) {
             stopMins={stopMins}
             laidOut={laidOut}
             onEdit={openBlock}
-            onStart={(b) => void startBlock(b)}
+            onStart={(b) => void startAndOpen(b)}
             onStatus={(b, s) => void setStatus(b, s)}
             onOpenMaterial={(id) =>
               navigate(`/library/material/${id}`, { state: { source: "courses" } })
@@ -144,7 +167,7 @@ export default function TodayTab({ schedule }: Props) {
           blocks={blocks}
           nowMins={nowMins}
           isToday={isToday}
-          onStart={(b) => void startBlock(b)}
+          onStart={(b) => void startAndOpen(b)}
           onEdit={openBlock}
         />
         {/* Closes the loop on commitments. Necessary because `UpNextCard` lists only OPEN
@@ -161,7 +184,7 @@ export default function TodayTab({ schedule }: Props) {
         onClose={() => setModalOpen(false)}
         day={day}
         block={editBlock}
-        onSave={(input) => void saveBlock(input)}
+        onSave={saveBlock}
         onDelete={(b) => void removeBlock(b)}
       />
 
