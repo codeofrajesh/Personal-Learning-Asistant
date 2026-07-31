@@ -27,7 +27,7 @@ use crate::utils::errors::{AppError, AppResult};
 
 /// Guard against a malformed `day` reaching the queries. `YYYY-MM-DD` only — a loose string
 /// would silently create a phantom day row that never matches anything the UI reads back.
-fn validate_day(day: &str) -> AppResult<()> {
+pub(crate) fn validate_day(day: &str) -> AppResult<()> {
     let b = day.as_bytes();
     let shaped = b.len() == 10
         && b[4] == b'-'
@@ -211,9 +211,11 @@ pub fn reconcile_plan(db: State<'_, Db>, today: String) -> AppResult<i64> {
 /// There is intentionally no lifetime "Overall" figure — after a bad month it becomes
 /// mathematically unrecoverable, turning feedback into a permanent indictment. Rolling-90 always
 /// recovers.
+/// `today` is the caller's LOCAL date — see `queries::score_window` for why it isn't `date('now')`.
 #[tauri::command]
-pub fn score_summary(db: State<'_, Db>) -> AppResult<Vec<ScoreWindow>> {
-    db.with(|conn| queries::score_summary(conn))
+pub fn score_summary(db: State<'_, Db>, today: String) -> AppResult<Vec<ScoreWindow>> {
+    validate_day(&today)?;
+    db.with(|conn| queries::score_summary(conn, &today))
 }
 
 // ── Durable reminder ledger ──────────────────────────────────────────────────

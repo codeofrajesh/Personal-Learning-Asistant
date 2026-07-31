@@ -265,9 +265,10 @@ export const ipc = {
     return call<void>("delete_task", { id });
   },
 
-  /** Consistency summary (score, streak, per-day series) for the Planning Hub. */
-  consistencySummary(windowDays?: number): Promise<ConsistencySummary> {
-    return call<ConsistencySummary>("consistency_summary", { windowDays });
+  /** Consistency summary (score, streak, per-day series) for the Planning Hub.
+   *  `today` is the caller's LOCAL date — the window is anchored on it, not on UTC. */
+  consistencySummary(today: string, windowDays?: number): Promise<ConsistencySummary> {
+    return call<ConsistencySummary>("consistency_summary", { today, windowDays });
   },
 
   // ── Planning / Scheduling / Intelligence (v9 — commands::plan) ──────────────
@@ -360,9 +361,11 @@ export const ipc = {
     return call<number>("reconcile_plan", { today });
   },
 
-  /** Score drill-down: Today / Week / Month / Rolling 90 (no lifetime figure by design). */
-  scoreSummary(): Promise<ScoreWindow[]> {
-    return call<ScoreWindow[]>("score_summary");
+  /** Score drill-down: Today / Week / Month / Rolling 90 (no lifetime figure by design).
+   *  `today` is the caller's LOCAL date — a UTC anchor would drop the student's evening
+   *  out of the "Today" window west of Greenwich. */
+  scoreSummary(today: string): Promise<ScoreWindow[]> {
+    return call<ScoreWindow[]>("score_summary", { today });
   },
 
   // ── Durable reminder ledger (v9 `reminder_state`) ───────────────────────────

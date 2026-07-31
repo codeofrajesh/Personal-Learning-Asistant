@@ -10,6 +10,7 @@
 
 import { memo } from "react";
 import { Flame } from "lucide-react";
+import { dayHasSignal } from "./useScoreReview";
 import type { ConsistencyDay } from "../../lib/types";
 
 const RADIUS = 46;
@@ -23,9 +24,11 @@ function status(score: number): { label: string; color: string } {
   return { label: "Building", color: "text-orange" };
 }
 
-/** Build an SVG polyline path for the score trend (days with signal only). */
+/** Build an SVG polyline path for the score trend (days with signal only).
+ *  Shares `dayHasSignal` with the heatmap and the backend, so a schedule-only day appears on
+ *  the trend line instead of being silently dropped from it. */
 function trendPath(days: ConsistencyDay[], w: number, h: number): string {
-  const pts = days.filter((d) => d.tasks_due > 0 || d.study_minutes > 0);
+  const pts = days.filter(dayHasSignal);
   if (pts.length < 2) return "";
   const stepX = w / (pts.length - 1);
   return pts

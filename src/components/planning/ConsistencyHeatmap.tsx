@@ -15,14 +15,16 @@
 import { memo, useLayoutEffect, useRef } from "react";
 import { gsap } from "gsap";
 import { motionAllowed } from "../../lib/perfStore";
+import { dayHasSignal } from "./useScoreReview";
 import type { ConsistencyDay } from "../../lib/types";
 
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-/** Score → 0-4 intensity bucket (0 = no signal, 1 Low … 4 Best). */
+/** Score → 0-4 intensity bucket (0 = no signal, 1 Low … 4 Best).
+ *  Uses the SHARED signal test: a day where the student planned and worked a schedule but had
+ *  no deadline due used to render as an empty cell, which reads as "did nothing". */
 function bucket(d: ConsistencyDay): number {
-  const hasSignal = d.tasks_due > 0 || d.study_minutes > 0;
-  if (!hasSignal) return 0;
+  if (!dayHasSignal(d)) return 0;
   if (d.score >= 85) return 4;
   if (d.score >= 60) return 3;
   if (d.score >= 35) return 2;

@@ -100,8 +100,10 @@ pub fn delete_task(db: State<'_, Db>, id: i64) -> AppResult<()> {
 #[tauri::command]
 pub fn consistency_summary(
     db: State<'_, Db>,
+    today: String,
     window_days: Option<i64>,
 ) -> AppResult<ConsistencySummary> {
     let days = window_days.unwrap_or(91);
-    db.with(|conn| queries::consistency_summary(conn, days))
+    crate::commands::plan::validate_day(&today)?;
+    db.with(|conn| queries::consistency_summary(conn, &today, days))
 }

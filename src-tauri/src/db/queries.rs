@@ -2187,6 +2187,15 @@ pub struct ConsistencyDay {
     pub tasks_completed_late: i64,
     pub tasks_missed: i64,
     pub study_minutes: f64,
+    // v9 schedule adherence. Carried per-day so the weekly review can say *which* days the
+    // schedule held, not just what the week averaged — "Tuesday and Thursday are where it
+    // slipped" is actionable, "72% adherence" is not.
+    pub blocks_planned: i64,
+    pub blocks_completed: i64,
+    pub planned_minutes: f64,
+    pub executed_minutes: f64,
+    /// 0-100, `None` when nothing was planned that day (absence of a plan is not a failure).
+    pub adherence: Option<f64>,
 }
 
 /// Compute a 0-100 consistency score from a day's facts.
@@ -2346,8 +2355,19 @@ pub struct ScoreWindow {
     pub blocks_completed: i64,
 }
 
-/// Compute one trailing window. `days` is inclusive of today.
-pub fn score_window(conn: &Connection, label: &str, days: i64) -> AppResult<ScoreWindow> {
+/// Compute one trailing window ending on `today` (inclusive), where `today` is the caller's
+/// LOCAL date.
+///
+/// `today` is a parameter rather than `date('now')` for the same reason every planner command
+/// takes `day`: SQLite's `date('now')` is UTC, so west of Greenwich after 17:00 local the "Today"
+/// window would silently mean tomorrow and read as empty — the student's whole day missing from
+/// their own score.
+pub fn score_window(
+    conn: &Connection,
+    today: &str,
+    label: &str,
+    days: i64,
+) -> AppResult<ScoreWindow> {
     let offset = format!("-{} days", days.max(1) - 1);
     let (score, counted, study, planned, completed): (
         Option<f64>,
@@ -2363,9 +2383,9 @@ pub fn score_window(conn: &Connection, label: &str, days: i64) -> AppResult<Scor
             COALESCE(SUM(blocks_planned), 0),
             COALESCE(SUM(blocks_completed), 0)
          FROM consistency_log
-         WHERE day >= date('now', ?1)
+         WHERE day >= date(?1, ?2) AND day <= ?1
            AND (tasks_due > 0 OR study_minutes > 0 OR blocks_planned > 0)",
-        [offset],
+        rusqlite::params![today, offset],
         |r| {
             Ok((
                 r.get(0)?,
@@ -2393,12 +2413,12 @@ pub fn score_window(conn: &Connection, label: &str, days: i64) -> AppResult<Scor
 /// There is intentionally NO lifetime "Overall" score. After a bad month a lifetime average
 /// becomes mathematically unrecoverable, which turns feedback into a permanent indictment and
 /// is a well-known driver of study-app abandonment. Rolling-90 always recovers.
-pub fn score_summary(conn: &Connection) -> AppResult<Vec<ScoreWindow>> {
+pub fn score_summary(conn: &Connection, today: &str) -> AppResult<Vec<ScoreWindow>> {
     Ok(vec![
-        score_window(conn, "Today", 1)?,
-        score_window(conn, "Week", 7)?,
-        score_window(conn, "Month", 30)?,
-        score_window(conn, "Rolling 90", 90)?,
+        score_window(conn, today, "Today", 1)?,
+        score_window(conn, today, "Week", 7)?,
+        score_window(conn, today, "Month", 30)?,
+        score_window(conn, today, "Rolling 90", 90)?,
     ])
 }
 
@@ -2477,21 +2497,38 @@ pub struct ConsistencySummary {
     pub enabled: bool,
 }
 
-/// Read the consistency summary for the last `window_days` days.
-pub fn consistency_summary(conn: &Connection, window_days: i64) -> AppResult<ConsistencySummary> {
+/// Did this day carry any signal at all?
+///
+/// ONE definition, shared by the weighted average, the streak, and `score_window`'s SQL filter.
+/// These had drifted apart: the summary tested only `tasks_due`/`study_minutes`, so a day where
+/// the student planned and worked a full schedule but had no deadline due counted as *neutral*
+/// here while counting toward the score windows — the same table reporting two different
+/// answers for whether a day mattered. `blocks_planned` is the third signal.
+fn day_has_signal(d: &ConsistencyDay) -> bool {
+    d.tasks_due > 0 || d.study_minutes > 0.0 || d.blocks_planned > 0
+}
+
+/// Read the consistency summary for the `window_days` days ending on `today` (the caller's
+/// LOCAL date — see `score_window` for why this is not `date('now')`).
+pub fn consistency_summary(
+    conn: &Connection,
+    today: &str,
+    window_days: i64,
+) -> AppResult<ConsistencySummary> {
     let enabled = get_setting(conn, "consistency.enabled")?
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
     let mut stmt = conn.prepare(
         "SELECT day, score, tasks_due, tasks_completed_on_time, tasks_completed_late,
-                tasks_missed, study_minutes
+                tasks_missed, study_minutes, blocks_planned, blocks_completed,
+                planned_minutes, executed_minutes, adherence
          FROM consistency_log
-         WHERE day >= date('now', ?1)
+         WHERE day >= date(?1, ?2) AND day <= ?1
          ORDER BY day",
     )?;
     let offset = format!("-{} days", window_days.max(1) - 1);
-    let rows = stmt.query_map([offset], |r| {
+    let rows = stmt.query_map(rusqlite::params![today, offset], |r| {
         Ok(ConsistencyDay {
             day: r.get(0)?,
             score: r.get(1)?,
@@ -2500,6 +2537,11 @@ pub fn consistency_summary(conn: &Connection, window_days: i64) -> AppResult<Con
             tasks_completed_late: r.get(4)?,
             tasks_missed: r.get(5)?,
             study_minutes: r.get(6)?,
+            blocks_planned: r.get(7)?,
+            blocks_completed: r.get(8)?,
+            planned_minutes: r.get(9)?,
+            executed_minutes: r.get(10)?,
+            adherence: r.get(11)?,
         })
     })?;
     let mut days = Vec::new();
@@ -2507,13 +2549,12 @@ pub fn consistency_summary(conn: &Connection, window_days: i64) -> AppResult<Con
         days.push(row?);
     }
 
-    // Trailing weighted average: only days that actually have signal (tasks due or study)
-    // count; recent days weighted heavier (linear ramp). Neutral days are skipped.
+    // Trailing weighted average: only days that actually have signal count; recent days
+    // weighted heavier (linear ramp). Neutral days are skipped.
     let mut wsum = 0.0f64;
     let mut wtot = 0.0f64;
     for (i, d) in days.iter().enumerate() {
-        let has_signal = d.tasks_due > 0 || d.study_minutes > 0.0;
-        if !has_signal {
+        if !day_has_signal(d) {
             continue;
         }
         let w = (i + 1) as f64; // more recent → larger weight
@@ -2525,8 +2566,7 @@ pub fn consistency_summary(conn: &Connection, window_days: i64) -> AppResult<Con
     // Streak: consecutive trailing days (from the end) scoring >= 60 with signal.
     let mut streak = 0i64;
     for d in days.iter().rev() {
-        let has_signal = d.tasks_due > 0 || d.study_minutes > 0.0;
-        if !has_signal {
+        if !day_has_signal(d) {
             // A neutral day neither extends nor breaks the streak — skip it.
             continue;
         }
@@ -3060,7 +3100,8 @@ mod tests {
         )
         .unwrap();
 
-        let windows = score_summary(&conn).unwrap();
+        let today_str: String = conn.query_row("SELECT date('now')", [], |r| r.get(0)).unwrap();
+        let windows = score_summary(&conn, &today_str).unwrap();
         let labels: Vec<&str> = windows.iter().map(|w| w.label.as_str()).collect();
         assert_eq!(labels, vec!["Today", "Week", "Month", "Rolling 90"]);
         assert!(
@@ -3076,6 +3117,88 @@ mod tests {
         let week = &windows[1];
         assert_eq!(week.counted_days, 2, "the zero-signal day is skipped");
         assert_eq!(week.score, Some(70.0));
+    }
+
+    /// A day where the student planned and worked a schedule but had no deadline due is NOT
+    /// neutral. The summary used to test only `tasks_due`/`study_minutes`, so such a day was
+    /// skipped by the streak and the weighted average while still counting toward
+    /// `score_window` — the same table giving two answers for whether a day mattered.
+    #[test]
+    fn schedule_only_days_carry_signal_in_the_summary() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, study_minutes, score, blocks_planned)
+             VALUES ('2026-03-15', 0, 0, 80.0, 3)",
+            [],
+        )
+        .unwrap();
+
+        let s = consistency_summary(&conn, "2026-03-15", 7).unwrap();
+        assert_eq!(s.score, Some(80.0), "a planned-and-worked day is signal");
+        assert_eq!(s.streak, 1, "and it extends the streak");
+
+        // The score windows must agree with the summary on the very same row.
+        let w = score_summary(&conn, "2026-03-15").unwrap();
+        assert_eq!(w[0].score, Some(80.0));
+        assert_eq!(w[0].counted_days, 1);
+    }
+
+    /// A genuinely empty day stays neutral — it must not drag the average down or reset a streak.
+    #[test]
+    fn fully_neutral_days_stay_neutral_in_the_summary() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, study_minutes, score, blocks_planned)
+             VALUES ('2026-03-14', 2, 0, 90.0, 0), ('2026-03-15', 0, 0, 0.0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let s = consistency_summary(&conn, "2026-03-15", 7).unwrap();
+        assert_eq!(s.score, Some(90.0), "the empty day is skipped, not averaged in");
+        assert_eq!(s.streak, 1, "and it neither extends nor breaks the streak");
+    }
+
+    /// The heatmap window is anchored on the caller's local date too, and must not include
+    /// future rows.
+    #[test]
+    fn consistency_summary_anchors_on_the_callers_local_day() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, score)
+             VALUES ('2026-03-14', 2, 90.0), ('2026-03-15', 2, 50.0)",
+            [],
+        )
+        .unwrap();
+
+        let s = consistency_summary(&conn, "2026-03-14", 7).unwrap();
+        assert_eq!(s.days.len(), 1, "a later day is not in a trailing window");
+        assert_eq!(s.days[0].day, "2026-03-14");
+    }
+
+    /// Windows are anchored on the caller's LOCAL date, not `date('now')` (UTC). West of
+    /// Greenwich in the evening those differ, and a UTC anchor would drop the student's whole
+    /// day out of "Today" — the score would read empty exactly when they'd just done the work.
+    #[test]
+    fn score_windows_anchor_on_the_callers_local_day() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO consistency_log(day, tasks_due, score)
+             VALUES ('2026-03-14', 2, 90.0), ('2026-03-15', 2, 50.0)",
+            [],
+        )
+        .unwrap();
+
+        // Anchored on the 14th, the 15th is in the FUTURE and must not be counted.
+        let w = score_summary(&conn, "2026-03-14").unwrap();
+        assert_eq!(w[0].score, Some(90.0), "Today = the anchor day");
+        assert_eq!(w[1].counted_days, 1, "a later day is not in a trailing window");
+
+        // Anchored on the 15th, both days are in the trailing week.
+        let w = score_summary(&conn, "2026-03-15").unwrap();
+        assert_eq!(w[0].score, Some(50.0));
+        assert_eq!(w[1].counted_days, 2);
+        assert_eq!(w[1].score, Some(70.0));
     }
 
     /// The blended score: both signals average, one signal stands alone, neither is neutral.

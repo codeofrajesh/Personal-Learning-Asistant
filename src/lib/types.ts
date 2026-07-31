@@ -219,6 +219,14 @@ export interface ConsistencyDay {
   tasks_completed_late: number;
   tasks_missed: number;
   study_minutes: number;
+  /** v9 schedule adherence, carried per-day so the weekly review can name WHICH days
+   *  slipped ("Tuesday and Thursday") instead of only reporting a week average. */
+  blocks_planned: number;
+  blocks_completed: number;
+  planned_minutes: number;
+  executed_minutes: number;
+  /** 0-100, `null` when nothing was planned that day (no plan is not a failure). */
+  adherence: number | null;
 }
 
 /** Consistency summary payload (backend `ConsistencySummary`). */

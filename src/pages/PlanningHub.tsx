@@ -13,23 +13,26 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { gsap } from "gsap";
-import { LayoutDashboard, CalendarRange, CalendarClock } from "lucide-react";
+import { LayoutDashboard, CalendarRange, CalendarClock, TrendingUp } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import PlannerTab from "../components/planning/PlannerTab";
+import ReviewTab from "../components/planning/ReviewTab";
 import TodayTab from "../components/planning/TodayTab";
 import ViewTab from "../components/planning/ViewTab";
 import { usePlanningTasks } from "../components/planning/usePlanningTasks";
 import { useDayPlan } from "../components/planning/useDayPlan";
+import { useScoreReview } from "../components/planning/useScoreReview";
 import { ipc, isTauri } from "../lib/ipc";
 import { localDay } from "../lib/scheduleClock";
 import { motionAllowed } from "../lib/perfStore";
 import { cn } from "../lib/utils";
 
-type Tab = "today" | "planner" | "view";
+type Tab = "today" | "planner" | "view" | "review";
 
 export default function PlanningHub() {
   const planning = usePlanningTasks();
   const schedule = useDayPlan();
+  const review = useScoreReview();
   // Today is the default: the schedule is the thing you act on, the to-do list is the thing you
   // maintain. Opening on the list every time buries the blocks you're supposed to be doing.
   const [tab, setTab] = useState<Tab>("today");
@@ -80,6 +83,7 @@ export default function PlanningHub() {
                 { key: "today", label: "Today", icon: CalendarClock },
                 { key: "planner", label: "Planner", icon: LayoutDashboard },
                 { key: "view", label: "View", icon: CalendarRange },
+                { key: "review", label: "Review", icon: TrendingUp },
               ] as const).map((t) => (
                 <button
                   key={t.key}
@@ -109,8 +113,10 @@ export default function PlanningHub() {
           <TodayTab schedule={schedule} />
         ) : tab === "planner" ? (
           <PlannerTab planning={planning} />
-        ) : (
+        ) : tab === "view" ? (
           <ViewTab planning={planning} />
+        ) : (
+          <ReviewTab review={review} />
         )}
       </div>
     </div>

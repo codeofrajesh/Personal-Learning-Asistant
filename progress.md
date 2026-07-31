@@ -976,8 +976,60 @@ ambitious", and the card is actionable while the verdict is not.
   bad news. Apply/undo both `bumpPlanRevision()` so the reminder ladder re-arms on new starts.
 - Verified: `cargo test --lib` **83 passed**, `tsc --noEmit` clean, `npm run build` green.
 
-### 14.9 Next — Phase E onward
-- **E:** Score drill-downs (Today/Week/Month/Rolling-90) + weekly review.
+### 14.9 Phase E — DONE (score drill-down + weekly review)
+New **Review** tab (4th in the hub): four window cards, the weekly review, and the 13-week
+heatmap. `useScoreReview.ts` owns the data; `ReviewTab.tsx` is presentation.
+
+**Three backend bugs found and fixed while wiring this up** — all the same root cause as the
+planner's local-time rule, which had not been applied to the scoring layer:
+
+1. **`score_window` anchored on UTC `date('now')`.** West of Greenwich after 17:00 local, the
+   "Today" window meant *tomorrow* and read as empty — the student's whole day missing from their
+   own score, exactly when they'd just done the work. `score_summary(conn, today)` now takes the
+   caller's local date, as every planner command already did. Same fix for `consistency_summary`
+   (the heatmap window), which also now excludes future rows.
+2. **Two different definitions of "a day that mattered."** `score_window`'s SQL counted
+   `tasks_due > 0 OR study_minutes > 0 OR blocks_planned > 0`, but `consistency_summary`'s
+   weighted average and streak tested only the first two. A day where the student planned and
+   worked a full schedule with no deadline due was therefore *signal* for the score windows and
+   *neutral* for the streak — the same table giving two answers. Extracted `day_has_signal()`,
+   used by both, mirrored on the client as `dayHasSignal()` and now shared by the heatmap bucket
+   and the trend sparkline (that day used to render as an empty cell, which reads as "did
+   nothing").
+3. `ConsistencyDay` did not carry the v9 adherence columns, so no per-day schedule data reached
+   the client. Added `blocks_planned/completed`, `planned_minutes`, `executed_minutes`,
+   `adherence`. This is what lets the review name *which* days slipped instead of only reporting
+   a week average.
+
+Design decisions:
+- **`null` is never rendered as 0.** A window with no signal says "No data". Telling a new user
+  they score zero is both wrong and discouraging.
+- The review is derived on the client — every input is already in the `ConsistencySummary`
+  payload, so a new IPC command would only add a second definition of "this week".
+- **The 7-day window is sliced by DATE, not array position.** The series has gaps (a day with no
+  row simply isn't there), so positional slicing would silently compare mismatched spans.
+- **Adherence is minute-weighted, not a mean of daily percentages.** A day with one 15-min block
+  must not swing the week as hard as a day with six hours planned (verified: 105/375 = 28%, where
+  mean-of-percentages would claim 62%).
+- Weekday pattern needs >= 3 samples per weekday and >= 2 comparable weekdays, else it's a single
+  data point dressed up as an insight. Drawn from all 13 weeks: one bad Tuesday is noise.
+- `longestStreak` **skips** neutral days rather than breaking on them, matching the backend's
+  loop. A calendar-contiguity rule was implemented first and dropped: it made this number mean
+  something different from the streak on the Planner tab, and two disagreeing "streak" figures
+  are worse than either rule alone.
+- The review is allowed to say "Worse than last week." A review that only encourages is one the
+  student stops reading.
+- Verified: `cargo test --lib` **87 passed** (+3: local-day anchoring, schedule-only signal,
+  neutral-day handling). No frontend test runner exists in this project, so `buildWeeklyReview` /
+  `dayHasSignal` were verified by bundling the REAL modules with esbuild and running 22 assertions
+  (date-gap slicing, month/year rollover, minute-weighting, streak rules, sample thresholds) —
+  which is how the dead contiguity check in `longestStreak` was caught. Temp files removed.
+  `tsc --noEmit` clean, `npm run build` green.
+
+### 14.10 Next — Phase F
 - **F:** Innovations — Plan Integrity surfacing, templates UI, **exam backward-planning**,
   learned peak hours, streak insurance, Pomodoro↔block binding, focus contract.
 - **Also owed:** live smoke test of v9 against a real pre-v9 DB, plus §13.5's outstanding items.
+- **Worth doing:** a real frontend test runner (Vitest). Phase E's client-side derivations had to
+  be verified with a throwaway esbuild harness, and it found a genuine bug — that shouldn't be
+  a manual step.

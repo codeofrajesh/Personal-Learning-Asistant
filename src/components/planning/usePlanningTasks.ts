@@ -10,6 +10,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
+import { localDay } from "../../lib/scheduleClock";
 import type { ConsistencySummary, DashboardData, Task } from "../../lib/types";
 
 export interface NewTaskInput {
@@ -51,7 +52,7 @@ export function usePlanningTasks(): PlanningTasks {
     try {
       const [t, c, dash] = await Promise.all([
         ipc.listTasks(),
-        ipc.consistencySummary(),
+        ipc.consistencySummary(localDay()),
         ipc.dashboardData(),
       ]);
       setTasks(t);
@@ -105,7 +106,7 @@ export function usePlanningTasks(): PlanningTasks {
     setTasks((cur) => cur.map((t) => (t.id === task.id ? { ...t, done: next } : t)));
     try {
       await ipc.setTaskDone(task.id, next);
-      void ipc.consistencySummary().then(setConsistency).catch(() => {});
+      void ipc.consistencySummary(localDay()).then(setConsistency).catch(() => {});
     } catch {
       setTasks((cur) => cur.map((t) => (t.id === task.id ? { ...t, done: !next } : t)));
     }
