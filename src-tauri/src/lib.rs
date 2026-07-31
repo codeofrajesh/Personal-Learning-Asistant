@@ -147,6 +147,7 @@ pub fn run() {
             commands::plan::upsert_exam,
             commands::plan::delete_exam,
             commands::plan::exam_plans,
+            commands::plan::peak_hours,
             commands::plan::reconcile_plan,
             commands::plan::score_summary,
             commands::plan::claim_reminder,

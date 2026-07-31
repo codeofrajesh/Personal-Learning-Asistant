@@ -1671,6 +1671,66 @@ pub fn exam_plans(conn: &Connection, today: &str) -> AppResult<Vec<ExamPlan>> {
     Ok(out)
 }
 
+// ── Learned peak hours ───────────────────────────────────────────────────────
+
+/// One hour of the day, with how much focus the student has actually logged in it.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeakHour {
+    /// Local hour, 0..=23.
+    pub hour: i64,
+    pub total_mins: f64,
+    /// Distinct days on which any focus landed in this hour — the confidence behind the number.
+    pub days: i64,
+}
+
+/// Focus-by-hour over the trailing `days`, in the caller's LOCAL time.
+///
+/// `utc_offset_mins` is REQUIRED and comes from the frontend, because `study_sessions.started_at`
+/// is written with SQLite's `datetime('now')` — UTC. Reading `strftime('%H', started_at)` directly
+/// would report a student in UTC+5:30 as peaking five and a half hours away from when they
+/// actually study, which is worse than not offering the feature: they'd be advised to schedule
+/// their hardest work while asleep.
+///
+/// Breaks are excluded: this measures focus, and a long break at 21:00 is not a peak hour.
+pub fn peak_hours(
+    conn: &Connection,
+    utc_offset_mins: i64,
+    days: i64,
+) -> AppResult<Vec<PeakHour>> {
+    // Guard the offset: real zones span UTC-12..UTC+14, and a wild value would silently rotate
+    // the whole histogram.
+    if !(-12 * 60..=14 * 60).contains(&utc_offset_mins) {
+        return Err(AppError::Invalid(format!(
+            "utc_offset_mins {utc_offset_mins} out of range"
+        )));
+    }
+    let window = format!("-{} days", days.clamp(1, 365));
+    let shift = format!("{utc_offset_mins} minutes");
+
+    let mut stmt = conn.prepare(
+        "SELECT CAST(strftime('%H', datetime(started_at, ?1)) AS INTEGER) AS h,
+                COALESCE(SUM(duration_secs), 0) / 60.0,
+                COUNT(DISTINCT date(datetime(started_at, ?1)))
+           FROM study_sessions
+          WHERE COALESCE(session_type, 'work') = 'work'
+            AND started_at >= datetime('now', ?2)
+          GROUP BY h
+          ORDER BY h",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![shift, window], |r| {
+        Ok(PeakHour {
+            hour: r.get(0)?,
+            total_mins: r.get(1)?,
+            days: r.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Node ids with an active exam still ahead of `today`, including every ancestor of the exam's
 /// node.
 ///
@@ -2509,6 +2569,52 @@ mod tests {
             revision_days: revision,
             is_archived: false,
         }
+    }
+
+    /// Peak hours must be bucketed in LOCAL time. `started_at` is stored in UTC, so an offset
+    /// has to rotate the histogram — otherwise a student in UTC+5:30 is told they peak five and a
+    /// half hours from when they actually study, and would schedule their hardest work asleep.
+    #[test]
+    fn peak_hours_bucket_in_local_time() {
+        let conn = test_conn();
+        // 18:00 UTC.
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES(datetime('now', '-1 days', 'start of day', '+18 hours'), 3600, 'work')",
+            [],
+        )
+        .unwrap();
+
+        let utc = peak_hours(&conn, 0, 30).unwrap();
+        assert_eq!(utc.len(), 1);
+        assert_eq!(utc[0].hour, 18, "UTC reads it at 18:00");
+        assert!((utc[0].total_mins - 60.0).abs() < 0.01);
+
+        // UTC+5:30 → 23:30 local, so the same session belongs to hour 23.
+        let ist = peak_hours(&conn, 330, 30).unwrap();
+        assert_eq!(ist[0].hour, 23, "the same instant is 23:30 in UTC+5:30");
+
+        // UTC-8 → 10:00 local.
+        let pst = peak_hours(&conn, -480, 30).unwrap();
+        assert_eq!(pst[0].hour, 10);
+
+        // A nonsense offset is rejected rather than silently rotating the histogram.
+        assert!(peak_hours(&conn, 99_999, 30).is_err());
+    }
+
+    /// Breaks are not peaks: this measures focus, and a long break at 21:00 is not a good hour
+    /// to schedule hard work in.
+    #[test]
+    fn peak_hours_ignore_breaks() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES(datetime('now', '-1 days'), 1800, 'short_break'),
+                   (datetime('now', '-1 days'), 1800, 'long_break')",
+            [],
+        )
+        .unwrap();
+        assert!(peak_hours(&conn, 0, 30).unwrap().is_empty());
     }
 
     /// Exam CRUD round-trip, including the archived filter and input clamping.

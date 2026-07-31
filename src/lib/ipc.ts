@@ -29,6 +29,7 @@ import type {
   NodeCard,
   NodeCrumb,
   Note,
+  PeakHour,
   PlanBlock,
   PlanTemplate,
   PlanTemplateBlock,
@@ -362,6 +363,14 @@ export const ipc = {
    *  Idempotent: re-applying skips blocks that already exist at the same time+title. */
   applyPlanTemplate(templateId: number, day: string): Promise<number> {
     return call<number>("apply_plan_template", { templateId, day });
+  },
+
+  /** Focus-by-hour over the trailing `days`, in LOCAL time.
+   *  `utcOffsetMins` is required: sessions are stored in UTC, so without it the histogram is
+   *  rotated by the caller's offset and the advice points at the wrong hours. Note the SIGN —
+   *  `Date.getTimezoneOffset()` returns the inverse, so pass `-new Date().getTimezoneOffset()`. */
+  peakHours(utcOffsetMins: number, days?: number): Promise<PeakHour[]> {
+    return call<PeakHour[]>("peak_hours", { utcOffsetMins, days });
   },
 
   // ── Exams & backward planning (v10) ─────────────────────────────────────────

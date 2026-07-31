@@ -23,16 +23,21 @@ import {
   ArrowUpRight,
   CalendarCheck,
   Flame,
+  Sunrise,
   TrendingUp,
 } from "lucide-react";
 import ConsistencyHeatmap, { HeatmapLegend } from "./ConsistencyHeatmap";
 import { fmtMins } from "./planningUtils";
 import { dayHasSignal, type ScoreReviewState, type WeeklyReview } from "./useScoreReview";
+import { usePeakHours, type PeakHoursState } from "./usePeakHours";
 import { cn } from "../../lib/utils";
 import type { ConsistencyDay, ScoreWindow } from "../../lib/types";
 
 export default function ReviewTab({ review: state }: { review: ScoreReviewState }) {
   const { windows, summary, review, loaded } = state;
+  // Learned rhythm. Lives here rather than on Today: it's a reflective insight you act on when
+  // planning, not a control you need mid-day.
+  const peak = usePeakHours();
 
   if (loaded && windows.length === 0 && !summary) {
     return (
@@ -61,6 +66,8 @@ export default function ReviewTab({ review: state }: { review: ScoreReviewState 
       </section>
 
       {review && <WeeklyReviewCard review={review} />}
+
+      <PeakHoursCard peak={peak} />
 
       {summary && summary.days.length > 0 && (
         <section className="plan-panel rounded-[24px] border border-white/[0.06] bg-white/[0.02] p-6 shadow-2xl backdrop-blur-xl">
@@ -195,6 +202,85 @@ function WeeklyReviewCard({ review }: { review: WeeklyReview }) {
       )}
     </section>
   );
+}
+
+/**
+ * Learned peak hours. A 24-bar histogram of where focus actually landed, plus the best 2-hour
+ * window once there is enough data to make that claim.
+ *
+ * The confidence gate is the important part: with two sessions logged, "your best hour is 3am"
+ * is noise wearing a lab coat, and a student who follows it once and has a bad time stops
+ * believing anything else the app says. Below the threshold this reports how much more data it
+ * needs instead of guessing.
+ */
+function PeakHoursCard({ peak }: { peak: PeakHoursState }) {
+  const { hours, loaded, confident, bestWindow, totalMins } = peak;
+  if (!loaded || (hours.length === 0 && totalMins === 0)) return null;
+
+  const max = hours.reduce((m, h) => Math.max(m, h.total_mins), 0);
+  const byHour = new Map(hours.map((h) => [h.hour, h.total_mins]));
+
+  return (
+    <section className="plan-panel rounded-[24px] border border-white/[0.06] bg-white/[0.02] p-6 shadow-2xl backdrop-blur-xl">
+      <header className="mb-1 flex items-center gap-2">
+        <Sunrise size={16} strokeWidth={2} className="text-amber-300" aria-hidden />
+        <h2 className="text-sm font-semibold text-content-primary">When you actually focus</h2>
+      </header>
+
+      <p className="text-xs leading-relaxed text-content-secondary">
+        {confident && bestWindow ? (
+          <>
+            Your strongest stretch is{" "}
+            <strong className="font-semibold text-content-primary">
+              {hourLabel(bestWindow.startHour)}–{hourLabel(bestWindow.startHour + 2)}
+            </strong>
+            . Put the work you're most likely to avoid there, not at the end of the day.
+          </>
+        ) : (
+          `Not enough logged focus yet to call this — ${fmtMins(totalMins)} so far. Keep using the
+           timer and this fills in.`
+        )}
+      </p>
+
+      {/* 24 bars, midnight → midnight. Rendered even when not confident: the shape is honest
+          data, it's only the CONCLUSION that needs a threshold. */}
+      <div className="mt-4 flex items-end gap-[3px]" aria-hidden>
+        {Array.from({ length: 24 }, (_, h) => {
+          const mins = byHour.get(h) ?? 0;
+          const frac = max > 0 ? mins / max : 0;
+          const inBest =
+            confident &&
+            bestWindow != null &&
+            (h === bestWindow.startHour || h === bestWindow.startHour + 1);
+          return (
+            <div key={h} className="flex flex-1 flex-col items-center gap-1">
+              <div className="flex h-16 w-full items-end">
+                <div
+                  className={cn(
+                    "w-full rounded-[2px] transition-[height]",
+                    inBest ? "bg-lime" : mins > 0 ? "bg-lime/35" : "bg-white/[0.05]",
+                  )}
+                  style={{ height: `${Math.max(mins > 0 ? 6 : 2, frac * 100)}%` }}
+                  title={`${hourLabel(h)}: ${fmtMins(mins)}`}
+                />
+              </div>
+              {h % 6 === 0 && (
+                <span className="text-[0.52rem] tabular-nums text-white/30">{hourLabel(h)}</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+/** 0-24 → "12am" / "9am" / "3pm". */
+function hourLabel(hour: number): string {
+  const h = ((hour % 24) + 24) % 24;
+  if (h === 0) return "12am";
+  if (h === 12) return "12pm";
+  return h > 12 ? `${h - 12}pm` : `${h}am`;
 }
 
 /** Direction of travel against the previous 7 days. */

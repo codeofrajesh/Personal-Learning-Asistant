@@ -20,7 +20,7 @@
 use tauri::State;
 
 use crate::db::plan::{
-    self, BlockInputDto, DayPlan, Exam, ExamInputDto, ExamPlan, PlanBlock, PlanTemplate,
+    self, BlockInputDto, DayPlan, Exam, ExamInputDto, ExamPlan, PeakHour, PlanBlock, PlanTemplate,
     PlanTemplateBlock, ReminderState, TemplateBlockInputDto, TemplateInputDto,
 };
 use crate::db::queries::{self, ScoreWindow};
@@ -261,6 +261,21 @@ pub fn suggested_plan_template(
     weekday: i64,
 ) -> AppResult<Option<PlanTemplate>> {
     db.with(|conn| plan::suggested_template(conn, weekday))
+}
+
+/// Focus-by-hour over the trailing `days`, in the caller's LOCAL time.
+///
+/// `utc_offset_mins` is required, not optional: `study_sessions.started_at` is stored in UTC, so
+/// bucketing by `strftime('%H')` alone would tell a student in UTC+5:30 that they peak five and a
+/// half hours from when they actually study.
+#[tauri::command]
+pub fn peak_hours(
+    db: State<'_, Db>,
+    utc_offset_mins: i64,
+    days: Option<i64>,
+) -> AppResult<Vec<PeakHour>> {
+    let window = days.unwrap_or(60);
+    db.with(|conn| plan::peak_hours(conn, utc_offset_mins, window))
 }
 
 // ── Exams & backward planning (v10) ──────────────────────────────────────────

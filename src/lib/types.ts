@@ -545,6 +545,17 @@ export interface DayPlan {
   adjust_state: string | null;
 }
 
+/** One hour of the day with the focus actually logged in it (backend `PeakHour`).
+ *  Bucketed in LOCAL time - `study_sessions.started_at` is UTC, so the caller must send its
+ *  offset or a UTC+5:30 student is told they peak while asleep. */
+export interface PeakHour {
+  /** Local hour, 0-23. */
+  hour: number;
+  total_mins: number;
+  /** Distinct days any focus landed in this hour - the confidence behind the number. */
+  days: number;
+}
+
 // ── Exams & backward planning (v10) ─────────────────────────────────────────
 
 /** A dated exam attached to a course subtree (backend `Exam`). */
