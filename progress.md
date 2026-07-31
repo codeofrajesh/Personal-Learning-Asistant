@@ -761,3 +761,131 @@ sections with correct membership; (b) **pin/unpin** a course from a hub card and
 (v8 column); (c) each **Explore ›** opens the right full list; search/sort/filter chips work;
 (d) drill a node from "All Courses" still works (explorer unchanged); (e) **Lite tier**: hub
 + Explore have zero entrance motion / hover scale; (f) v8 migration on a real pre-v8 DB.
+
+---
+
+## 14. Planning, Scheduling & Intelligence System (schema v9)
+
+Time-blocked scheduling with an Intelligent Adjustment engine, an advisory pre-mortem, learned
+pace, and schedule-adherence scoring. **Phases A + B (backend) are DONE**: `cargo test --lib`
+**74/74** green (was 14), zero warnings; `npm run build` + `tsc --noEmit` clean. Phases C–F
+(frontend) are not started.
+
+### 14.0 Architectural decisions (pushbacks accepted by the user)
+These were argued *against* the original brief and approved — they are load-bearing, not
+preferences:
+1. **Propose, never auto-reschedule.** The engine emits named, previewable plans; nothing moves
+   without a tap, and Apply is undoable. Silent mutation is why users distrust Motion-style
+   tools — for a student who woke up late, a rewritten day looks like data loss.
+2. **No lifetime "Overall" score.** After a bad month a lifetime average is mathematically
+   unrecoverable, turning feedback into a permanent indictment (a known driver of study-app
+   abandonment). Replaced with **Rolling 90**, which always recovers.
+3. **Week/Month are DERIVED, not stored.** `consistency_log` is already one row/day, so windows
+   are a sub-millisecond `GROUP BY`. No second write path to keep in sync.
+4. **Blocks ≠ Tasks (separate tables).** A block is a time *intention*; a task is a
+   *deliverable*. One task can span several blocks, and a block can target a *quantity*
+   ("2 lectures of Physics"). Cramming this into `tasks` would either duplicate rows or destroy
+   the plan-vs-outcome distinction that makes adherence measurable at all.
+5. **No Rust polling loop.** Reminders will be event-driven (`setTimeout` armed to the next
+   reminder, ~30 wakeups/day vs 1,440 polls) — both cheaper *and* lower-latency than the
+   current 60s poll. Boot reconciliation is one-shot, mirroring `backfill_consistency`.
+6. **Inline + batched confirmation, never a modal.** A modal about a *past* block has no
+   urgency and is the fastest route to the feature being disabled.
+
+### 14.1 Backend — schema v9
+- **New tables:** `plan_blocks` (the planner), `plan_events` (append-only lifecycle ledger),
+  `plan_days` (per-day window + pre-mortem + `adjust_state`), `plan_templates` /
+  `plan_template_blocks` (routine days), `reminder_state` (**durable** dedupe), `node_velocity`
+  (learned pace). All arrive via `CREATE TABLE IF NOT EXISTS` — none existed pre-v9.
+- **`consistency_log` extended** with `blocks_planned/completed/partial/skipped`,
+  `planned_minutes`, `executed_minutes`, `adherence`, `score_version` via **guarded ALTERs**
+  (it already exists on pre-v9 DBs). `score_version` (1 = tasks only, 2 = blended) means the
+  formula can evolve without silently rewriting historical rows.
+- **Gotcha handled again:** the partial `idx_blocks_status` is created in
+  `connection.rs::migrate`, not `SCHEMA_SQL` — same trap as v8's `idx_nodes_pinned`.
+- **Time model:** local wall-clock `'HH:MM'` + `day`, **never UTC**. "6:00 AM study" means 6 AM
+  wherever the student is; UTC would jump an hour across DST. Only `plan_events.at` is absolute
+  (a real observation). Every command takes `day`/`now_mins` from the frontend, because
+  SQLite's `date('now')` is UTC and would mis-file late-evening study.
+
+### 14.2 Backend — the pure solver (`src-tauri/src/planner/`)
+- `solver.rs` is **pure**: no `Connection`, no clock, no I/O. `db::plan` reads a snapshot under
+  the mutex, **releases it**, then computes. This is the constraint that matters: the app has
+  ONE `Mutex<Connection>`, so computing while holding it would stall `save_progress` /
+  `log_session` and surface as video stutter. `now_mins` is injected, so every scenario is a
+  unit test. n ≈ 10–25 blocks → single-digit microseconds.
+- **Capacity:** `(raw_window − 5min×blocks) × 0.85` fatigue discount, with anchored blocks
+  carved out via gap inversion (overlapping anchors merged).
+- **Three strategies:** *Cascade* (preserve order, drop from the tail), *Triage* (greedy
+  knapsack on value density, then redistribute slack — usually recommended), *Compress* (scale
+  toward the floor, **drop rather than shrink** below `min_viable`).
+- **Value = `(weight+1)² × exam × spill`.** Deviation from the proposal's literal `weight²` is
+  deliberate: `weight²` makes a priority-0 block worth *exactly 0*, so it could never be
+  admitted and contributed nothing to coverage — it would vanish from every plan silently.
+  `(weight+1)²` keeps the ~16× spread while giving unprioritized work a small real voice.
+- **Ranking:** `0.6·coverage + 0.25·integrity + 0.15·continuity`; exactly one `recommended`.
+- **When everything still fits → ONE gentle shift, not three options.** Offering a "choose what
+  to sacrifice" dialog for a 20-minute sleep-in manufactures a crisis out of a non-event.
+- **Spillover, not deletion:** a dropped block is marked `spilled` and re-created next day with
+  `spilled_from_id`. The recursive spill depth **promotes** chronically-dodged work in later
+  triage — that's how avoidance of a disliked subject self-corrects.
+
+### 14.3 Backend — persistence, scoring, boot (`src-tauri/src/db/plan.rs`)
+- Block CRUD with real validation (rejects bad `HH:MM`, unknown `target_kind`/`status`,
+  zero/over-long durations, blank titles) — a wrong-but-plausible time is worse in a planner
+  than an error. One `active` block at a time; a demoted block that saw work becomes `partial`,
+  never losing progress.
+- **Window precedence:** per-day override → global setting (`plan.hard_stop` / `plan.wake`) →
+  default 06:00/22:00. An inverted window falls back rather than yielding a zero-length day.
+- **Velocity EWMA** (α=0.2, first sample trusted outright) feeds `effective_mins()`, so
+  estimates become personal. Degenerate samples ignored.
+- **Adherence** = 50% completion (partial = half) + 30% time-on-task + 20% punctuality
+  (from the append-only ledger, so edits can't rewrite history). `None` when nothing was
+  planned — an unplanned day stays *neutral*, never a zero.
+- `blended_score` = 50/50 tasks+adherence when both exist, else whichever exists — so a
+  to-do-only user and a schedule-only user both get honest numbers.
+- **Boot:** `reconcile_plan_days()` closes out past days (pending → `skipped`, or `partial` if
+  work was logged) **before** `backfill_consistency` so snapshots see final states. One-shot,
+  O(days since last open), 365-day cap. Uses UTC date deliberately — it can only err toward
+  leaving a day *open* (the frontend re-reconciles with the true local date), never closing one
+  early.
+
+### 14.4 `next_up` is now NODE-NATIVE (open question #3, resolved)
+New `MAT_ROOT_CTE` replaces the `MAT_ANC_CTE` shim for scheduling: it answers only "which
+course is this material in?" instead of manufacturing a goal/subject/chapter vocabulary the
+tree doesn't have. `NextUpItem` now carries `node_id`/`node_name` (immediate folder) +
+`root_id`/`root_name` (course). **Breaking DTO change** — `types.ts`, `NextUp.tsx`,
+`PlannerTab.tsx` updated. `MAT_ANC_CTE` still serves the library/dashboard DTOs.
+
+### 14.5 Files touched
+- **New:** `src-tauri/src/planner/mod.rs` (wall-clock helpers), `src-tauri/src/planner/solver.rs`
+  (pure engine, 25 tests), `src-tauri/src/db/plan.rs` (persistence, 22 tests),
+  `src-tauri/src/commands/plan.rs` (14 commands).
+- **Backend:** `db/schema.rs` (v9), `db/connection.rs` (migration + pre-v9 test),
+  `db/queries.rs` (`MAT_ROOT_CTE`, node-native `next_up`, `blended_score`, `score_window`,
+  `score_summary`, adherence in `snapshot_day`, 5 tests), `db/mod.rs`, `commands/mod.rs`,
+  `lib.rs` (module + boot reconcile + 14 registrations).
+- **Frontend (DTO absorption only):** `lib/types.ts`, `components/dashboard/NextUp.tsx`,
+  `components/planning/PlannerTab.tsx`.
+
+### 14.6 Command surface (registered, untested live)
+`plan_day`, `upsert_plan_block`, `delete_plan_block`, `set_plan_block_status`,
+`start_plan_block`, `active_plan_block`, `set_plan_day_window`, `recovery_plans` (**read-only**),
+`apply_recovery` (→ undo token), `undo_recovery`, `dismiss_recovery`, `apply_plan_template`,
+`reconcile_plan`, `score_summary`.
+
+### 14.7 Next — Phase C onward (frontend, not started)
+- **C:** Today view (blocks, **CSS-animated now-line** — `animation: sweep 86400s linear` with a
+  negative delay, zero JS per frame so it can't jitter during playback), one `scheduleClock`
+  store replacing both the 60s reminder poll and `PlannerTab`'s 1 Hz whole-subtree re-render,
+  reminder escalation ladder, durable dedupe via `reminder_state`, reuse `playChime()` for block
+  starts (approved). **Must fix:** `ToastHost` (bottom-right) currently collides with
+  `MiniPlayer` (also bottom-right, with a clip-path hole punched through AppShell for the mpv
+  surface) — offset toasts upward when `useMiniPlayer(s => s.rect)` is non-null, or reminders
+  will cover the video.
+- **D:** Recovery Card (inline, never a modal; suppressed during fullscreen video; one prompt
+  per drift event via `plan_days.adjust_state`; 10s Undo).
+- **E:** Score drill-downs (Today/Week/Month/Rolling-90) + weekly review.
+- **F:** Innovations — Plan Integrity surfacing, templates UI, **exam backward-planning**,
+  learned peak hours, streak insurance, Pomodoro↔block binding, focus contract.
+- **Also owed:** live smoke test of v9 against a real pre-v9 DB, plus §13.5's outstanding items.
