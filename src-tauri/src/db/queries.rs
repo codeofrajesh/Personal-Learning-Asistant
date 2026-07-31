@@ -1537,6 +1537,23 @@ pub fn save_progress(
     let completed = duration_secs > 0.0 && (position_secs / duration_secs) >= COMPLETION_THRESHOLD;
     let completed_i = i64::from(completed);
 
+    // Was this material ALREADY finished before this save? This is the difference between an
+    // event and a state, and the planner needs the event: `save_progress` keeps firing every few
+    // seconds while a finished video plays out its last frames, so crediting "an item is done" on
+    // every call would race a "2 lectures" block to completion inside a minute. Read it before
+    // the write, credit only on the false → true transition.
+    let was_completed: bool = conn
+        .query_row(
+            "SELECT COALESCE(MAX(w.completed), MAX(m.is_completed), 0)
+               FROM materials m LEFT JOIN watch_progress w ON w.material_id = m.id
+              WHERE m.id = ?1",
+            [material_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|v| v != 0)
+        .unwrap_or(false);
+
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO watch_progress(material_id, position_secs, duration_secs, completed, last_watched_at, watch_count)
@@ -1558,6 +1575,15 @@ pub fn save_progress(
         )?;
     }
     tx.commit()?;
+
+    // The missing event hook (the Phase C disconnect). Watching a lecture to the end updated the
+    // course database and told the SCHEDULE nothing, so a "2 lectures of Physics" block sat at
+    // zero while both lectures were finished. Credited after the commit and only on the
+    // transition: the watch progress is the user-visible outcome, so planner bookkeeping is
+    // best-effort by the same contract as `plan::log_event` and must never roll it back.
+    if completed && !was_completed {
+        let _ = crate::db::plan::attribute_completion(conn, material_id);
+    }
     Ok(())
 }
 
@@ -1595,7 +1621,7 @@ pub fn mark_complete(conn: &mut Connection, material_id: i64, completed: bool) -
 /// as study time in the activity/streak aggregates (breaks are recorded but excluded
 /// there — see `weekly_activity`/`active_days`).
 ///
-/// ## Block binding (v9)
+/// ## Block binding (v9, funnelled through `plan::attribute_time`)
 ///
 /// A `work` session also credits the currently ACTIVE plan block's `executed_mins`. Before
 /// this, `add_executed_mins` was called from NOWHERE but tests — its own doc comment claimed
@@ -1608,6 +1634,11 @@ pub fn mark_complete(conn: &mut Connection, material_id: i64, completed: bool) -
 ///
 /// Breaks are deliberately excluded: time on a break is not time on task, and counting it
 /// would let a student score full adherence by starting a block and walking away.
+///
+/// The credit itself now goes through `plan::attribute_time`, which shares the "does the active
+/// block cover this material?" test with item-completion credit. A Pomodoro phase passes
+/// `material_id: None` and is always credited — the timer targets no file, and pressing Start is
+/// the student's whole claim.
 pub fn log_study_session(
     conn: &Connection,
     material_id: Option<i64>,
@@ -1629,10 +1660,15 @@ pub fn log_study_session(
 
     // Best-effort by contract, exactly like `plan::log_event`: the session row is the
     // user-visible outcome and must not be rolled back because the planner credit failed.
+    //
+    // Routed through `plan::attribute_time` rather than crediting `active_block` directly, so the
+    // "does the running block actually cover this material?" rule lives in ONE place with the
+    // item-completion rule. A session on a material the active block does not target is still
+    // recorded here (the dashboard's activity chart and streak are about real study time) — only
+    // the schedule declines to claim it, because adherence is the signal the recovery engine
+    // trusts and a false credit there is worse than none.
     if stype == "work" {
-        if let Ok(Some(block)) = crate::db::plan::active_block(conn) {
-            let _ = crate::db::plan::add_executed_mins(conn, block.id, seconds / 60.0);
-        }
+        let _ = crate::db::plan::attribute_time(conn, material_id, seconds / 60.0);
     }
     Ok(())
 }
@@ -3336,6 +3372,57 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM study_sessions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Watching a video to the end must credit ONE item to the active block, and the flood of
+    /// `save_progress` calls that follows must not credit any more.
+    ///
+    /// This is the gate that makes item-tracking usable at all: the player keeps flushing
+    /// progress every few seconds while a finished video sits at its last frame, so counting
+    /// per-call would race a "2 lectures" block to done inside a minute. The transition is read
+    /// BEFORE the write, so only the first crossing counts.
+    #[test]
+    fn completing_a_material_credits_the_block_exactly_once() {
+        let mut conn = test_conn();
+        let day: String = conn.query_row("SELECT date('now')", [], |r| r.get(0)).unwrap();
+        let node = upsert_root_node(&conn, "Physics").unwrap();
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                   duration_secs)
+             VALUES(?1, '/p/1.mp4', '1.mp4', 'video', 'mp4', 600)",
+            [node],
+        )
+        .unwrap();
+        let mat = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO plan_blocks(day, planned_start, planned_mins, title, status,
+                                     target_kind, target_node_id, target_count)
+             VALUES(?1, '06:00', 60, 'Physics', 'active', 'node_count', ?2, 3)",
+            rusqlite::params![&day, node],
+        )
+        .unwrap();
+
+        // Mid-video saves are progress, not completion.
+        save_progress(&mut conn, mat, 100.0, 600.0).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT progress_count FROM plan_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "half-watched is not an item");
+
+        // Crossing the completion threshold credits exactly one.
+        save_progress(&mut conn, mat, 595.0, 600.0).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT progress_count FROM plan_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "finishing the lecture ticks the block");
+
+        // The trailing flushes on an already-finished video must add nothing.
+        save_progress(&mut conn, mat, 598.0, 600.0).unwrap();
+        save_progress(&mut conn, mat, 600.0, 600.0).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT progress_count FROM plan_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "completion is an event, not a state re-reported");
     }
 
     /// `nodes_in_progress` returns only roots with 0 < completed < total; `recent_nodes`

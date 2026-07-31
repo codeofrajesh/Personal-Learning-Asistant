@@ -52,6 +52,7 @@ import {
   fmtMins,
   isBlockOpen,
 } from "./planningUtils";
+import { intervalBox, layoutIntervals } from "./timelineLayout";
 import { hhmmToMins, useScheduleClock } from "../../lib/scheduleClock";
 import { motionAllowed } from "../../lib/perfStore";
 import { cn } from "../../lib/utils";
@@ -326,45 +327,40 @@ function EmptyDay({
 
 // ── Axis + blocks ────────────────────────────────────────────────────────────
 
-type Laid = { block: PlanBlock; startMins: number; lane: number; laneCount: number };
+type Laid = { block: PlanBlock; startMins: number; col: number; span: number; cols: number };
 
-/** Greedy interval partitioning — concurrent blocks sit side by side instead of overlapping. */
+/**
+ * Place the day's blocks with the shared calendar geometry engine.
+ *
+ * The rank argument is the part specific to this surface: OPEN work claims the leftmost, widest
+ * column, so an active block sharing a slot with a skipped or finished one is the block that
+ * reads as primary. Settled work is history — it should be visible without competing.
+ */
 function layoutBlocks(blocks: PlanBlock[]): Laid[] {
-  const items = blocks
+  const intervals = blocks
     .map((block) => {
       const startMins = blockStartMins(block);
-      return startMins == null ? null : { block, startMins, end: startMins + block.effective_mins };
+      if (startMins == null) return null;
+      return {
+        key: block.id,
+        start: startMins,
+        // A zero-length block would be invisible AND collide with nothing; give it a floor so it
+        // still occupies the axis honestly.
+        end: startMins + Math.max(1, block.effective_mins),
+        rank: isBlockOpen(block) ? 0 : 1,
+        block,
+        startMins,
+      };
     })
-    .filter((x): x is { block: PlanBlock; startMins: number; end: number } => x != null)
-    .sort((a, b) => a.startMins - b.startMins || a.end - b.end);
+    .filter((x): x is NonNullable<typeof x> => x != null);
 
-  const out: Laid[] = [];
-  let group: (Laid & { end: number })[] = [];
-  let laneEnds: number[] = [];
-  let groupEnd = -1;
-
-  const flush = () => {
-    const laneCount = Math.max(1, laneEnds.length);
-    for (const g of group) out.push({ ...g, laneCount });
-    group = [];
-    laneEnds = [];
-    groupEnd = -1;
-  };
-
-  for (const item of items) {
-    if (groupEnd >= 0 && item.startMins >= groupEnd) flush();
-    let lane = laneEnds.findIndex((end) => end <= item.startMins);
-    if (lane === -1) {
-      lane = laneEnds.length;
-      laneEnds.push(item.end);
-    } else {
-      laneEnds[lane] = item.end;
-    }
-    group.push({ block: item.block, startMins: item.startMins, lane, laneCount: 1, end: item.end });
-    groupEnd = Math.max(groupEnd, item.end);
-  }
-  flush();
-  return out;
+  return layoutIntervals(intervals).map(({ item, col, span, cols }) => ({
+    block: item.block,
+    startMins: item.startMins,
+    col,
+    span,
+    cols,
+  }));
 }
 
 function DayAxis({
@@ -443,14 +439,15 @@ function DayAxis({
 
         {/* Blocks */}
         <div className="absolute inset-y-0 left-16 right-2">
-          {laidOut.map(({ block, startMins, lane, laneCount }) => (
+          {laidOut.map(({ block, startMins, col, span, cols }) => (
             <BlockCard
               key={block.id}
               block={block}
               top={(startMins / 60) * HOUR_H}
               height={Math.max(MIN_BLOCK_H, (block.effective_mins / 60) * HOUR_H - 4)}
-              lane={lane}
-              laneCount={laneCount}
+              col={col}
+              span={span}
+              cols={cols}
               nowMins={nowMins}
               isToday={isToday}
               onEdit={onEdit}
@@ -502,8 +499,9 @@ function BlockCard({
   block,
   top,
   height,
-  lane,
-  laneCount,
+  col,
+  span,
+  cols,
   nowMins,
   isToday,
   onEdit,
@@ -514,8 +512,9 @@ function BlockCard({
   block: PlanBlock;
   top: number;
   height: number;
-  lane: number;
-  laneCount: number;
+  col: number;
+  span: number;
+  cols: number;
   nowMins: number;
   isToday: boolean;
   onEdit: (b: PlanBlock) => void;
@@ -536,19 +535,26 @@ function BlockCard({
   // Executed-vs-planned, the one number that says whether the block is actually happening.
   const progress = Math.max(0, Math.min(1, block.executed_mins / Math.max(1, block.effective_mins)));
 
+  // Shared geometry (see timelineLayout): a block only loses width to blocks it genuinely
+  // overlaps, so a long block beside short ones no longer squeezes all of them.
+  const box = intervalBox({ col, span, cols });
+  // A stacked block sits ABOVE its neighbours to the left, so the layering reads as depth
+  // rather than as a rendering accident. Elevation follows column order, not status.
+  const z = 1 + col;
+
   return (
     <div
       className={cn(
         "plan-block group/blk absolute flex flex-col overflow-hidden rounded-[12px] border border-white/[0.08] bg-gradient-to-br p-2 pl-2.5 backdrop-blur-sm transition-[transform,border-color,box-shadow] duration-200 hover:border-white/[0.18] hover:shadow-[0_10px_28px_-8px_rgba(0,0,0,0.55)]",
         meta.grad,
         state === "active" && "ring-1 ring-lime/30",
+        // Narrow blocks overlap their neighbour's shadow, so give them a hard edge to sit on.
+        cols > 1 && "shadow-[0_4px_16px_-6px_rgba(0,0,0,0.7)]",
+        // Hovering a stacked block lifts it clear of whatever is drawn over it — the standard
+        // calendar affordance for reaching a partly-covered event.
+        cols > 1 && "hover:z-20",
       )}
-      style={{
-        top,
-        height,
-        left: `${(lane / laneCount) * 100}%`,
-        width: `calc(${100 / laneCount}% - 4px)`,
-      }}
+      style={{ top, height, zIndex: z, ...box }}
     >
       <span className={cn("absolute inset-y-0 left-0 w-1.5 rounded-l-[12px]", meta.rail)} aria-hidden />
 

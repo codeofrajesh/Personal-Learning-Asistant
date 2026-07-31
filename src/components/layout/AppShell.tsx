@@ -89,6 +89,14 @@ export default function AppShell() {
   // fullscreen animation that used to cause the transition lag.
   useEffect(() => subscribeFullscreen(setAppFullscreen), []);
 
+  // Chrome is only sacrificed for the VIDEO. Fullscreen exists so the transparent mpv anchor can
+  // fill the screen, which is a player concern — but the suppression was written app-wide, while
+  // the sidebar's (below) was already correctly scoped to the player route. The asymmetry was the
+  // bug: F11 or a title-bar double-click on Today / Planner / Library / Dashboard removed the top
+  // bar, and with it the running focus timer, with no video on screen to justify it. Scoped here
+  // so the timer survives fullscreen everywhere it isn't covering a video.
+  const immersive = appFullscreen && isPlayerRoute;
+
   // The Player route keeps the transparent shell + flush opaque sidebar (libmpv
   // renders behind the webview, so a floating panel / ambient canvas can't sit over
   // it). Every other route gets the unified cinematic canvas + a floating sidebar.
@@ -124,7 +132,7 @@ export default function AppShell() {
           When the docked mini-player is active, we punch a transparent notch through
           the entire AppShell (via clip-path on the root) so MPV's native surface (behind
           the webview) shows through the mini card, cutting out overlapping page content. */}
-      {floating && !appFullscreen && (
+      {floating && !immersive && (
         <div aria-hidden className="pointer-events-none absolute inset-0 -z-10">
           <div className="absolute inset-0 -z-20 bg-gradient-to-br from-[#0C0C0C] to-[#050505]" />
           {/* The two blur blobs are the premium ambient finish. `perf-blob` lets the tier
@@ -135,18 +143,21 @@ export default function AppShell() {
         </div>
       )}
 
-      {/* Sidebar — hidden entirely when the OS window is fullscreen (so the video
-          anchor fills the screen). Otherwise minimized on the player route. */}
-      {(!appFullscreen || !isPlayerRoute) && (
+      {/* Sidebar — hidden only in immersive playback (so the video anchor fills the screen).
+          Otherwise minimized on the player route. */}
+      {!immersive && (
         <Sidebar collapsed={sidebarCollapsed} onOpenSearch={openSearch} floating={floating} />
       )}
 
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* One universal top bar on every route (hidden only in OS fullscreen). It is a
-            flex sibling ABOVE the scroll container, so it stays fixed while content
-            scrolls. The strip is fully transparent on every route — only the three glass
-            pills float — including the video/PDF player. */}
-        {!appFullscreen && (
+        {/* One universal top bar on every route — and therefore the running focus timer, which is
+            the single piece of app state a student most needs to keep seeing while they work. It
+            is a flex sibling ABOVE the scroll container, so it stays fixed while content scrolls.
+            The strip is fully transparent on every route (only the three glass pills float),
+            including the video/PDF player. Hidden ONLY in immersive playback: covering a
+            fullscreen video is the one case where the timer costs more than it gives, and the
+            mini-player carries the thread back. */}
+        {!immersive && (
           <GlobalTopBar
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={toggleSidebar}

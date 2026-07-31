@@ -21,6 +21,7 @@ import {
   statusStyle, taskProgress, taskStatus, deadlineLabel, parseDue, isoDay, sameDay, fmtTime,
   blockDetail,
 } from "./planningUtils";
+import { intervalBox, layoutIntervals } from "./timelineLayout";
 import TaskGlyph from "./TaskGlyph";
 import TimelineLegend from "./TimelineLegend";
 import { motionAllowed } from "../../lib/perfStore";
@@ -48,11 +49,21 @@ type LaidOutTask = {
   start: Date;
   startH: number;
   endH: number;
-  lane: number;
-  laneCount: number;
+  col: number;
+  span: number;
+  cols: number;
 };
 
-/** Greedy interval partitioning keeps concurrent tasks visible in side-by-side lanes. */
+/**
+ * Place a day's tasks with the shared calendar geometry engine (`timelineLayout`).
+ *
+ * Same fix as the Today axis: the old pass divided width by the whole collision *cluster*, so a
+ * single long task shrank every task it brushed against — including ones that don't overlap each
+ * other. Tasks now only surrender width to tasks they genuinely intersect.
+ *
+ * Open work ranks ahead of completed work for the primary column, so a finished task never
+ * outranks the live one sharing its slot.
+ */
 function layoutDayTasks(tasks: Task[]): LaidOutTask[] {
   const intervals = tasks
     .map((task) => {
@@ -61,33 +72,32 @@ function layoutDayTasks(tasks: Task[]): LaidOutTask[] {
       const mins = task.estimated_mins && task.estimated_mins > 0 ? task.estimated_mins : 60;
       const start = new Date(due.getTime() - mins * 60000);
       const endH = due.getHours() + due.getMinutes() / 60;
-      return { task, due, start, startH: Math.max(0, endH - mins / 60), endH };
+      const startH = Math.max(0, endH - mins / 60);
+      return {
+        key: task.id,
+        // The engine works in minutes; hours are what this view renders with.
+        start: startH * 60,
+        end: Math.max(startH * 60 + 1, endH * 60),
+        rank: task.done ? 1 : 0,
+        task,
+        due,
+        startDate: start,
+        startH,
+        endH,
+      };
     })
-    .filter((item): item is Omit<LaidOutTask, "lane" | "laneCount"> => item != null)
-    .sort((a, b) => a.startH - b.startH || a.endH - b.endH);
+    .filter((item): item is NonNullable<typeof item> => item != null);
 
-  const result: LaidOutTask[] = [];
-  let group: LaidOutTask[] = [];
-  let groupEnd = -1;
-  let laneEnds: number[] = [];
-  const flush = () => {
-    const laneCount = Math.max(1, laneEnds.length);
-    for (const item of group) result.push({ ...item, laneCount });
-    group = [];
-    laneEnds = [];
-    groupEnd = -1;
-  };
-
-  for (const item of intervals) {
-    if (group.length > 0 && item.startH >= groupEnd) flush();
-    let lane = laneEnds.findIndex((end) => end <= item.startH);
-    if (lane < 0) lane = laneEnds.length;
-    laneEnds[lane] = item.endH;
-    groupEnd = Math.max(groupEnd, item.endH);
-    group.push({ ...item, lane, laneCount: 1 });
-  }
-  if (group.length > 0) flush();
-  return result;
+  return layoutIntervals(intervals).map(({ item, col, span, cols }) => ({
+    task: item.task,
+    due: item.due,
+    start: item.startDate,
+    startH: item.startH,
+    endH: item.endH,
+    col,
+    span,
+    cols,
+  }));
 }
 
 export default function CalendarTimeline({ tasks, now, onToggleDone, onOpenTask, onOpenMaterial }: Props) {
@@ -234,7 +244,7 @@ function DayGrid({
 
         {/* task blocks */}
         <div className="absolute inset-y-0 left-16 right-2">
-          {laidOutTasks.map(({ task, due, start, startH, endH, lane, laneCount }) => {
+          {laidOutTasks.map(({ task, due, start, startH, endH, col, span, cols }) => {
             const top = startH * HOUR_H;
             const height = Math.max(44, (endH - startH) * HOUR_H - 4);
             const st = taskStyle(task, now);
@@ -243,14 +253,17 @@ function DayGrid({
             // Shared with TodayTab: how many rows this height can hold without crushing them.
             const detail = blockDetail(height);
             const relative = task.done ? "Done" : deadlineLabel(task.due_at ?? "", false, now).text;
+            // Shared geometry with the Today axis (see timelineLayout).
+            const box = intervalBox({ col, span, cols });
             return (
               <div
                 key={task.id}
                 className={cn(
                   "group/blk absolute flex flex-col overflow-hidden rounded-[12px] border border-white/[0.08] bg-gradient-to-br p-2 pl-2.5 backdrop-blur-sm transition-all duration-200 hover:border-white/[0.18] hover:shadow-[0_10px_28px_-8px_rgba(0,0,0,0.55)]",
                   st.grad,
+                  cols > 1 && "shadow-[0_4px_16px_-6px_rgba(0,0,0,0.7)] hover:z-20",
                 )}
-                style={{ top, height, left: `${(lane / laneCount) * 100}%`, width: `calc(${100 / laneCount}% - 4px)` }}
+                style={{ top, height, zIndex: 1 + col, ...box }}
               >
                 <span className={cn("absolute inset-y-0 left-0 w-1.5 rounded-l-[12px]", st.rail)} aria-hidden />
 

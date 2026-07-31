@@ -718,6 +718,141 @@ pub fn active_block(conn: &Connection) -> AppResult<Option<PlanBlock>> {
     Ok(conn.query_row(&sql, [], map_block).optional()?)
 }
 
+// ── Attribution: the one funnel from observed learning to the schedule ────────
+//
+// Everything the app can OBSERVE about real study lands in exactly two places:
+// `queries::save_progress` (a material moved, and possibly finished) and
+// `queries::log_study_session` (wall time was spent). Before this, only the second one
+// reached the planner, and only for time — so "watch 2 lectures of Physics" could never
+// tick over (nothing counted items; `progress_count` was written by no code at all) and a
+// player that logged its session on unmount left the block reading 0m until you left the page.
+//
+// The two functions below are that missing hook, and they are deliberately the ONLY way
+// playback writes to `plan_blocks`. One funnel means one place where the attribution rules
+// live, instead of the player, the timer and the planner each having an opinion.
+//
+// ## Why attribution is gated on the ACTIVE block
+//
+// The tempting alternative — "find today's open block that targets this course" — cannot be
+// written correctly here. This module's contract (see the module header) is that the CALLER
+// supplies local time, because SQLite's `now` is UTC; `save_progress` and `log_study_session`
+// are playback-path commands that have no local date to give. A day-blind search would
+// cheerfully credit *tomorrow's* Physics block for tonight's watching, and the student would
+// discover it as a mysteriously pre-completed plan.
+//
+// `status = 'active'` needs no date at all. It is an invariant `start_block` already enforces
+// (at most one active block), and it carries real intent: the student pressed Start to say
+// "this is what I am doing now". That declaration is what arms tracking, which also means
+// tracking cannot silently credit work the student never claimed.
+
+/// Whether the active block's target plausibly COVERS this material.
+///
+/// Attribution has to be able to refuse. If the running block is "Physics" and the student is
+/// watching History, crediting Physics is strictly worse than crediting nothing: adherence is
+/// the number the recovery engine and the score both trust, so a false positive corrupts the
+/// one signal that is supposed to detect a day going wrong. The study session itself is still
+/// recorded either way, so the dashboard never loses the time — only the *schedule* declines it.
+///
+/// A block with no content link at all (freeform) is treated as covering anything: there is no
+/// stated target to contradict, and the student did start it deliberately.
+fn block_covers_material(conn: &Connection, block: &PlanBlock, material_id: i64) -> bool {
+    if let Some(target) = block.target_material_id {
+        return target == material_id;
+    }
+    if let Some(node) = block.target_node_id {
+        // Climb from the material's node to the root: a block on "Physics" covers a lecture
+        // filed under Physics → Waves, which is how courses are actually organised. Descending
+        // from the target would work too, but climbing touches one path instead of a subtree.
+        return conn
+            .query_row(
+                "WITH RECURSIVE up(id) AS (
+                    SELECT node_id FROM materials WHERE id = ?1
+                    UNION
+                    SELECT n.parent_id FROM nodes n JOIN up ON n.id = up.id
+                     WHERE n.parent_id IS NOT NULL
+                 )
+                 SELECT 1 FROM up WHERE id = ?2 LIMIT 1",
+                rusqlite::params![material_id, node],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some();
+    }
+    // Freeform / task-linked with no material of its own: nothing to contradict.
+    true
+}
+
+/// Credit observed minutes to the active block.
+///
+/// `material_id` is `None` for a Pomodoro focus phase — the timer targets no file, and the
+/// student's Start is the whole claim, so it credits unconditionally. That path is what the
+/// dashboard's "Counting toward …" label describes, and it must keep working.
+pub fn attribute_time(conn: &Connection, material_id: Option<i64>, mins: f64) -> AppResult<()> {
+    if mins <= 0.0 {
+        return Ok(());
+    }
+    let Some(block) = active_block(conn)? else {
+        return Ok(());
+    };
+    if let Some(mid) = material_id {
+        if !block_covers_material(conn, &block, mid) {
+            return Ok(());
+        }
+    }
+    add_executed_mins(conn, block.id, mins)
+}
+
+/// Credit ONE finished item to the active block, and auto-complete the block when its target
+/// is met.
+///
+/// Called only on the not-completed → completed TRANSITION of a material (see
+/// `queries::save_progress`). That matters: `save_progress` fires every few seconds for the rest
+/// of a finished video, and counting each of those as an item would race a 2-lecture block to
+/// "done" inside a minute.
+///
+/// This is what finally makes `progress_count` mean something. The column has existed since v9,
+/// was selected by `BLOCK_SELECT`, mapped into the DTO and exported to TypeScript — and written
+/// by nothing, which is precisely why a "2 lectures of Physics" block could watch both lectures
+/// and still sit at 0.
+pub fn attribute_completion(conn: &Connection, material_id: i64) -> AppResult<()> {
+    let Some(block) = active_block(conn)? else {
+        return Ok(());
+    };
+    if !block_covers_material(conn, &block, material_id) {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE plan_blocks SET progress_count = progress_count + 1,
+                                updated_at = datetime('now')
+         WHERE id = ?1",
+        [block.id],
+    )?;
+    let done_count = block.progress_count + 1;
+
+    // Does finishing this item finish the block? Only two target kinds can answer yes.
+    //   * `material` — the block names this one file, and it is now watched.
+    //   * `node_count` — the student asked for N items and has now finished N.
+    // `node_minutes` is explicitly NOT completed here: it is a time box, so its completion is a
+    // question about minutes, and `executed_mins` already answers it on the timeline. Marking it
+    // done because one lecture ended would cut a 90-minute study block short at 20.
+    let target_met = match block.target_kind.as_str() {
+        "material" => true,
+        "node_count" => block.target_count.is_some_and(|want| done_count >= want.max(1)),
+        _ => false,
+    };
+    if target_met {
+        // Reuse the normal status path so `completed_at`, the lifecycle event and the score all
+        // behave exactly as they do for a manual tick. Best-effort by the same contract as
+        // `log_event`: the watch progress is the user-visible outcome and must not be lost
+        // because the planner bookkeeping failed.
+        let _ = set_block_status(conn, block.id, "done", None);
+    }
+    Ok(())
+}
+
 /// Update the learned pace for a course from one observation.
 ///
 /// EWMA with α = 0.2: responsive enough to adapt within a week, damped enough that one
@@ -3664,6 +3799,197 @@ mod tests {
         let conn = test_conn();
         assert!(get_block(&conn, 424242).is_err());
         assert!(set_block_status(&conn, 424242, "done", None).is_err());
+    }
+
+    // ── Attribution: observed learning → the schedule ─────────────────────────
+
+    /// The core of the Phase C fix: finishing a lecture must tick the active block's item count.
+    /// `progress_count` existed in the schema, the SELECT, the DTO and TypeScript since v9 and
+    /// was written by NO code at all, which is exactly why "2 lectures of Physics" could watch
+    /// both lectures and still read 0.
+    #[test]
+    fn finishing_an_item_credits_the_active_block() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 2, 30.0);
+
+        let mut d = dto(DAY, "06:00", 60, "Physics lectures", 2);
+        d.target_kind = "node_count".into();
+        d.target_node_id = Some(node);
+        d.target_count = Some(2);
+        let id = upsert_block(&conn, &d).unwrap();
+        start_block(&conn, id).unwrap();
+
+        let mats: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM materials ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        attribute_completion(&conn, mats[0]).unwrap();
+        let b = get_block(&conn, id).unwrap();
+        assert_eq!(b.progress_count, 1, "one lecture down");
+        assert_eq!(b.status, "active", "1 of 2 is not the whole block");
+
+        // The second one meets the target, so the block closes itself out.
+        attribute_completion(&conn, mats[1]).unwrap();
+        let b = get_block(&conn, id).unwrap();
+        assert_eq!(b.progress_count, 2);
+        assert_eq!(b.status, "done", "the target the student asked for is met");
+        assert!(b.completed_at.is_some(), "auto-completion stamps the time like a manual tick");
+    }
+
+    /// A time-boxed block must NOT be completed by one finished lecture. `node_minutes` asks a
+    /// question about minutes; ending an item early would cut a 90-minute study block short.
+    #[test]
+    fn a_time_boxed_block_is_not_completed_by_one_item() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 3, 20.0);
+        let mut d = dto(DAY, "06:00", 90, "Physics study", 2);
+        d.target_kind = "node_minutes".into();
+        d.target_node_id = Some(node);
+        let id = upsert_block(&conn, &d).unwrap();
+        start_block(&conn, id).unwrap();
+
+        let mat: i64 = conn
+            .query_row("SELECT id FROM materials ORDER BY id LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        attribute_completion(&conn, mat).unwrap();
+
+        let b = get_block(&conn, id).unwrap();
+        assert_eq!(b.progress_count, 1, "the item is still counted for display");
+        assert_eq!(b.status, "active", "a time box is finished by minutes, not by items");
+    }
+
+    /// Attribution must REFUSE work the running block doesn't cover. Crediting Physics for a
+    /// History lecture is worse than crediting nothing: adherence is the signal the recovery
+    /// engine trusts.
+    #[test]
+    fn attribution_refuses_a_material_the_block_does_not_cover() {
+        let conn = test_conn();
+        let physics = course_with_videos(&conn, "Physics", 1, 30.0);
+        let history = course_with_videos(&conn, "History", 1, 30.0);
+
+        let mut d = dto(DAY, "06:00", 60, "Physics", 2);
+        d.target_kind = "node_minutes".into();
+        d.target_node_id = Some(physics);
+        let id = upsert_block(&conn, &d).unwrap();
+        start_block(&conn, id).unwrap();
+
+        let hist_mat: i64 = conn
+            .query_row(
+                "SELECT m.id FROM materials m WHERE m.node_id = ?1",
+                [history],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        attribute_time(&conn, Some(hist_mat), 20.0).unwrap();
+        attribute_completion(&conn, hist_mat).unwrap();
+
+        let b = get_block(&conn, id).unwrap();
+        assert_eq!(b.executed_mins, 0.0, "unrelated study is not this block's progress");
+        assert_eq!(b.progress_count, 0);
+    }
+
+    /// A block on a COURSE covers a lecture filed in a chapter under it — that's how courses are
+    /// actually organised, and matching only the exact node would leave real blocks untracked
+    /// (the same reasoning as `exam_linked_nodes`).
+    #[test]
+    fn a_course_block_covers_material_nested_under_it() {
+        let conn = test_conn();
+        let physics = crate::db::queries::upsert_root_node(&conn, "Physics").unwrap();
+        let waves = crate::db::queries::upsert_child_node(&conn, physics, "Waves").unwrap();
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                   duration_secs)
+             VALUES(?1, '/p/w/1.mp4', 'w1.mp4', 'video', 'mp4', 1800)",
+            [waves],
+        )
+        .unwrap();
+        let mat = conn.last_insert_rowid();
+
+        let mut d = dto(DAY, "06:00", 60, "Physics", 2);
+        d.target_kind = "node_minutes".into();
+        d.target_node_id = Some(physics);
+        let id = upsert_block(&conn, &d).unwrap();
+        start_block(&conn, id).unwrap();
+
+        attribute_time(&conn, Some(mat), 15.0).unwrap();
+        assert_eq!(
+            get_block(&conn, id).unwrap().executed_mins,
+            15.0,
+            "a chapter under the target course is the target course"
+        );
+    }
+
+    /// With nothing started, attribution is a no-op. Tracking is armed by the student pressing
+    /// Start; crediting a `pending` block would mean guessing which day's block they meant, and
+    /// this module cannot know the local date (see the module header).
+    #[test]
+    fn attribution_without_an_active_block_credits_nothing() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 1, 30.0);
+        let mut d = dto(DAY, "06:00", 60, "Physics", 2);
+        d.target_kind = "node_count".into();
+        d.target_node_id = Some(node);
+        d.target_count = Some(1);
+        let id = upsert_block(&conn, &d).unwrap();
+        // deliberately NOT started
+
+        let mat: i64 = conn
+            .query_row("SELECT id FROM materials LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        attribute_time(&conn, Some(mat), 30.0).unwrap();
+        attribute_completion(&conn, mat).unwrap();
+
+        let b = get_block(&conn, id).unwrap();
+        assert_eq!(b.executed_mins, 0.0);
+        assert_eq!(b.progress_count, 0);
+        assert_eq!(b.status, "pending");
+    }
+
+    /// A Pomodoro phase has no material, and must still credit: the timer targets no file, so the
+    /// student's Start is the entire claim. This is what the dashboard's "Counting toward …"
+    /// label promises.
+    #[test]
+    fn a_pomodoro_session_credits_without_a_material() {
+        let conn = test_conn();
+        let id = upsert_block(&conn, &dto(DAY, "06:00", 60, "Read the textbook", 2)).unwrap();
+        start_block(&conn, id).unwrap();
+
+        attribute_time(&conn, None, 25.0).unwrap();
+        assert_eq!(get_block(&conn, id).unwrap().executed_mins, 25.0);
+    }
+
+    /// A block naming ONE file is finished by that file, and is not credited by a different one.
+    #[test]
+    fn a_material_block_completes_on_its_own_file_only() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 2, 30.0);
+        let mats: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM materials WHERE node_id = ?1 ORDER BY id")
+                .unwrap();
+            let rows = stmt.query_map([node], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        let mut d = dto(DAY, "06:00", 30, "Lecture 1", 2);
+        d.target_kind = "material".into();
+        d.target_material_id = Some(mats[0]);
+        let id = upsert_block(&conn, &d).unwrap();
+        start_block(&conn, id).unwrap();
+
+        // The sibling lecture is not this block's business, even in the same course.
+        attribute_completion(&conn, mats[1]).unwrap();
+        assert_eq!(get_block(&conn, id).unwrap().status, "active");
+
+        attribute_completion(&conn, mats[0]).unwrap();
+        assert_eq!(
+            get_block(&conn, id).unwrap().status,
+            "done",
+            "the file the block names is finished, so the block is"
+        );
     }
 
     // ── Reminder ledger ──────────────────────────────────────────────────────

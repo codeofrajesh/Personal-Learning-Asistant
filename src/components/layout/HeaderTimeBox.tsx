@@ -19,6 +19,7 @@ import {
   phaseLabel,
   fmtClock,
 } from "../../lib/timerStore";
+import { useActiveBlock } from "../dashboard/useActiveBlock";
 import { cn } from "../../lib/utils";
 
 const R = 15.5;
@@ -33,6 +34,14 @@ export function HeaderTimeBox() {
   const start = useTimerStore((s) => s.start);
   const pause = useTimerStore((s) => s.pause);
   const resume = useTimerStore((s) => s.resume);
+  // What this focus time is being credited to. The Dashboard widget has said this since Phase C;
+  // the header is where the student actually is while the time accrues, and off the Dashboard the
+  // binding was invisible — a timer that doesn't say what it's counting toward reads as a
+  // stopwatch that happens to be running, not as progress against today's plan.
+  //
+  // Free: the hook returns null unless a `work` phase is live, polls the shared minute clock
+  // rather than its own interval, and the Dashboard widget already pays for the same request.
+  const block = useActiveBlock();
 
   const isWork = phase === "work";
   const accent = isWork ? "text-lime" : "text-cyan-400";
@@ -76,7 +85,11 @@ export function HeaderTimeBox() {
     >
       <Link
         to="/"
-        aria-label={`Focus timer: ${phaseLabel(phase)}, ${fmtClock(remaining)} remaining. Open dashboard.`}
+        aria-label={
+          `Focus timer: ${phaseLabel(phase)}, ${fmtClock(remaining)} remaining` +
+          (block ? `, counting toward ${block.title}` : "") +
+          ". Open dashboard."
+        }
         className="flex items-center gap-2.5 rounded-full py-1 pl-1 pr-2.5 transition-colors hover:bg-white/[0.04]"
       >
         {/* Mini ring with the countdown inside */}
@@ -100,10 +113,15 @@ export function HeaderTimeBox() {
           <span className={cn("absolute h-2 w-2 rounded-full", isWork ? "bg-lime" : "bg-cyan-400", running && "animate-pulse")} aria-hidden />
         </span>
 
-        <div className="leading-none">
+        <div className="min-w-0 leading-none">
           <div className={cn("font-mono text-base font-bold tabular-nums", accent)}>{fmtClock(remaining)}</div>
-          <div className="mt-0.5 text-[11px] text-content-muted">
-            {phaseLabel(phase)}
+          {/* The block name REPLACES the phase label rather than joining it. "Focus · Physics" in
+              a pill this size truncates to noise, and once a student has started a block, what the
+              time is counting toward is the more useful of the two — the ring colour and the
+              play/pause icon already say which phase this is. `max-w` keeps a long course title
+              from pushing the search pill off narrow windows. */}
+          <div className="mt-0.5 max-w-[9rem] truncate text-[11px] text-content-muted">
+            {block ? block.title : phaseLabel(phase)}
             {!running && " · paused"}
           </div>
         </div>

@@ -165,6 +165,31 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     [materialId],
   );
 
+  /**
+   * Drain genuinely-watched seconds into `log_session`.
+   *
+   * This is the frontend half of the "time on a course never updates the block" bug. The
+   * backend hook was only ever reached from `log_session`, and this player called it in exactly
+   * ONE place: its unmount cleanup. So watching two minutes of an MKV credited the active block
+   * nothing until the student left the player — which reads as the block being stuck at 0m, and
+   * loses the time entirely if the app is closed on the video.
+   *
+   * The HTML5 path already drained on its 15s flush (`useMediaProgress`); mpv simply never got
+   * the same treatment. Draining is a MOVE, not a copy: the counter is zeroed before the await
+   * so a concurrent flush can't bill the same seconds twice, and every caller reports one
+   * discrete chunk, which is what makes the backend's summing safe.
+   */
+  const drainSession = useCallback(() => {
+    const secs = watchedSecondsRef.current;
+    if (secs < 1) return;
+    watchedSecondsRef.current = 0;
+    void ipc.logSession(materialId, secs).catch(() => {
+      // Best-effort: put the seconds back so the next flush can retry rather than silently
+      // discarding real study time.
+      watchedSecondsRef.current += secs;
+    });
+  }, [materialId]);
+
   // ── Init mpv once (init FIRST, then observe) ───────────────────────────────
   useEffect(() => {
     if (!isTauri()) {
@@ -218,7 +243,12 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               isPlayingRef.current = !data;
               setIsPlaying(!data);
               isPausedRef.current = !!data;
-              if (data) saveProgress(true); // save on pause (forced)
+              if (data) {
+                saveProgress(true); // save on pause (forced)
+                // Pausing is a natural boundary: bank the watched time now rather than
+                // holding it in memory while the student walks away.
+                drainSession();
+              }
               break;
             case "time-pos": {
               const t = (data as number | null) ?? 0;
@@ -251,7 +281,12 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               setRate(data as number);
               break;
             case "eof-reached":
-              if (data) saveProgress(true); // save on end (forced)
+              if (data) {
+                saveProgress(true); // save on end (forced)
+                // Order matters: the forced save is what crosses the completion threshold and
+                // credits the item, and the last watched seconds belong to this block too.
+                drainSession();
+              }
               break;
           }
         };
@@ -277,11 +312,11 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
 
     return () => {
       disposedRef.current = true;
-      // Final progress save + session log on unmount (forced — always persist exactly).
+      // Final progress save + session log on unmount (forced — always persist exactly). This is
+      // now the LAST resort rather than the only one: pause, EOF, hide and the 15s flush have
+      // already banked most of it.
       saveProgress(true);
-      if (watchedSecondsRef.current > 0) {
-        void ipc.logSession(materialId, watchedSecondsRef.current).catch(() => {});
-      }
+      drainSession();
       
       // Clean up the event listener specifically for this component instance
       if (cleanupMpvListenerRef.current) {
@@ -658,9 +693,12 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   // lose the resume point on a hard close that skips React unmount.
   useEffect(() => {
     if (!ready) return;
-    const onHide = () => saveProgress(true);
+    const onHide = () => {
+      saveProgress(true);
+      drainSession();
+    };
     const onVisibility = () => {
-      if (document.visibilityState === "hidden") saveProgress(true);
+      if (document.visibilityState === "hidden") onHide();
     };
     window.addEventListener("beforeunload", onHide);
     document.addEventListener("visibilitychange", onVisibility);
@@ -668,7 +706,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       window.removeEventListener("beforeunload", onHide);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [ready, saveProgress]);
+  }, [ready, saveProgress, drainSession]);
 
   // Expose current time + seek to player-adjacent UI (timestamped Notes) via the bridge.
   useEffect(() => {
@@ -688,11 +726,19 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
 
   // Periodic safety flush of progress (every 15 s while watching). Coalesced: only writes
   // if the position actually advanced ≥ 5s since the last save (no redundant SSD writes).
+  //
+  // The session drain rides the SAME interval, which is what makes an active block's progress
+  // bar move while the student is still watching (matching `useMediaProgress` on the HTML5
+  // path). 15s is also the resolution of the "time on a course" target: a 25-minute block ticks
+  // over ~100 times, which is smooth enough to read as live and cheap enough to ignore.
   useEffect(() => {
     if (!ready) return;
-    const id = window.setInterval(() => saveProgress(false), 15000);
+    const id = window.setInterval(() => {
+      saveProgress(false);
+      drainSession();
+    }, 15000);
     return () => window.clearInterval(id);
-  }, [ready, saveProgress]);
+  }, [ready, saveProgress, drainSession]);
 
   if (error) {
     return (

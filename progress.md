@@ -768,8 +768,9 @@ sections with correct membership; (b) **pin/unpin** a course from a hub card and
 
 Time-blocked scheduling with an Intelligent Adjustment engine, an advisory pre-mortem, learned
 pace, and schedule-adherence scoring. **ALL phases (A–F) are DONE**: `cargo test --lib`
-**117/117** green (was 14), no new clippy warnings; `npm run build` + `tsc --noEmit` clean.
-**37 plan commands** registered. Still owed: a live smoke test against a real pre-v9 DB (§14.11).
+**130 passed** (was 14), no new clippy warnings; `npm run build` + `tsc --noEmit` clean.
+**37 plan commands** registered. Post-QA fixes in §14.11 (tracking attribution, timeline geometry,
+timer visibility). Still owed: a live smoke test against a real pre-v9 DB (§14.12).
 
 ### 14.0 Architectural decisions (pushbacks accepted by the user)
 These were argued *against* the original brief and approved — they are load-bearing, not
@@ -1111,10 +1112,80 @@ otherwise produce invalid `meta` that reads back empty (test covers it). The pro
 `OpenContracts` list, because `UpNextCard` shows only *open* blocks — a finished block would
 otherwise take its unanswered question with it when it left the list.
 
-### 14.11 Still owed
+### 14.11 Tracking attribution — the Phase C event hook (schema v10, no migration)
+`cargo test --lib` **130 passed** (was 122); `tsc --noEmit` + `npm run build` clean; clippy still 18
+pre-existing warnings.
+
+**The disconnect found by the audit.** Three write paths observe real learning, and only one of them
+reached the schedule, for only one of the two things it should carry:
+
+| Path | Wrote | Touched `plan_blocks`? |
+|---|---|---|
+| `queries::save_progress` | `watch_progress`, `materials.is_completed` at 95% | **nothing at all** |
+| `queries::log_study_session` | `study_sessions`, then `add_executed_mins` | time only, `active` only |
+| `plan::set_block_status` | status + `executed_mins` | manual only |
+
+- **`progress_count` was a dead column.** Declared in v9's schema, selected by `BLOCK_SELECT`, mapped
+  into the DTO, exported in `types.ts` — and written by NO code and read by NO component. That is the
+  whole reason "N lessons" could never tick over: nothing counted lessons.
+- **Time credit couldn't reach the mpv player.** `MpvVideoPlayer` called `logSession` in exactly one
+  place: its unmount cleanup. Watching two minutes of an MKV credited the block nothing until the
+  student left the page — and lost the time entirely if the app was closed on the video. The HTML5
+  path already drained on `useMediaProgress`'s 15s flush; mpv never got the same treatment.
+
+**The architecture — one funnel, in `db::plan`.** `attribute_time(material, mins)` and
+`attribute_completion(material)`, called from the two paths that observe learning. Load-bearing
+decisions:
+- **Gated on the ACTIVE block, not "today's open block for this course".** This module's contract is
+  that callers supply local time (SQLite's `now` is UTC), and the playback commands have no local
+  date to give — a day-blind search would credit *tomorrow's* block for tonight's watching.
+  `status = 'active'` needs no date, is already a `start_block` invariant, and carries real intent:
+  pressing Start is what arms tracking, so nothing is credited that the student never claimed.
+- **Attribution can REFUSE.** `block_covers_material` climbs the material's node path, so a block on
+  "Physics" covers a lecture in Physics → Waves (same reasoning as `exam_linked_nodes`), but a
+  History lecture credits nothing. Adherence is the signal the recovery engine trusts; a false
+  credit there is worse than none. The `study_sessions` row still lands either way, so the activity
+  chart and streak never lose real time — only the *schedule* declines it.
+- **Completion is an EVENT, not a state.** `save_progress` keeps firing for the rest of a finished
+  video, so the completed flag is read *before* the write and credited only on the false → true
+  crossing. Otherwise a "2 lectures" block would race to done inside a minute (test covers it).
+- **`node_minutes` is never auto-completed by an item.** A time box is answered in minutes, which
+  `executed_mins` already tracks; closing it because one lecture ended would cut a 90-minute block
+  short at 20. Only `material` (its own file finished) and `node_count` (target met) auto-complete,
+  and they route through `set_block_status` so `completed_at`, the lifecycle event and the score
+  behave exactly as for a manual tick.
+- Pomodoro passes `material_id: None` and always credits — the timer targets no file.
+
+**Timeline geometry — `planning/timelineLayout.ts`** (new, shared by the Today axis and the Calendar
+Day view). Both surfaces had the same defect: width was divided by the whole collision *cluster*, so
+ONE long block dragged every block it touched into the same divisor — a 6:00–12:00 block beside three
+unrelated 30-minute blocks rendered all four at 25%, none of which overlap each other. That is the
+reported "cramped and messy", and it was never caused by the blocks that actually collide. Now two
+passes, like Google/Apple Calendar: **column assignment** (leftmost free column — the part that
+existed), then **column-span expansion** (grow rightward while nothing there overlaps — the part that
+was missing). A block only surrenders width to blocks it genuinely intersects; with no collisions
+everything spans every column and is full-width, which is the common case and the one that must look
+calm. Intervals are half-open, matching `find_conflict`, so the UI can't draw an overlap the backend
+would have refused. Open work ranks ahead of settled work for the primary column, so an active block
+sharing a slot with a skipped one reads as primary. Geometry only — the module returns column
+indices and spans, no px or colours, so it stays unit-testable and both surfaces keep their own
+vocabulary. Backend bindings, `blockDetail` row-gating and course linking are untouched.
+
+**Top-bar timer visibility.** The bar already rendered on every route; the real defect was an
+asymmetry in `AppShell`. The sidebar's suppression was scoped to the player
+(`!appFullscreen || !isPlayerRoute`), the top bar's was app-wide (`!appFullscreen`) — so F11 or a
+title-bar double-click on Today/Planner/Library/Dashboard removed the running timer with no video on
+screen to justify it. Both now share one `immersive = appFullscreen && isPlayerRoute` flag. Chrome is
+only sacrificed for the video. `HeaderTimeBox` also names the bound block (replacing the phase label,
+which the ring colour and play/pause icon already convey) via the existing `useActiveBlock` — off the
+Dashboard the binding was invisible, and a timer that doesn't say what it's counting toward reads as
+a stopwatch, not as progress against today's plan.
+
+### 14.12 Still owed
 - **Live smoke test against a real pre-v9 DB.** Everything above is compile-, test- and
   build-verified only. The v9→v10 migration path is covered by unit tests but has never run
-  against a real user database.
+  against a real user database. The attribution funnel in particular has never been exercised
+  against a real playing video — only against its unit tests.
 - **A frontend test runner (Vitest).** Phase E's client-side derivations had to be verified with a
   throwaway esbuild harness, and it found a genuine bug (`longestStreak`'s dead contiguity check).
   That shouldn't be a manual step. Phase F's client logic is thinner but equally unguarded.
