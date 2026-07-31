@@ -27,6 +27,8 @@ import type {
   NodeCrumb,
   Note,
   PlanBlock,
+  PlanTemplate,
+  PlanTemplateBlock,
   PlayerView,
   Recommendation,
   RecoveryReport,
@@ -38,6 +40,8 @@ import type {
   SearchResult,
   SubjectView,
   Task,
+  TemplateBlockInput,
+  TemplateInput,
   WizardImport,
 } from "./types";
 
@@ -351,9 +355,53 @@ export const ipc = {
     return call<void>("dismiss_recovery", { day });
   },
 
-  /** Generate a day's blocks from a routine template. Returns how many were created. */
+  /** Generate a day's blocks from a routine template. Returns how many were created.
+   *  Idempotent: re-applying skips blocks that already exist at the same time+title. */
   applyPlanTemplate(templateId: number, day: string): Promise<number> {
     return call<number>("apply_plan_template", { templateId, day });
+  },
+
+  // ── Routine templates ───────────────────────────────────────────────────────
+
+  /** All routines, newest first, with rolled-up block counts. */
+  listPlanTemplates(): Promise<PlanTemplate[]> {
+    return call<PlanTemplate[]>("list_plan_templates");
+  },
+
+  /** One routine's blocks, in routine order. */
+  planTemplateBlocks(templateId: number): Promise<PlanTemplateBlock[]> {
+    return call<PlanTemplateBlock[]>("plan_template_blocks", { templateId });
+  },
+
+  /** Create or update a routine. Returns its id. */
+  upsertPlanTemplate(template: TemplateInput): Promise<number> {
+    return call<number>("upsert_plan_template", { template });
+  },
+
+  /** Delete a routine. Days already generated from it keep their blocks. */
+  deletePlanTemplate(id: number): Promise<void> {
+    return call<void>("delete_plan_template", { id });
+  },
+
+  /** Create or update one block inside a routine. */
+  upsertPlanTemplateBlock(block: TemplateBlockInput): Promise<number> {
+    return call<number>("upsert_plan_template_block", { block });
+  },
+
+  /** Delete one block from a routine. */
+  deletePlanTemplateBlock(id: number): Promise<void> {
+    return call<void>("delete_plan_template_block", { id });
+  },
+
+  /** Capture a day's blocks as a reusable routine. Returns the new template id.
+   *  Captures `planned_*` (the intention), skips spill carry-overs. */
+  saveDayAsTemplate(day: string, name: string, dowMask: number): Promise<number> {
+    return call<number>("save_day_as_template", { day, name, dowMask });
+  },
+
+  /** The routine matching `weekday` (0 = Sunday), if any. Local weekday, not UTC. */
+  suggestedPlanTemplate(weekday: number): Promise<PlanTemplate | null> {
+    return call<PlanTemplate | null>("suggested_plan_template", { weekday });
   },
 
   /** Close out past days from the caller's true LOCAL date. Returns days reconciled. */

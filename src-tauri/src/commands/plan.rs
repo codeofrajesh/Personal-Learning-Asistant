@@ -19,7 +19,10 @@
 
 use tauri::State;
 
-use crate::db::plan::{self, BlockInputDto, DayPlan, PlanBlock, ReminderState};
+use crate::db::plan::{
+    self, BlockInputDto, DayPlan, PlanBlock, PlanTemplate, PlanTemplateBlock, ReminderState,
+    TemplateBlockInputDto, TemplateInputDto,
+};
 use crate::db::queries::{self, ScoreWindow};
 use crate::db::Db;
 use crate::planner::solver::RecoveryReport;
@@ -190,6 +193,74 @@ pub fn dismiss_recovery(db: State<'_, Db>, day: String) -> AppResult<()> {
 pub fn apply_plan_template(db: State<'_, Db>, template_id: i64, day: String) -> AppResult<i64> {
     validate_day(&day)?;
     db.with(|conn| plan::apply_template(conn, template_id, &day))
+}
+
+// ── Routine templates ────────────────────────────────────────────────────────
+
+/// All routines, with block counts.
+#[tauri::command]
+pub fn list_plan_templates(db: State<'_, Db>) -> AppResult<Vec<PlanTemplate>> {
+    db.with(|conn| plan::list_templates(conn))
+}
+
+/// One routine's blocks, in routine order.
+#[tauri::command]
+pub fn plan_template_blocks(
+    db: State<'_, Db>,
+    template_id: i64,
+) -> AppResult<Vec<PlanTemplateBlock>> {
+    db.with(|conn| plan::template_blocks(conn, template_id))
+}
+
+/// Create or update a routine. Returns its id.
+#[tauri::command]
+pub fn upsert_plan_template(db: State<'_, Db>, template: TemplateInputDto) -> AppResult<i64> {
+    db.with(|conn| plan::upsert_template(conn, &template))
+}
+
+/// Delete a routine. Days already generated from it keep their blocks.
+#[tauri::command]
+pub fn delete_plan_template(db: State<'_, Db>, id: i64) -> AppResult<()> {
+    db.with(|conn| plan::delete_template(conn, id))
+}
+
+/// Create or update one block inside a routine.
+#[tauri::command]
+pub fn upsert_plan_template_block(
+    db: State<'_, Db>,
+    block: TemplateBlockInputDto,
+) -> AppResult<i64> {
+    db.with(|conn| plan::upsert_template_block(conn, &block))
+}
+
+/// Delete one block from a routine.
+#[tauri::command]
+pub fn delete_plan_template_block(db: State<'_, Db>, id: i64) -> AppResult<()> {
+    db.with(|conn| plan::delete_template_block(conn, id))
+}
+
+/// Capture a day's blocks as a reusable routine. Returns the new template id.
+#[tauri::command]
+pub fn save_day_as_template(
+    db: State<'_, Db>,
+    day: String,
+    name: String,
+    dow_mask: i64,
+) -> AppResult<i64> {
+    validate_day(&day)?;
+    db.with(|conn| plan::save_day_as_template(conn, &day, &name, dow_mask))
+}
+
+/// The routine matching `weekday` (0 = Sunday), if any.
+///
+/// `weekday` comes from the frontend rather than SQLite's `strftime('%w')`, which is UTC and
+/// would suggest tomorrow's routine late in the evening.
+#[tauri::command]
+pub fn suggested_plan_template(
+    db: State<'_, Db>,
+    weekday: i64,
+) -> AppResult<Option<PlanTemplate>> {
+    db.with(|conn| plan::suggested_template(conn, weekday))
 }
 
 /// Reconcile every past day from the caller's LOCAL date, then re-snapshot.

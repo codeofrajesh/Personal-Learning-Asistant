@@ -545,6 +545,59 @@ export interface DayPlan {
   adjust_state: string | null;
 }
 
+// ── Routine templates (backend `db::plan` templates section) ────────────────
+
+/** A routine day ("my normal weekday") with rolled-up counts (backend `PlanTemplate`). */
+export interface PlanTemplate {
+  id: number;
+  name: string;
+  /** Weekday bitmask: bit 0 = Sunday … bit 6 = Saturday. */
+  dow_mask: number;
+  is_active: boolean;
+  block_count: number;
+  planned_mins: number;
+}
+
+/** One block inside a routine (backend `PlanTemplateBlock`). A template is a *shape*, so
+ *  there is no day, no status, and no executed minutes here. */
+export interface PlanTemplateBlock {
+  id: number;
+  template_id: number;
+  planned_start: string;
+  planned_mins: number;
+  title: string;
+  target_kind: BlockTargetKind;
+  target_node_id: number | null;
+  target_count: number | null;
+  weight: number;
+  is_anchored: boolean;
+  sort_order: number;
+  target_name: string | null;
+}
+
+/** Create/update payload for a routine (backend `TemplateInputDto`). */
+export interface TemplateInput {
+  id?: number | null;
+  name: string;
+  dow_mask?: number;
+  is_active?: boolean;
+}
+
+/** Create/update payload for a routine block (backend `TemplateBlockInputDto`). */
+export interface TemplateBlockInput {
+  id?: number | null;
+  template_id: number;
+  planned_start: string;
+  planned_mins: number;
+  title: string;
+  target_kind?: BlockTargetKind;
+  target_node_id?: number | null;
+  target_count?: number | null;
+  weight?: number;
+  is_anchored?: boolean;
+  sort_order?: number;
+}
+
 /** Create/update payload for a block (backend `BlockInputDto`). `id` omitted = create. */
 export interface BlockInput {
   id?: number | null;

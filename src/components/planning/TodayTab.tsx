@@ -37,7 +37,9 @@ import {
 } from "lucide-react";
 import BlockModal from "./BlockModal";
 import RecoveryCard from "./RecoveryCard";
+import RoutinesModal, { RoutineSuggestion } from "./RoutinesModal";
 import { useRecovery } from "./useRecovery";
+import { useTemplates } from "./useTemplates";
 import {
   BLOCK_STATE_META,
   blockStartMins,
@@ -49,7 +51,7 @@ import {
 import { hhmmToMins, useScheduleClock } from "../../lib/scheduleClock";
 import { motionAllowed } from "../../lib/perfStore";
 import { cn } from "../../lib/utils";
-import type { BlockStatus, DayPlan, PlanBlock } from "../../lib/types";
+import type { BlockStatus, DayPlan, PlanBlock, PlanTemplate } from "../../lib/types";
 import type { DayPlanState } from "./useDayPlan";
 
 const HOUR_H = 64; // px per hour, matching CalendarTimeline so the two read as one system.
@@ -67,9 +69,12 @@ export default function TodayTab({ schedule }: Props) {
   const nowMins = useScheduleClock((s) => s.minutes);
   // Drift detection + apply/undo/dismiss. Owns its own gating; renders nothing when quiet.
   const recovery = useRecovery(schedule);
+  // Routines. Loaded once here and shared with the empty-day offer and the modal.
+  const templates = useTemplates();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editBlock, setEditBlock] = useState<PlanBlock | null>(null);
+  const [routinesOpen, setRoutinesOpen] = useState(false);
 
   const blocks = plan?.blocks ?? [];
   const wakeMins = hhmmToMins(plan?.wake_at) ?? 6 * 60;
@@ -96,7 +101,15 @@ export default function TodayTab({ schedule }: Props) {
         <DayHeader schedule={schedule} onAdd={() => openBlock(null)} />
 
         {loaded && blocks.length === 0 ? (
-          <EmptyDay isToday={isToday} onAdd={() => openBlock(null)} />
+          <EmptyDay
+            isToday={isToday}
+            onAdd={() => openBlock(null)}
+            suggestion={templates.suggestionFor(day)}
+            onApplyRoutine={async (id) => {
+              if ((await templates.apply(id, day)) > 0) await schedule.reload();
+            }}
+            onManageRoutines={() => setRoutinesOpen(true)}
+          />
         ) : (
           <DayAxis
             day={day}
@@ -137,6 +150,14 @@ export default function TodayTab({ schedule }: Props) {
         block={editBlock}
         onSave={(input) => void saveBlock(input)}
         onDelete={(b) => void removeBlock(b)}
+      />
+
+      <RoutinesModal
+        open={routinesOpen}
+        onClose={() => setRoutinesOpen(false)}
+        day={day}
+        templates={templates}
+        onApplied={() => void schedule.reload()}
       />
     </div>
   );
@@ -219,7 +240,24 @@ function DayHeader({ schedule, onAdd }: { schedule: DayPlanState; onAdd: () => v
   );
 }
 
-function EmptyDay({ isToday, onAdd }: { isToday: boolean; onAdd: () => void }) {
+/**
+ * The empty day. This is where a routine earns its keep: the alternative to one tap is
+ * re-entering the same five blocks by hand, which is exactly when a planner gets abandoned.
+ * The routine offer leads, and building by hand stays available underneath.
+ */
+function EmptyDay({
+  isToday,
+  onAdd,
+  suggestion,
+  onApplyRoutine,
+  onManageRoutines,
+}: {
+  isToday: boolean;
+  onAdd: () => void;
+  suggestion: PlanTemplate | null;
+  onApplyRoutine: (templateId: number) => void;
+  onManageRoutines: () => void;
+}) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-2 py-16 text-center">
       <CalendarDays size={28} className="text-white/20" aria-hidden />
@@ -230,12 +268,21 @@ function EmptyDay({ isToday, onAdd }: { isToday: boolean; onAdd: () => void }) {
         A block is when you'll actually sit down — not just what's due. Two or three honest ones
         beat a wall of wishful hours.
       </p>
+
+      <div className="mt-3">
+        <RoutineSuggestion
+          template={suggestion}
+          onApply={() => suggestion && onApplyRoutine(suggestion.id)}
+          onManage={onManageRoutines}
+        />
+      </div>
+
       <button
         type="button"
         onClick={onAdd}
-        className="mt-2 rounded-full border border-white/[0.08] bg-white/[0.04] px-4 py-2 text-xs font-semibold text-content-primary transition-colors hover:bg-white/[0.08]"
+        className="mt-1 rounded-full px-4 py-2 text-xs font-medium text-white/45 transition-colors hover:bg-white/[0.06] hover:text-content-primary"
       >
-        Add the first block
+        Or add a single block
       </button>
     </div>
   );

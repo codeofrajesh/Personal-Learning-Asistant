@@ -1022,6 +1022,317 @@ pub fn prune_reminders(conn: &Connection, keep_days: i64) -> AppResult<i64> {
 
 // ── Templates ────────────────────────────────────────────────────────────────
 
+/// A routine day ("my normal weekday"), with its block count for display.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanTemplate {
+    pub id: i64,
+    pub name: String,
+    /// Bitmask of weekdays this routine suits: bit 0 = Sunday … bit 6 = Saturday.
+    pub dow_mask: i64,
+    pub is_active: bool,
+    pub block_count: i64,
+    pub planned_mins: i64,
+}
+
+/// One block inside a template. No `day` and no lifecycle state — a template is a *shape*,
+/// not a schedule, so it has no status, no executed minutes, and nothing to reconcile.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanTemplateBlock {
+    pub id: i64,
+    pub template_id: i64,
+    pub planned_start: String,
+    pub planned_mins: i64,
+    pub title: String,
+    pub target_kind: String,
+    pub target_node_id: Option<i64>,
+    pub target_count: Option<i64>,
+    pub weight: i64,
+    pub is_anchored: bool,
+    pub sort_order: i64,
+    /// Resolved course name when `target_node_id` still exists.
+    pub target_name: Option<String>,
+}
+
+/// Create/update payload for a template.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TemplateInputDto {
+    pub id: Option<i64>,
+    pub name: String,
+    #[serde(default = "default_dow_mask")]
+    pub dow_mask: i64,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+/// Create/update payload for a template block.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TemplateBlockInputDto {
+    pub id: Option<i64>,
+    pub template_id: i64,
+    pub planned_start: String,
+    pub planned_mins: i64,
+    pub title: String,
+    #[serde(default = "default_target_kind")]
+    pub target_kind: String,
+    pub target_node_id: Option<i64>,
+    pub target_count: Option<i64>,
+    #[serde(default = "default_weight")]
+    pub weight: i64,
+    #[serde(default)]
+    pub is_anchored: bool,
+    #[serde(default)]
+    pub sort_order: i64,
+}
+
+fn default_dow_mask() -> i64 {
+    127 // every day
+}
+fn default_true() -> bool {
+    true
+}
+
+/// All templates, newest first, with rolled-up block counts.
+pub fn list_templates(conn: &Connection) -> AppResult<Vec<PlanTemplate>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.dow_mask, t.is_active,
+                COUNT(b.id), COALESCE(SUM(b.planned_mins), 0)
+           FROM plan_templates t
+           LEFT JOIN plan_template_blocks b ON b.template_id = t.id
+          GROUP BY t.id
+          ORDER BY t.id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(PlanTemplate {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            dow_mask: r.get(2)?,
+            is_active: r.get::<_, i64>(3)? != 0,
+            block_count: r.get(4)?,
+            planned_mins: r.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// One template's blocks, in routine order.
+pub fn template_blocks(conn: &Connection, template_id: i64) -> AppResult<Vec<PlanTemplateBlock>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.id, b.template_id, b.planned_start, b.planned_mins, b.title, b.target_kind,
+                b.target_node_id, b.target_count, b.weight, b.is_anchored, b.sort_order,
+                n.name
+           FROM plan_template_blocks b
+           LEFT JOIN nodes n ON n.id = b.target_node_id
+          WHERE b.template_id = ?1
+          ORDER BY b.sort_order, b.planned_start, b.id",
+    )?;
+    let rows = stmt.query_map([template_id], |r| {
+        Ok(PlanTemplateBlock {
+            id: r.get(0)?,
+            template_id: r.get(1)?,
+            planned_start: r.get(2)?,
+            planned_mins: r.get(3)?,
+            title: r.get(4)?,
+            target_kind: r.get(5)?,
+            target_node_id: r.get(6)?,
+            target_count: r.get(7)?,
+            weight: r.get(8)?,
+            is_anchored: r.get::<_, i64>(9)? != 0,
+            sort_order: r.get(10)?,
+            target_name: r.get(11)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Create or update a template. Returns its id.
+pub fn upsert_template(conn: &Connection, input: &TemplateInputDto) -> AppResult<i64> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(AppError::Invalid("template name is required".into()));
+    }
+    // Only the low 7 bits are meaningful; a wider value would silently never match a weekday.
+    let mask = input.dow_mask & 0x7F;
+    match input.id {
+        Some(id) => {
+            let n = conn.execute(
+                "UPDATE plan_templates SET name = ?2, dow_mask = ?3, is_active = ?4 WHERE id = ?1",
+                rusqlite::params![id, name, mask, input.is_active as i64],
+            )?;
+            if n == 0 {
+                return Err(AppError::NotFound(format!("template {id} not found")));
+            }
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO plan_templates(name, dow_mask, is_active) VALUES(?1, ?2, ?3)",
+                rusqlite::params![name, mask, input.is_active as i64],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+/// Delete a template. Its blocks go with it via `ON DELETE CASCADE`; days that were generated
+/// from it keep their blocks (`plan_days.template_id` is `ON DELETE SET NULL`) — deleting a
+/// routine must never retroactively empty the days it produced.
+pub fn delete_template(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM plan_templates WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// Create or update one block inside a template. Same validation as a real block, minus the
+/// day/lifecycle fields — a template with an invalid time would generate broken days forever.
+pub fn upsert_template_block(
+    conn: &Connection,
+    input: &TemplateBlockInputDto,
+) -> AppResult<i64> {
+    let title = input.title.trim();
+    if title.is_empty() {
+        return Err(AppError::Invalid("block title is required".into()));
+    }
+    if parse_hhmm(&input.planned_start).is_none() {
+        return Err(AppError::Invalid(format!(
+            "invalid start '{}' (want HH:MM)",
+            input.planned_start
+        )));
+    }
+    if !TARGET_KINDS.contains(&input.target_kind.as_str()) {
+        return Err(AppError::Invalid(format!(
+            "unknown target_kind '{}'",
+            input.target_kind
+        )));
+    }
+    if input.planned_mins < 1 || input.planned_mins > 24 * 60 {
+        return Err(AppError::Invalid(
+            "planned_mins must be between 1 and 1440".into(),
+        ));
+    }
+    let weight = input.weight.clamp(0, 3);
+
+    match input.id {
+        Some(id) => {
+            let n = conn.execute(
+                "UPDATE plan_template_blocks SET
+                    template_id = ?2, planned_start = ?3, planned_mins = ?4, title = ?5,
+                    target_kind = ?6, target_node_id = ?7, target_count = ?8, weight = ?9,
+                    is_anchored = ?10, sort_order = ?11
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    input.template_id,
+                    input.planned_start,
+                    input.planned_mins,
+                    title,
+                    input.target_kind,
+                    input.target_node_id,
+                    input.target_count,
+                    weight,
+                    input.is_anchored as i64,
+                    input.sort_order,
+                ],
+            )?;
+            if n == 0 {
+                return Err(AppError::NotFound(format!("template block {id} not found")));
+            }
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO plan_template_blocks(
+                    template_id, planned_start, planned_mins, title, target_kind,
+                    target_node_id, target_count, weight, is_anchored, sort_order)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    input.template_id,
+                    input.planned_start,
+                    input.planned_mins,
+                    title,
+                    input.target_kind,
+                    input.target_node_id,
+                    input.target_count,
+                    weight,
+                    input.is_anchored as i64,
+                    input.sort_order,
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+/// Delete one block from a template.
+pub fn delete_template_block(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM plan_template_blocks WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// Capture an existing day's blocks as a reusable routine. Returns the new template id.
+///
+/// This is the only ergonomic way to author a template: nobody builds a routine from an empty
+/// form, they build a good day and then want it back. `planned_*` is captured rather than
+/// `effective_*` — the routine should be the intention, not one morning's adjustments baked in
+/// permanently. Spilled carry-overs are excluded for the same reason: they belong to the day
+/// that went wrong, not to the routine.
+pub fn save_day_as_template(
+    conn: &Connection,
+    day: &str,
+    name: &str,
+    dow_mask: i64,
+) -> AppResult<i64> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::Invalid("template name is required".into()));
+    }
+    conn.execute(
+        "INSERT INTO plan_templates(name, dow_mask) VALUES(?1, ?2)",
+        rusqlite::params![name, dow_mask & 0x7F],
+    )?;
+    let template_id = conn.last_insert_rowid();
+
+    let n = conn.execute(
+        "INSERT INTO plan_template_blocks(
+            template_id, planned_start, planned_mins, title, target_kind,
+            target_node_id, target_count, weight, is_anchored, sort_order)
+         SELECT ?1, b.planned_start, b.planned_mins, b.title, b.target_kind,
+                b.target_node_id, b.target_count, b.weight, b.is_anchored,
+                ROW_NUMBER() OVER (ORDER BY b.planned_start, b.id)
+           FROM plan_blocks b
+          WHERE b.day = ?2 AND b.status <> 'spilled' AND b.spilled_from_id IS NULL",
+        rusqlite::params![template_id, day],
+    )?;
+    if n == 0 {
+        // Refuse to leave an empty routine behind — applying it later would look like a bug.
+        conn.execute("DELETE FROM plan_templates WHERE id = ?1", [template_id])?;
+        return Err(AppError::Invalid(
+            "that day has no blocks to save as a routine".into(),
+        ));
+    }
+    Ok(template_id)
+}
+
+/// The active template whose `dow_mask` covers `weekday` (0 = Sunday), if any.
+///
+/// `weekday` is passed in rather than derived with SQLite's `strftime('%w')` for the same
+/// reason every other planner call takes `day`: SQLite works in UTC, so late-evening local
+/// time resolves to tomorrow's weekday and would suggest the wrong routine.
+pub fn suggested_template(conn: &Connection, weekday: i64) -> AppResult<Option<PlanTemplate>> {
+    if !(0..=6).contains(&weekday) {
+        return Err(AppError::Invalid("weekday must be 0..=6".into()));
+    }
+    Ok(list_templates(conn)?
+        .into_iter()
+        .find(|t| t.is_active && t.block_count > 0 && (t.dow_mask & (1 << weekday)) != 0))
+}
+
 /// Generate a day's blocks from a routine template. Skips blocks that already exist for that
 /// day at the same time+title, so applying twice doesn't duplicate the routine.
 pub fn apply_template(conn: &Connection, template_id: i64, day: &str) -> AppResult<i64> {
@@ -1209,6 +1520,23 @@ mod tests {
             is_anchored: false,
             min_viable_mins: None,
             notes: None,
+        }
+    }
+
+    /// A template block payload with sane defaults, mirroring `dto` for real blocks.
+    fn tblock(template_id: i64, start: &str, mins: i64, title: &str) -> TemplateBlockInputDto {
+        TemplateBlockInputDto {
+            id: None,
+            template_id,
+            planned_start: start.to_string(),
+            planned_mins: mins,
+            title: title.to_string(),
+            target_kind: "freeform".to_string(),
+            target_node_id: None,
+            target_count: None,
+            weight: 2,
+            is_anchored: false,
+            sort_order: 0,
         }
     }
 
@@ -1604,6 +1932,203 @@ mod tests {
 
         assert_eq!(apply_template(&conn, tid, DAY).unwrap(), 0, "no duplicates");
         assert_eq!(list_day_blocks(&conn, DAY).unwrap().len(), 2);
+    }
+
+    /// Template CRUD round-trip, including the rolled-up counts the list view renders.
+    #[test]
+    fn template_crud_round_trip() {
+        let conn = test_conn();
+        let tid = upsert_template(
+            &conn,
+            &TemplateInputDto {
+                id: None,
+                name: "  Weekday  ".into(),
+                dow_mask: 0b0111110, // Mon–Fri
+                is_active: true,
+            },
+        )
+        .unwrap();
+
+        upsert_template_block(&conn, &tblock(tid, "06:00", 60, "Physics")).unwrap();
+        let second = upsert_template_block(&conn, &tblock(tid, "07:00", 45, "Math")).unwrap();
+
+        let list = list_templates(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Weekday", "the name is trimmed");
+        assert_eq!(list[0].block_count, 2);
+        assert_eq!(list[0].planned_mins, 105, "durations roll up for display");
+
+        // Rename + narrow the weekday mask.
+        upsert_template(
+            &conn,
+            &TemplateInputDto {
+                id: Some(tid),
+                name: "Term time".into(),
+                dow_mask: 0b0000010, // Monday only
+                is_active: false,
+            },
+        )
+        .unwrap();
+        let list = list_templates(&conn).unwrap();
+        assert_eq!(list[0].name, "Term time");
+        assert!(!list[0].is_active);
+
+        delete_template_block(&conn, second).unwrap();
+        assert_eq!(template_blocks(&conn, tid).unwrap().len(), 1);
+
+        // Deleting the template cascades to its blocks.
+        delete_template(&conn, tid).unwrap();
+        assert!(list_templates(&conn).unwrap().is_empty());
+        assert!(template_blocks(&conn, tid).unwrap().is_empty());
+    }
+
+    /// A blank name is rejected, not stored as an unnameable routine.
+    #[test]
+    fn template_rejects_blank_name() {
+        let conn = test_conn();
+        assert!(upsert_template(
+            &conn,
+            &TemplateInputDto {
+                id: None,
+                name: "   ".into(),
+                dow_mask: 127,
+                is_active: true,
+            },
+        )
+        .is_err());
+    }
+
+    /// Template blocks get the SAME validation as real blocks — a bad time in a routine would
+    /// generate broken days every time it was applied.
+    #[test]
+    fn template_blocks_validate_like_real_blocks() {
+        let conn = test_conn();
+        let tid = upsert_template(
+            &conn,
+            &TemplateInputDto { id: None, name: "T".into(), dow_mask: 127, is_active: true },
+        )
+        .unwrap();
+
+        let mut bad = tblock(tid, "25:00", 60, "Nope");
+        assert!(upsert_template_block(&conn, &bad).is_err(), "invalid HH:MM");
+
+        bad = tblock(tid, "06:00", 0, "Nope");
+        assert!(upsert_template_block(&conn, &bad).is_err(), "zero duration");
+
+        bad = tblock(tid, "06:00", 60, "   ");
+        assert!(upsert_template_block(&conn, &bad).is_err(), "blank title");
+
+        bad = tblock(tid, "06:00", 60, "Nope");
+        bad.target_kind = "wishful".into();
+        assert!(upsert_template_block(&conn, &bad).is_err(), "unknown target_kind");
+
+        // Weight is clamped rather than rejected — an out-of-range priority has an obvious
+        // intent, unlike an invalid time.
+        let mut ok = tblock(tid, "06:00", 60, "Physics");
+        ok.weight = 99;
+        let id = upsert_template_block(&conn, &ok).unwrap();
+        let stored = template_blocks(&conn, tid).unwrap();
+        assert_eq!(stored.iter().find(|b| b.id == id).unwrap().weight, 3);
+    }
+
+    /// Saving a day as a routine captures the INTENTION (`planned_*`), not one morning's
+    /// adjustments, and excludes spill carry-overs that belong to the day that went wrong.
+    #[test]
+    fn save_day_as_template_captures_intent_only() {
+        let conn = test_conn();
+        let a = upsert_block(&conn, &dto(DAY, "06:00", 60, "Physics", 3)).unwrap();
+        upsert_block(&conn, &dto(DAY, "07:00", 45, "Math", 2)).unwrap();
+        // A carry-over from yesterday, and an adjusted position on a real block.
+        // `spilled_from_id` is a real FK, so the source block has to exist.
+        let source = upsert_block(&conn, &dto("2026-07-30", "09:00", 30, "Yesterday", 2)).unwrap();
+        conn.execute(
+            "INSERT INTO plan_blocks(day, planned_start, planned_mins, title, spilled_from_id)
+             VALUES(?1, '09:00', 30, 'Yesterday leftovers', ?2)",
+            rusqlite::params![DAY, source],
+        )
+        .unwrap();
+        conn.execute("UPDATE plan_blocks SET actual_start = '11:00' WHERE id = ?1", [a])
+            .unwrap();
+
+        let tid = save_day_as_template(&conn, DAY, "My weekday", 0b0111110).unwrap();
+        let blocks = template_blocks(&conn, tid).unwrap();
+
+        assert_eq!(blocks.len(), 2, "the carry-over is not part of the routine");
+        assert_eq!(
+            blocks[0].planned_start, "06:00",
+            "captures the intention, not the adjusted 11:00"
+        );
+        assert_eq!(blocks[1].planned_start, "07:00");
+        assert_eq!(blocks[0].sort_order, 1, "routine order is materialised");
+    }
+
+    /// Saving an empty day must fail rather than leave behind a routine that silently does
+    /// nothing when applied.
+    #[test]
+    fn save_day_as_template_refuses_an_empty_day() {
+        let conn = test_conn();
+        assert!(save_day_as_template(&conn, DAY, "Nothing", 127).is_err());
+        assert!(
+            list_templates(&conn).unwrap().is_empty(),
+            "no orphan template row is left behind"
+        );
+    }
+
+    /// The suggestion respects the weekday bitmask, the active flag, and skips empty routines.
+    #[test]
+    fn suggested_template_matches_the_weekday() {
+        let conn = test_conn();
+        // Weekend-only routine (bit 0 = Sunday, bit 6 = Saturday).
+        let weekend = upsert_template(
+            &conn,
+            &TemplateInputDto {
+                id: None,
+                name: "Weekend".into(),
+                dow_mask: 0b1000001,
+                is_active: true,
+            },
+        )
+        .unwrap();
+        upsert_template_block(&conn, &tblock(weekend, "10:00", 90, "Long read")).unwrap();
+
+        assert_eq!(
+            suggested_template(&conn, 0).unwrap().map(|t| t.id),
+            Some(weekend),
+            "Sunday matches bit 0"
+        );
+        assert!(suggested_template(&conn, 3).unwrap().is_none(), "Wednesday does not");
+
+        // An inactive routine is never suggested.
+        upsert_template(
+            &conn,
+            &TemplateInputDto {
+                id: Some(weekend),
+                name: "Weekend".into(),
+                dow_mask: 0b1000001,
+                is_active: false,
+            },
+        )
+        .unwrap();
+        assert!(suggested_template(&conn, 0).unwrap().is_none(), "inactive is skipped");
+
+        // An EMPTY routine is never suggested either — applying it would look like a bug.
+        let empty = upsert_template(
+            &conn,
+            &TemplateInputDto {
+                id: None,
+                name: "Empty".into(),
+                dow_mask: 127,
+                is_active: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            suggested_template(&conn, 0).unwrap().is_none(),
+            "a routine with no blocks is not a suggestion"
+        );
+        let _ = empty;
+
+        assert!(suggested_template(&conn, 7).is_err(), "weekday must be 0..=6");
     }
 
     /// The Today payload exposes the window, totals, and the advisory pre-mortem together.
