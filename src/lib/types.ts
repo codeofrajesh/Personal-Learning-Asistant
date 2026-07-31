@@ -545,6 +545,27 @@ export interface DayPlan {
   adjust_state: string | null;
 }
 
+/** What a student committed to for one block, and how it ended (backend `FocusContract`).
+ *  Stored as `plan_events` rows, so the history survives edits to the block itself. */
+export interface FocusContract {
+  block_id: number;
+  /** The one-line definition of done, as written. */
+  intention: string;
+  committed_at: string;
+  /** `null` while the block is still in flight. */
+  kept: boolean | null;
+  resolved_at: string | null;
+}
+
+/** How reliably this student keeps what they commit to (backend `FocusRecord`). */
+export interface FocusRecord {
+  committed: number;
+  kept: number;
+  broken: number;
+  /** 0-100 over RESOLVED contracts only; `null` until at least three are answered. */
+  keep_rate: number | null;
+}
+
 /** A streak that tolerates a limited number of EARNED bad days (backend `StreakStatus`).
  *  Purely derived from `consistency_log` - there is no spendable token, so the same history
  *  always yields the same number and there is nothing to farm or migrate. */

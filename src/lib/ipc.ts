@@ -19,6 +19,8 @@ import type {
   Exam,
   ExamInput,
   ExamPlan,
+  FocusContract,
+  FocusRecord,
   FolderPreview,
   GoalSummary,
   GoalView,
@@ -364,6 +366,28 @@ export const ipc = {
    *  Idempotent: re-applying skips blocks that already exist at the same time+title. */
   applyPlanTemplate(templateId: number, day: string): Promise<number> {
     return call<number>("apply_plan_template", { templateId, day });
+  },
+
+  // ── Focus contract ──────────────────────────────────────────────────────────
+
+  /** Record what "done" means for a block. Supersedes any unresolved commitment on it. */
+  commitFocus(blockId: number, intention: string): Promise<void> {
+    return call<void>("commit_focus", { blockId, intention });
+  },
+
+  /** Record whether the commitment was kept. Self-reported by design. */
+  resolveFocus(blockId: number, kept: boolean): Promise<void> {
+    return call<void>("resolve_focus", { blockId, kept });
+  },
+
+  /** The commitment for one block, if any. */
+  focusContract(blockId: number): Promise<FocusContract | null> {
+    return call<FocusContract | null>("focus_contract", { blockId });
+  },
+
+  /** Keep-rate over the trailing `days`. `today` is the caller's LOCAL date. */
+  focusRecord(today: string, days?: number): Promise<FocusRecord> {
+    return call<FocusRecord>("focus_record", { today, days });
   },
 
   /** The current streak with earned bad days bridged. `today` is the caller's LOCAL date. */

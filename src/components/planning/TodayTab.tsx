@@ -37,6 +37,7 @@ import {
 } from "lucide-react";
 import BlockModal from "./BlockModal";
 import ExamsCard from "./ExamsCard";
+import FocusContractPrompt from "./FocusContractPrompt";
 import RecoveryCard from "./RecoveryCard";
 import RoutinesModal, { RoutineSuggestion } from "./RoutinesModal";
 import { useExams } from "./useExams";
@@ -145,6 +146,10 @@ export default function TodayTab({ schedule }: Props) {
           onStart={(b) => void startBlock(b)}
           onEdit={openBlock}
         />
+        {/* Closes the loop on commitments. Necessary because `UpNextCard` lists only OPEN
+            blocks: the moment a block is finished it leaves that list, taking its unanswered
+            "did you keep it?" with it. */}
+        {isToday && <OpenContracts blocks={blocks} />}
         {/* Last in the rail deliberately: exams are important but not immediate. Putting a
             countdown above "what do I do right now" trades action for anxiety. */}
         <ExamsCard exams={exams} />
@@ -724,39 +729,76 @@ function UpNextCard({
         </p>
       ) : (
         <div className="-mx-1 flex flex-col">
-          {upcoming.slice(0, 4).map((b) => {
+          {upcoming.slice(0, 4).map((b, i) => {
             const meta = BLOCK_STATE_META[blockVisualState(b, nowMins, isToday)];
             return (
-              <div key={b.id} className="flex items-center gap-3 rounded-[12px] px-3 py-2.5">
-                <button
-                  type="button"
-                  onClick={() => onStart(b)}
-                  aria-label={`Start ${b.title}`}
-                  className={cn(
-                    "grid h-8 w-8 shrink-0 place-items-center rounded-full border transition-colors",
-                    b.status === "active"
-                      ? "border-lime/30 bg-lime/10 text-lime"
-                      : "border-cyan-400/25 bg-cyan-400/10 text-cyan-400 hover:bg-cyan-400/20",
-                  )}
-                >
-                  <Play size={11} strokeWidth={2.5} fill="currentColor" aria-hidden />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onEdit(b)}
-                  className="min-w-0 flex-1 text-left"
-                >
-                  <p className="truncate text-sm text-content-primary">{b.title}</p>
-                  <p className={cn("truncate text-[0.7rem]", meta.text)}>
-                    {fmtHhmmLabel(b.effective_start)} · {fmtMins(b.effective_mins)} · {meta.label}
-                  </p>
-                </button>
+              <div key={b.id} className="rounded-[12px] px-3 py-2.5">
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => onStart(b)}
+                    aria-label={`Start ${b.title}`}
+                    className={cn(
+                      "grid h-8 w-8 shrink-0 place-items-center rounded-full border transition-colors",
+                      b.status === "active"
+                        ? "border-lime/30 bg-lime/10 text-lime"
+                        : "border-cyan-400/25 bg-cyan-400/10 text-cyan-400 hover:bg-cyan-400/20",
+                    )}
+                  >
+                    <Play size={11} strokeWidth={2.5} fill="currentColor" aria-hidden />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onEdit(b)}
+                    className="min-w-0 flex-1 text-left"
+                  >
+                    <p className="truncate text-sm text-content-primary">{b.title}</p>
+                    <p className={cn("truncate text-[0.7rem]", meta.text)}>
+                      {fmtHhmmLabel(b.effective_start)} · {fmtMins(b.effective_mins)} · {meta.label}
+                    </p>
+                  </button>
+                </div>
+
+                {/* Only on the LEADING block, and only today. Four commitment fields at once is
+                    a form, not a decision — and pre-committing to a block you'll reach in six
+                    hours is guessing. */}
+                {i === 0 && isToday && (
+                  <div className="mt-2">
+                    <FocusContractPrompt block={b} />
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
       )}
     </section>
+  );
+}
+
+/**
+ * Unanswered focus contracts on finished blocks.
+ *
+ * This exists because "What's next" only lists OPEN blocks — the instant a block is completed it
+ * leaves that list, and its unanswered "did you keep it?" would leave with it. The question is
+ * the entire value of the mechanism, so it has to survive the block's own row disappearing.
+ *
+ * Renders nothing at all when there's nothing to answer: each child self-suppresses via
+ * `askOnly`, so a settled day shows no empty card.
+ */
+function OpenContracts({ blocks }: { blocks: PlanBlock[] }) {
+  const finished = useMemo(
+    () => blocks.filter((b) => b.status === "done" || b.status === "partial"),
+    [blocks],
+  );
+  if (finished.length === 0) return null;
+
+  return (
+    <div className="flex flex-col gap-2">
+      {finished.map((b) => (
+        <FocusContractPrompt key={b.id} block={b} askOnly showTitle />
+      ))}
+    </div>
   );
 }
 

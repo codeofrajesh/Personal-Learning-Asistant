@@ -1671,6 +1671,176 @@ pub fn exam_plans(conn: &Connection, today: &str) -> AppResult<Vec<ExamPlan>> {
     Ok(out)
 }
 
+// ── Focus contract ───────────────────────────────────────────────────────────
+//
+// A focus contract is a pre-commitment: before starting a block the student writes, in one line,
+// what "done" means for it. At the end they say whether they kept it. That's the whole mechanism.
+//
+// Two deliberate limits:
+//   * It is NOT enforcement. Nothing is locked, blocked, or punished. A planner that fights the
+//     student loses, and the point of a contract is that keeping it is the student's choice —
+//     otherwise there is nothing to learn about themselves from having kept it.
+//   * The verdict is SELF-REPORTED. "Did I do what I said?" is not observable from playback, and
+//     inferring it from executed minutes would score the wrong thing: sitting there for 45
+//     minutes is not the same as finishing what you promised.
+//
+// Stored as `plan_events` rows rather than new columns: it is a sequence of observations about a
+// block, which is exactly what that append-only ledger is for. No migration, and the history is
+// preserved even if the block is later edited.
+
+/// What a student committed to for one block, and how it ended.
+#[derive(Debug, Clone, Serialize)]
+pub struct FocusContract {
+    pub block_id: i64,
+    /// The one-line definition of done, as written.
+    pub intention: String,
+    pub committed_at: String,
+    /// `None` while the block is still in flight.
+    pub kept: Option<bool>,
+    pub resolved_at: Option<String>,
+}
+
+/// How reliably this student keeps what they commit to. The honest mirror the feature exists for.
+#[derive(Debug, Clone, Serialize)]
+pub struct FocusRecord {
+    pub committed: i64,
+    pub kept: i64,
+    pub broken: i64,
+    /// 0-100 over RESOLVED contracts only, `None` until at least three have been answered.
+    pub keep_rate: Option<f64>,
+}
+
+/// Below this many resolved contracts a keep-rate is a coin toss, not a fact about the student.
+const FOCUS_MIN_SAMPLES: i64 = 3;
+
+/// Record a commitment for a block. Replaces any previous one for the same block.
+pub fn commit_focus(conn: &Connection, block_id: i64, intention: &str) -> AppResult<()> {
+    let intention = intention.trim();
+    if intention.is_empty() {
+        return Err(AppError::Invalid(
+            "write what 'done' means before committing".into(),
+        ));
+    }
+    if intention.chars().count() > 200 {
+        return Err(AppError::Invalid(
+            "keep the commitment to one line (200 characters)".into(),
+        ));
+    }
+    let block = get_block(conn, block_id)?;
+
+    // Re-committing supersedes rather than appends: two live contracts on one block would leave
+    // no answer to "what did you promise?". Resolved ones are never touched — that's the record.
+    conn.execute(
+        "DELETE FROM plan_events
+          WHERE block_id = ?1 AND kind = 'committed'
+            AND NOT EXISTS (
+                SELECT 1 FROM plan_events r
+                 WHERE r.block_id = ?1 AND r.kind IN ('contract_kept', 'contract_broken')
+            )",
+        [block_id],
+    )?;
+
+    // `meta` is the existing small-JSON column. Escaped rather than string-formatted: an
+    // intention containing a quote would otherwise produce invalid JSON that reads back empty.
+    let meta = format!(
+        "{{\"intention\":{}}}",
+        serde_json::to_string(intention).unwrap_or_else(|_| "\"\"".into())
+    );
+    log_event(conn, Some(block_id), &block.day, "committed", None, Some(&meta))
+}
+
+/// Record whether the student kept their commitment. Self-reported by design.
+pub fn resolve_focus(conn: &Connection, block_id: i64, kept: bool) -> AppResult<()> {
+    let block = get_block(conn, block_id)?;
+    let kind = if kept { "contract_kept" } else { "contract_broken" };
+    log_event(conn, Some(block_id), &block.day, kind, None, None)
+}
+
+/// The live contract for a block, if one was ever made.
+pub fn focus_contract(conn: &Connection, block_id: i64) -> AppResult<Option<FocusContract>> {
+    let committed: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT at, meta FROM plan_events
+              WHERE block_id = ?1 AND kind = 'committed'
+              ORDER BY id DESC LIMIT 1",
+            [block_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((committed_at, meta)) = committed else {
+        return Ok(None);
+    };
+
+    // A malformed or missing meta yields an empty intention rather than an error: the contract
+    // still happened, and losing the whole row over unreadable text would be worse.
+    let intention = meta
+        .as_deref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v.get("intention").and_then(|i| i.as_str()).map(str::to_owned))
+        .unwrap_or_default();
+
+    let resolution: Option<(String, String)> = conn
+        .query_row(
+            "SELECT kind, at FROM plan_events
+              WHERE block_id = ?1 AND kind IN ('contract_kept', 'contract_broken')
+              ORDER BY id DESC LIMIT 1",
+            [block_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let (kept, resolved_at) = match resolution {
+        Some((kind, at)) => (Some(kind == "contract_kept"), Some(at)),
+        None => (None, None),
+    };
+
+    Ok(Some(FocusContract {
+        block_id,
+        intention,
+        committed_at,
+        kept,
+        resolved_at,
+    }))
+}
+
+/// The student's keep-rate over the trailing `days`.
+pub fn focus_record(conn: &Connection, today: &str, days: i64) -> AppResult<FocusRecord> {
+    let window = format!("-{} days", days.clamp(1, 365));
+    let (committed, kept, broken): (i64, i64, i64) = conn.query_row(
+        "SELECT
+            SUM(CASE WHEN kind = 'committed' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN kind = 'contract_kept' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN kind = 'contract_broken' THEN 1 ELSE 0 END)
+           FROM plan_events
+          WHERE kind IN ('committed', 'contract_kept', 'contract_broken')
+            AND day <= ?1 AND day >= date(?1, ?2)",
+        rusqlite::params![today, window],
+        |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            ))
+        },
+    )?;
+
+    // Rate over RESOLVED contracts only. Counting unanswered ones as broken would punish the
+    // student for blocks still in flight, and counting them as kept would flatter.
+    let resolved = kept + broken;
+    let keep_rate = if resolved >= FOCUS_MIN_SAMPLES {
+        Some((kept as f64 / resolved as f64) * 100.0)
+    } else {
+        None
+    };
+
+    Ok(FocusRecord {
+        committed,
+        kept,
+        broken,
+        keep_rate,
+    })
+}
+
 // ── Streak insurance ─────────────────────────────────────────────────────────
 
 /// A streak that tolerates the occasional bad day, plus the arithmetic behind it.
@@ -2695,6 +2865,121 @@ mod tests {
             revision_days: revision,
             is_archived: false,
         }
+    }
+
+    /// A contract round-trip: commit, read back, resolve, read the verdict.
+    #[test]
+    fn focus_contract_round_trip() {
+        let conn = test_conn();
+        let id = upsert_block(&conn, &dto(DAY, "06:00", 60, "Physics", 2)).unwrap();
+
+        assert!(focus_contract(&conn, id).unwrap().is_none(), "none by default");
+
+        commit_focus(&conn, id, "  Finish chapter 4 problems  ").unwrap();
+        let c = focus_contract(&conn, id).unwrap().unwrap();
+        assert_eq!(c.intention, "Finish chapter 4 problems", "trimmed");
+        assert_eq!(c.kept, None, "unresolved while the block is in flight");
+
+        resolve_focus(&conn, id, true).unwrap();
+        let c = focus_contract(&conn, id).unwrap().unwrap();
+        assert_eq!(c.kept, Some(true));
+        assert!(c.resolved_at.is_some());
+    }
+
+    /// An intention containing quotes must survive the round-trip. Formatting the JSON by hand
+    /// would produce an invalid `meta` that reads back as an empty commitment.
+    #[test]
+    fn focus_contract_escapes_the_intention() {
+        let conn = test_conn();
+        let id = upsert_block(&conn, &dto(DAY, "06:00", 60, "Physics", 2)).unwrap();
+        let tricky = r#"Read "Waves" ch.2 \ notes"#;
+        commit_focus(&conn, id, tricky).unwrap();
+        assert_eq!(focus_contract(&conn, id).unwrap().unwrap().intention, tricky);
+    }
+
+    /// An empty or overlong commitment is rejected — "done" has to actually be defined.
+    #[test]
+    fn focus_contract_requires_a_real_intention() {
+        let conn = test_conn();
+        let id = upsert_block(&conn, &dto(DAY, "06:00", 60, "Physics", 2)).unwrap();
+        assert!(commit_focus(&conn, id, "   ").is_err());
+        assert!(commit_focus(&conn, id, &"x".repeat(201)).is_err());
+        assert!(commit_focus(&conn, id, &"x".repeat(200)).is_ok());
+    }
+
+    /// Re-committing SUPERSEDES an unresolved contract rather than appending: two live promises
+    /// on one block would leave no answer to "what did you commit to?".
+    #[test]
+    fn recommitting_supersedes_an_unresolved_contract() {
+        let conn = test_conn();
+        let id = upsert_block(&conn, &dto(DAY, "06:00", 60, "Physics", 2)).unwrap();
+        commit_focus(&conn, id, "First idea").unwrap();
+        commit_focus(&conn, id, "Actually: ch.4 problems").unwrap();
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plan_events WHERE block_id = ?1 AND kind = 'committed'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "only one live commitment");
+        assert_eq!(
+            focus_contract(&conn, id).unwrap().unwrap().intention,
+            "Actually: ch.4 problems"
+        );
+
+        // Once RESOLVED, the record is history and must not be rewritten.
+        resolve_focus(&conn, id, false).unwrap();
+        commit_focus(&conn, id, "Try again tomorrow").unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plan_events WHERE block_id = ?1 AND kind = 'committed'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "the resolved contract is preserved alongside the new one");
+    }
+
+    /// The keep-rate counts RESOLVED contracts only, and stays null until there's real signal.
+    #[test]
+    fn focus_record_needs_resolved_samples() {
+        let conn = test_conn();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = upsert_block(
+                &conn,
+                &dto(DAY, &format!("{:02}:00", 6 + i), 60, &format!("B{i}"), 2),
+            )
+            .unwrap();
+            commit_focus(&conn, id, "Do the thing").unwrap();
+            ids.push(id);
+        }
+
+        // Committed but unanswered: no rate yet. Counting these as broken would punish blocks
+        // still in flight; counting them as kept would flatter.
+        let r = focus_record(&conn, DAY, 30).unwrap();
+        assert_eq!(r.committed, 4);
+        assert_eq!(r.keep_rate, None, "nothing resolved yet");
+
+        resolve_focus(&conn, ids[0], true).unwrap();
+        resolve_focus(&conn, ids[1], true).unwrap();
+        assert_eq!(
+            focus_record(&conn, DAY, 30).unwrap().keep_rate,
+            None,
+            "two answers is still a coin toss"
+        );
+
+        resolve_focus(&conn, ids[2], false).unwrap();
+        let r = focus_record(&conn, DAY, 30).unwrap();
+        assert_eq!(r.kept, 2);
+        assert_eq!(r.broken, 1);
+        assert_eq!(
+            r.keep_rate.map(|v| v.round()),
+            Some(67.0),
+            "2 of 3 resolved, the unanswered one is excluded"
+        );
     }
 
     /// Insert a run of consistency_log days ending on `last`, newest score last.

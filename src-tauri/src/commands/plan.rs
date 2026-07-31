@@ -20,7 +20,8 @@
 use tauri::State;
 
 use crate::db::plan::{
-    self, BlockInputDto, DayPlan, Exam, ExamInputDto, ExamPlan, PeakHour, PlanBlock, PlanTemplate,
+    self, BlockInputDto, DayPlan, Exam, ExamInputDto, ExamPlan, FocusContract, FocusRecord,
+    PeakHour, PlanBlock, PlanTemplate,
     PlanTemplateBlock, ReminderState, StreakStatus, TemplateBlockInputDto, TemplateInputDto,
 };
 use crate::db::queries::{self, ScoreWindow};
@@ -261,6 +262,36 @@ pub fn suggested_plan_template(
     weekday: i64,
 ) -> AppResult<Option<PlanTemplate>> {
     db.with(|conn| plan::suggested_template(conn, weekday))
+}
+
+// ── Focus contract ───────────────────────────────────────────────────────────
+
+/// Record what "done" means for a block, before starting it. Supersedes any unresolved
+/// commitment on the same block.
+#[tauri::command]
+pub fn commit_focus(db: State<'_, Db>, block_id: i64, intention: String) -> AppResult<()> {
+    db.with(|conn| plan::commit_focus(conn, block_id, &intention))
+}
+
+/// Record whether the commitment was kept. SELF-REPORTED by design — "did I do what I said?"
+/// isn't observable from playback, and inferring it from minutes would score the wrong thing.
+#[tauri::command]
+pub fn resolve_focus(db: State<'_, Db>, block_id: i64, kept: bool) -> AppResult<()> {
+    db.with(|conn| plan::resolve_focus(conn, block_id, kept))
+}
+
+/// The commitment for one block, if any.
+#[tauri::command]
+pub fn focus_contract(db: State<'_, Db>, block_id: i64) -> AppResult<Option<FocusContract>> {
+    db.with(|conn| plan::focus_contract(conn, block_id))
+}
+
+/// Keep-rate over the trailing `days`. `today` is the caller's LOCAL date.
+#[tauri::command]
+pub fn focus_record(db: State<'_, Db>, today: String, days: Option<i64>) -> AppResult<FocusRecord> {
+    validate_day(&today)?;
+    let window = days.unwrap_or(30);
+    db.with(|conn| plan::focus_record(conn, &today, window))
 }
 
 /// The current streak, with earned bad days bridged.
