@@ -16,6 +16,9 @@ import type {
   CourseView,
   DashboardData,
   DayPlan,
+  Exam,
+  ExamInput,
+  ExamPlan,
   FolderPreview,
   GoalSummary,
   GoalView,
@@ -359,6 +362,28 @@ export const ipc = {
    *  Idempotent: re-applying skips blocks that already exist at the same time+title. */
   applyPlanTemplate(templateId: number, day: string): Promise<number> {
     return call<number>("apply_plan_template", { templateId, day });
+  },
+
+  // ── Exams & backward planning (v10) ─────────────────────────────────────────
+
+  /** All exams, soonest first. Archived ones are excluded unless asked for. */
+  listExams(includeArchived = false): Promise<Exam[]> {
+    return call<Exam[]>("list_exams", { includeArchived });
+  },
+
+  /** Create or update an exam. Returns its id. */
+  upsertExam(exam: ExamInput): Promise<number> {
+    return call<number>("upsert_exam", { exam });
+  },
+
+  /** Delete an exam. Blocks already scheduled for it are kept — the work still happened. */
+  deleteExam(id: number): Promise<void> {
+    return call<void>("delete_exam", { id });
+  },
+
+  /** Backward plans for every active exam, as of the caller's LOCAL date. */
+  examPlans(today: string): Promise<ExamPlan[]> {
+    return call<ExamPlan[]>("exam_plans", { today });
   },
 
   // ── Routine templates ───────────────────────────────────────────────────────

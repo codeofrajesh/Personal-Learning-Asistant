@@ -545,6 +545,56 @@ export interface DayPlan {
   adjust_state: string | null;
 }
 
+// ── Exams & backward planning (v10) ─────────────────────────────────────────
+
+/** A dated exam attached to a course subtree (backend `Exam`). */
+export interface Exam {
+  id: number;
+  name: string;
+  node_id: number | null;
+  /** Resolved course name, when the node still exists. */
+  node_name: string | null;
+  exam_date: string;
+  /** Minutes/day the student INTENDS to give it (advisory, not a constraint). */
+  daily_target_mins: number;
+  /** Days before the exam to stop scheduling new material and revise instead. */
+  revision_days: number;
+  is_archived: boolean;
+}
+
+/** Create/update payload for an exam (backend `ExamInputDto`). */
+export interface ExamInput {
+  id?: number | null;
+  name: string;
+  node_id?: number | null;
+  exam_date: string;
+  daily_target_mins?: number;
+  revision_days?: number;
+  is_archived?: boolean;
+}
+
+/** The backward plan for one exam (backend `ExamPlan`). Derived on read, never stored -
+ *  materials are added and watched constantly, so a cached projection goes stale in a day. */
+export interface ExamPlan {
+  exam: Exam;
+  /** Calendar days to the exam (0 = today, negative = past). */
+  days_until: number;
+  /** Days usable for NEW material (`days_until` minus the revision tail). */
+  study_days: number;
+  remaining_items: number;
+  /** Honest minutes left, already multiplied by the learned pace for this course. */
+  remaining_mins: number;
+  /** What the syllabus actually demands per day. */
+  required_daily_mins: number;
+  target_daily_mins: number;
+  /** True when the stated intention is enough. */
+  on_track: boolean;
+  /** True once no study days remain (imminent or passed). */
+  out_of_time: boolean;
+  /** Plain-language verdict in content terms, never a ratio. */
+  message: string;
+}
+
 // ── Routine templates (backend `db::plan` templates section) ────────────────
 
 /** A routine day ("my normal weekday") with rolled-up counts (backend `PlanTemplate`). */

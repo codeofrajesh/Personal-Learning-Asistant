@@ -36,8 +36,10 @@ import {
   Moon,
 } from "lucide-react";
 import BlockModal from "./BlockModal";
+import ExamsCard from "./ExamsCard";
 import RecoveryCard from "./RecoveryCard";
 import RoutinesModal, { RoutineSuggestion } from "./RoutinesModal";
+import { useExams } from "./useExams";
 import { useRecovery } from "./useRecovery";
 import { useTemplates } from "./useTemplates";
 import {
@@ -71,6 +73,8 @@ export default function TodayTab({ schedule }: Props) {
   const recovery = useRecovery(schedule);
   // Routines. Loaded once here and shared with the empty-day offer and the modal.
   const templates = useTemplates();
+  // Dated exams + their backward plans. Refetches on the day boundary, not on a timer.
+  const exams = useExams();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editBlock, setEditBlock] = useState<PlanBlock | null>(null);
@@ -141,6 +145,9 @@ export default function TodayTab({ schedule }: Props) {
           onStart={(b) => void startBlock(b)}
           onEdit={openBlock}
         />
+        {/* Last in the rail deliberately: exams are important but not immediate. Putting a
+            countdown above "what do I do right now" trades action for anxiety. */}
+        <ExamsCard exams={exams} />
       </div>
 
       <BlockModal

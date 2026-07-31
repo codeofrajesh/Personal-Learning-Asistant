@@ -324,6 +324,11 @@ pub fn build_day_snapshot(conn: &Connection, day: &str) -> AppResult<DaySnapshot
     let (wake, stop) = resolve_day_window(conn, day)?;
     let rows = list_day_blocks(conn, day)?;
 
+    // Which nodes feed an exam that is still ahead of the day being planned. One query for the
+    // whole day rather than a lookup per block. `day` is the reference date, not `'now'`: when
+    // planning a future day, an exam between now and then is no longer urgent *for that day*.
+    let exam_nodes = exam_linked_nodes(conn, day).unwrap_or_default();
+
     let mut blocks = Vec::with_capacity(rows.len());
     for b in &rows {
         // A malformed stored time would otherwise be silently treated as midnight; fall back
@@ -341,9 +346,12 @@ pub fn build_day_snapshot(conn: &Connection, day: &str) -> AppResult<DaySnapshot
             executed_mins: b.executed_mins,
             spill_count: b.spill_count.clamp(0, 100) as i32,
             pace_ratio: pace_for_node(conn, b.target_node_id),
-            // Exam linkage arrives with backward-planning (a later phase); until then no block
-            // claims exam urgency rather than every block pretending to have it.
-            exam_linked: false,
+            // v10: real exam linkage. A block feeding a dated exam that hasn't happened yet
+            // earns the solver's 1.5x urgency, so triage sacrifices non-exam work first.
+            // Until v10 this was hardcoded `false` and the multiplier was dead code.
+            exam_linked: b
+                .target_node_id
+                .is_some_and(|n| exam_nodes.contains(&n)),
         });
     }
 
@@ -1359,6 +1367,346 @@ pub fn apply_template(conn: &Connection, template_id: i64, day: &str) -> AppResu
     Ok(n as i64)
 }
 
+// ── Exams & backward planning (v10) ──────────────────────────────────────────
+//
+// Backward planning answers ONE question honestly: "given what's left of this syllabus, my
+// learned pace, and the days remaining, how much per day does this actually take?" The answer
+// is frequently unwelcome, and that is the feature — a student who finds out in week one that
+// the exam needs 3h/day can still act on it. Finding out the night before is not a plan.
+//
+// Everything here is derived on read. There is no stored "plan" to go stale: materials get
+// added, watched, and completed constantly, and a cached projection would be wrong within a day.
+
+/// A dated exam attached to a course subtree.
+#[derive(Debug, Clone, Serialize)]
+pub struct Exam {
+    pub id: i64,
+    pub name: String,
+    pub node_id: Option<i64>,
+    /// Resolved course name, when the node still exists.
+    pub node_name: Option<String>,
+    pub exam_date: String,
+    pub daily_target_mins: i64,
+    pub revision_days: i64,
+    pub is_archived: bool,
+}
+
+/// Create/update payload for an exam.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExamInputDto {
+    pub id: Option<i64>,
+    pub name: String,
+    pub node_id: Option<i64>,
+    pub exam_date: String,
+    #[serde(default = "default_daily_target")]
+    pub daily_target_mins: i64,
+    #[serde(default = "default_revision_days")]
+    pub revision_days: i64,
+    #[serde(default)]
+    pub is_archived: bool,
+}
+
+fn default_daily_target() -> i64 {
+    60
+}
+fn default_revision_days() -> i64 {
+    3
+}
+
+/// The backward plan for one exam: what's left, how long there is, and what that costs per day.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExamPlan {
+    pub exam: Exam,
+    /// Calendar days from `today` to the exam (0 = today, negative = past).
+    pub days_until: i64,
+    /// Days actually usable for NEW material (`days_until` minus the revision tail).
+    pub study_days: i64,
+    /// Items in the subtree not yet finished.
+    pub remaining_items: i64,
+    /// Honest minutes of content left, already multiplied by the learned pace for this course.
+    pub remaining_mins: i64,
+    /// Minutes/day the syllabus actually demands.
+    pub required_daily_mins: i64,
+    /// Minutes/day the student said they'd give it.
+    pub target_daily_mins: i64,
+    /// True when `required <= target` — the stated intention is enough.
+    pub on_track: bool,
+    /// True once there are no study days left (exam imminent or passed).
+    pub out_of_time: bool,
+    /// One plain-language verdict. Content terms, never a ratio.
+    pub message: String,
+}
+
+const EXAM_SELECT: &str = "SELECT e.id, e.name, e.node_id, n.name, e.exam_date,
+        e.daily_target_mins, e.revision_days, e.is_archived
+   FROM exams e
+   LEFT JOIN nodes n ON n.id = e.node_id";
+
+fn map_exam(r: &rusqlite::Row<'_>) -> rusqlite::Result<Exam> {
+    Ok(Exam {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        node_id: r.get(2)?,
+        node_name: r.get(3)?,
+        exam_date: r.get(4)?,
+        daily_target_mins: r.get(5)?,
+        revision_days: r.get(6)?,
+        is_archived: r.get::<_, i64>(7)? != 0,
+    })
+}
+
+/// All exams, soonest first. Archived ones are included only when asked for — a past exam
+/// should stop competing for attention on its own, without the student tidying up.
+pub fn list_exams(conn: &Connection, include_archived: bool) -> AppResult<Vec<Exam>> {
+    let sql = if include_archived {
+        format!("{EXAM_SELECT} ORDER BY e.exam_date ASC, e.id ASC")
+    } else {
+        format!("{EXAM_SELECT} WHERE e.is_archived = 0 ORDER BY e.exam_date ASC, e.id ASC")
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], map_exam)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Create or update an exam. Returns its id.
+pub fn upsert_exam(conn: &Connection, input: &ExamInputDto) -> AppResult<i64> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(AppError::Invalid("exam name is required".into()));
+    }
+    // A malformed date would silently produce a nonsense countdown forever.
+    if !is_iso_day(&input.exam_date) {
+        return Err(AppError::Invalid(format!(
+            "invalid exam_date '{}' (want YYYY-MM-DD)",
+            input.exam_date
+        )));
+    }
+    let target = input.daily_target_mins.clamp(5, 16 * 60);
+    let revision = input.revision_days.clamp(0, 60);
+
+    match input.id {
+        Some(id) => {
+            let n = conn.execute(
+                "UPDATE exams SET name = ?2, node_id = ?3, exam_date = ?4,
+                                  daily_target_mins = ?5, revision_days = ?6, is_archived = ?7
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    name,
+                    input.node_id,
+                    input.exam_date,
+                    target,
+                    revision,
+                    input.is_archived as i64
+                ],
+            )?;
+            if n == 0 {
+                return Err(AppError::NotFound(format!("exam {id} not found")));
+            }
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO exams(name, node_id, exam_date, daily_target_mins, revision_days,
+                                   is_archived)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    name,
+                    input.node_id,
+                    input.exam_date,
+                    target,
+                    revision,
+                    input.is_archived as i64
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+/// Delete an exam. Blocks that were scheduled for it keep existing — the work was still done,
+/// and retroactively deleting a week of study because an exam was removed would be data loss.
+pub fn delete_exam(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM exams WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// Shape check for `YYYY-MM-DD`. Deliberately not a full calendar validation: the frontend
+/// sends real dates, and this only has to reject the shapes that would corrupt date maths.
+fn is_iso_day(day: &str) -> bool {
+    let b = day.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit())
+}
+
+/// Remaining, unwatched content in a node's subtree as `(items, content_minutes)`.
+///
+/// "Remaining" credits partial progress: a 60-minute lecture watched to 40 minutes leaves 20,
+/// not 60. Counting it whole would inflate every projection and make the feature cry wolf.
+/// Items with no known duration contribute a conservative 10-minute placeholder rather than
+/// zero — a PDF with no page count is not free work.
+fn remaining_syllabus(conn: &Connection, node_id: i64) -> AppResult<(i64, f64)> {
+    conn.query_row(
+        "WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+         )
+         SELECT
+            COUNT(*),
+            COALESCE(SUM(
+                MAX(0.0,
+                    CASE
+                        WHEN COALESCE(m.duration_secs, 0) > 0
+                            THEN m.duration_secs - COALESCE(w.position_secs, 0)
+                        ELSE 600.0
+                    END
+                )
+            ), 0.0) / 60.0
+         FROM materials m
+         JOIN subtree s ON s.id = m.node_id
+         LEFT JOIN watch_progress w ON w.material_id = m.id
+         WHERE m.status = 'active'
+           AND m.is_completed = 0
+           AND COALESCE(w.completed, 0) = 0",
+        [node_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(Into::into)
+}
+
+/// Whole days from `from` to `to` (both `YYYY-MM-DD`), via SQLite's julian day.
+///
+/// Uses the DB purely as a calendar calculator on two explicit dates — no `'now'`, so this is
+/// still local-time-correct. Rust date arithmetic would mean a new dependency for one subtraction.
+fn days_between(conn: &Connection, from: &str, to: &str) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT CAST(julianday(?2) - julianday(?1) AS INTEGER)",
+        rusqlite::params![from, to],
+        |r| r.get::<_, Option<i64>>(0),
+    )?
+    .unwrap_or(0))
+}
+
+/// Build the backward plan for one exam, as of the caller's LOCAL `today`.
+pub fn exam_plan(conn: &Connection, exam: Exam, today: &str) -> AppResult<ExamPlan> {
+    let days_until = days_between(conn, today, &exam.exam_date)?;
+    // The revision tail is reserved for review, so new material stops before it.
+    let study_days = (days_until - exam.revision_days).max(0);
+
+    let (remaining_items, content_mins) = match exam.node_id {
+        Some(node) => remaining_syllabus(conn, node)?,
+        // An exam with no course attached still counts down; it just can't project a workload.
+        None => (0, 0.0),
+    };
+    // The learned pace is the whole point of using it here: 90 minutes of lecture is not 90
+    // minutes of this student's evening.
+    let pace = pace_for_node(conn, exam.node_id);
+    let remaining_mins = (content_mins * pace).round() as i64;
+
+    let out_of_time = study_days <= 0;
+    let required_daily_mins = if out_of_time {
+        remaining_mins
+    } else {
+        (remaining_mins as f64 / study_days as f64).ceil() as i64
+    };
+    let target_daily_mins = exam.daily_target_mins;
+    let on_track = !out_of_time && required_daily_mins <= target_daily_mins;
+
+    let message = if days_until < 0 {
+        "This exam has passed.".to_string()
+    } else if remaining_items == 0 {
+        match exam.node_id {
+            Some(_) => "Everything for this exam is covered. The rest is revision.".to_string(),
+            None => "No course linked yet, so there's nothing to project.".to_string(),
+        }
+    } else if out_of_time {
+        format!(
+            "{remaining_items} items still uncovered with no study days left — this is triage now, \
+             not coverage. Pick what matters most."
+        )
+    } else if on_track {
+        format!(
+            "{} a day covers the {remaining_items} items left, with {} to spare.",
+            fmt_mins_short(required_daily_mins),
+            fmt_mins_short(target_daily_mins - required_daily_mins),
+        )
+    } else {
+        format!(
+            "The {remaining_items} items left need {} a day, not {}. Either give it more time or \
+             decide now what you're not going to cover.",
+            fmt_mins_short(required_daily_mins),
+            fmt_mins_short(target_daily_mins),
+        )
+    };
+
+    Ok(ExamPlan {
+        exam,
+        days_until,
+        study_days,
+        remaining_items,
+        remaining_mins,
+        required_daily_mins,
+        target_daily_mins,
+        on_track,
+        out_of_time,
+        message,
+    })
+}
+
+/// Backward plans for every active exam, soonest first.
+pub fn exam_plans(conn: &Connection, today: &str) -> AppResult<Vec<ExamPlan>> {
+    let mut out = Vec::new();
+    for exam in list_exams(conn, false)? {
+        out.push(exam_plan(conn, exam, today)?);
+    }
+    Ok(out)
+}
+
+/// Node ids with an active exam still ahead of `today`, including every ancestor of the exam's
+/// node.
+///
+/// Ancestors matter: an exam is set on "Physics", but a block targets the specific chapter
+/// underneath it. Matching only the exact node would leave almost every real block unlinked,
+/// which is how the 1.5x urgency multiplier would stay dead code in practice.
+fn exam_linked_nodes(conn: &Connection, today: &str) -> AppResult<std::collections::HashSet<i64>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE subtree(id) AS (
+            SELECT node_id FROM exams
+             WHERE is_archived = 0 AND node_id IS NOT NULL AND exam_date >= ?1
+            UNION
+            SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+         )
+         SELECT id FROM subtree",
+    )?;
+    let rows = stmt.query_map([today], |r| r.get::<_, i64>(0))?;
+    let mut set = std::collections::HashSet::new();
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(set)
+}
+
+/// Short duration label for the verdict copy ("1h 20m", "45m").
+fn fmt_mins_short(mins: i64) -> String {
+    let m = mins.max(0);
+    if m < 60 {
+        format!("{m}m")
+    } else if m % 60 == 0 {
+        format!("{}h", m / 60)
+    } else {
+        format!("{}h {}m", m / 60, m % 60)
+    }
+}
+
 // ── Boot reconciliation ──────────────────────────────────────────────────────
 
 /// Close out every day before `today`: any block still `pending`/`active` on a past day is
@@ -2129,6 +2477,252 @@ mod tests {
         let _ = empty;
 
         assert!(suggested_template(&conn, 7).is_err(), "weekday must be 0..=6");
+    }
+
+    /// Helper: a course node with `n` video materials of `mins` each.
+    fn course_with_videos(conn: &Connection, name: &str, n: i64, mins: f64) -> i64 {
+        let node = crate::db::queries::upsert_root_node(conn, name).unwrap();
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                       duration_secs)
+                 VALUES(?1, ?2, ?3, 'video', 'mp4', ?4)",
+                rusqlite::params![
+                    node,
+                    format!("/{name}/{i}.mp4"),
+                    format!("{name} {i}"),
+                    mins * 60.0
+                ],
+            )
+            .unwrap();
+        }
+        node
+    }
+
+    fn exam_dto(name: &str, node: Option<i64>, date: &str, target: i64, revision: i64) -> ExamInputDto {
+        ExamInputDto {
+            id: None,
+            name: name.to_string(),
+            node_id: node,
+            exam_date: date.to_string(),
+            daily_target_mins: target,
+            revision_days: revision,
+            is_archived: false,
+        }
+    }
+
+    /// Exam CRUD round-trip, including the archived filter and input clamping.
+    #[test]
+    fn exam_crud_round_trip() {
+        let conn = test_conn();
+        let node = crate::db::queries::upsert_root_node(&conn, "Physics").unwrap();
+
+        let id = upsert_exam(&conn, &exam_dto("  Finals  ", Some(node), "2026-09-01", 90, 3))
+            .unwrap();
+        let list = list_exams(&conn, false).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Finals", "the name is trimmed");
+        assert_eq!(list[0].node_name.as_deref(), Some("Physics"));
+
+        // Archiving hides it from the default list without deleting anything.
+        let mut edit = exam_dto("Finals", Some(node), "2026-09-01", 90, 3);
+        edit.id = Some(id);
+        edit.is_archived = true;
+        upsert_exam(&conn, &edit).unwrap();
+        assert!(list_exams(&conn, false).unwrap().is_empty(), "archived is hidden");
+        assert_eq!(list_exams(&conn, true).unwrap().len(), 1, "but still there");
+
+        delete_exam(&conn, id).unwrap();
+        assert!(list_exams(&conn, true).unwrap().is_empty());
+    }
+
+    /// A malformed date is rejected rather than stored to produce a nonsense countdown forever.
+    #[test]
+    fn exam_rejects_bad_input() {
+        let conn = test_conn();
+        assert!(upsert_exam(&conn, &exam_dto("X", None, "01-09-2026", 60, 3)).is_err());
+        assert!(upsert_exam(&conn, &exam_dto("   ", None, "2026-09-01", 60, 3)).is_err());
+
+        // Out-of-range intentions are clamped, not rejected: the intent is obvious.
+        let id = upsert_exam(&conn, &exam_dto("X", None, "2026-09-01", 99_999, 9_999)).unwrap();
+        let e = list_exams(&conn, false).unwrap().into_iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.daily_target_mins, 16 * 60);
+        assert_eq!(e.revision_days, 60);
+    }
+
+    /// The core backward-planning maths: remaining content ÷ usable days, at the learned pace,
+    /// with the revision tail withheld.
+    #[test]
+    fn exam_plan_projects_required_daily_minutes() {
+        let conn = test_conn();
+        // 10 lectures × 60 min = 600 minutes of content.
+        let node = course_with_videos(&conn, "Physics", 10, 60.0);
+        upsert_exam(&conn, &exam_dto("Finals", Some(node), "2026-08-14", 60, 3)).unwrap();
+
+        // From 2026-07-31 that's 14 days out, minus 3 revision days = 11 study days.
+        let plan = &exam_plans(&conn, DAY).unwrap()[0];
+        assert_eq!(plan.days_until, 14);
+        assert_eq!(plan.study_days, 11);
+        assert_eq!(plan.remaining_items, 10);
+        assert_eq!(plan.remaining_mins, 600, "pace 1.0 until anything is learned");
+        assert_eq!(plan.required_daily_mins, 55, "600 / 11, rounded up");
+        assert!(plan.on_track, "55 <= the 60/day the student intends");
+
+        // A slower learned pace inflates the honest workload — this is the whole point of
+        // feeding velocity into the projection rather than trusting raw content length.
+        record_velocity(&conn, node, 90.0, 60.0).unwrap();
+        let plan = &exam_plans(&conn, DAY).unwrap()[0];
+        assert_eq!(plan.remaining_mins, 900, "600 content minutes at 1.5x");
+        assert_eq!(plan.required_daily_mins, 82, "900 / 11, rounded up");
+        assert!(!plan.on_track, "82 > 60 — the student needs to know now");
+        assert!(plan.message.contains("82m") || plan.message.contains("1h 22m"));
+    }
+
+    /// Partial progress must COUNT. A 60-minute lecture watched to 40 leaves 20 minutes, not 60 —
+    /// otherwise every projection over-states the work and the feature cries wolf.
+    #[test]
+    fn exam_plan_credits_partial_progress() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 2, 60.0);
+        upsert_exam(&conn, &exam_dto("Finals", Some(node), "2026-08-11", 60, 0)).unwrap();
+
+        let before = exam_plans(&conn, DAY).unwrap()[0].remaining_mins;
+        assert_eq!(before, 120);
+
+        // Watch 40 of the first lecture's 60 minutes.
+        let mid: i64 = conn
+            .query_row("SELECT MIN(id) FROM materials", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO watch_progress(material_id, position_secs, duration_secs)
+             VALUES(?1, 2400, 3600)",
+            [mid],
+        )
+        .unwrap();
+
+        let plan = &exam_plans(&conn, DAY).unwrap()[0];
+        assert_eq!(plan.remaining_mins, 80, "only the unwatched 20 + the untouched 60");
+        assert_eq!(plan.remaining_items, 2, "still two items in flight");
+
+        // Completing it removes it from the syllabus entirely.
+        conn.execute("UPDATE materials SET is_completed = 1 WHERE id = ?1", [mid])
+            .unwrap();
+        let plan = &exam_plans(&conn, DAY).unwrap()[0];
+        assert_eq!(plan.remaining_items, 1);
+        assert_eq!(plan.remaining_mins, 60);
+    }
+
+    /// Items with no known duration are not free work — they get a conservative placeholder.
+    #[test]
+    fn exam_plan_estimates_unknown_durations() {
+        let conn = test_conn();
+        let node = crate::db::queries::upsert_root_node(&conn, "Notes").unwrap();
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension)
+             VALUES(?1, '/n/a.pdf', 'a.pdf', 'pdf', 'pdf')",
+            [node],
+        )
+        .unwrap();
+        upsert_exam(&conn, &exam_dto("Finals", Some(node), "2026-08-11", 60, 0)).unwrap();
+
+        let plan = &exam_plans(&conn, DAY).unwrap()[0];
+        assert_eq!(plan.remaining_mins, 10, "a PDF with no page count is not zero work");
+    }
+
+    /// Out of study days, the verdict switches from coverage to triage rather than dividing by
+    /// zero or quietly reporting "0 a day".
+    #[test]
+    fn exam_plan_handles_running_out_of_time() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 5, 60.0);
+        // Exam in 2 days with a 3-day revision tail → zero usable study days.
+        upsert_exam(&conn, &exam_dto("Finals", Some(node), "2026-08-02", 60, 3)).unwrap();
+
+        let plan = &exam_plans(&conn, DAY).unwrap()[0];
+        assert!(plan.out_of_time);
+        assert_eq!(plan.study_days, 0);
+        assert!(!plan.on_track);
+        assert_eq!(plan.required_daily_mins, 300, "all of it, with no days to spread it");
+        assert!(plan.message.contains("triage"));
+    }
+
+    /// A finished syllabus says so, and a past exam says that instead of projecting work.
+    #[test]
+    fn exam_plan_reports_covered_and_past() {
+        let conn = test_conn();
+        let node = course_with_videos(&conn, "Physics", 1, 60.0);
+        conn.execute("UPDATE materials SET is_completed = 1", []).unwrap();
+        upsert_exam(&conn, &exam_dto("Finals", Some(node), "2026-08-14", 60, 3)).unwrap();
+
+        let plan = &exam_plans(&conn, DAY).unwrap()[0];
+        assert_eq!(plan.remaining_items, 0);
+        assert!(plan.message.contains("revision"));
+
+        // A past exam is reported as past, not as a workload.
+        let past = upsert_exam(&conn, &exam_dto("Mock", Some(node), "2026-07-01", 60, 0)).unwrap();
+        let plans = exam_plans(&conn, DAY).unwrap();
+        let p = plans.iter().find(|p| p.exam.id == past).unwrap();
+        assert!(p.days_until < 0);
+        assert!(p.message.contains("passed"));
+    }
+
+    /// An exam with no course attached still counts down, but must not pretend to project work.
+    #[test]
+    fn exam_plan_without_a_course_projects_nothing() {
+        let conn = test_conn();
+        upsert_exam(&conn, &exam_dto("Unknown", None, "2026-08-14", 60, 3)).unwrap();
+        let plan = &exam_plans(&conn, DAY).unwrap()[0];
+        assert_eq!(plan.days_until, 14);
+        assert_eq!(plan.remaining_mins, 0);
+        assert!(plan.message.contains("No course linked"));
+    }
+
+    /// v10's real payoff: a block feeding a dated exam earns the solver's urgency multiplier.
+    /// Ancestors count, because an exam is set on "Physics" while blocks target a chapter under
+    /// it — matching only the exact node would leave real blocks unlinked and the 1.5x dead.
+    #[test]
+    fn exam_linkage_reaches_the_solver_through_descendants() {
+        let conn = test_conn();
+        let physics = crate::db::queries::upsert_root_node(&conn, "Physics").unwrap();
+        let chapter =
+            crate::db::queries::upsert_child_node(&conn, physics, "Waves").unwrap();
+        let unrelated = crate::db::queries::upsert_root_node(&conn, "History").unwrap();
+
+        let mut linked = dto(DAY, "06:00", 60, "Waves revision", 2);
+        linked.target_kind = "node_minutes".into();
+        linked.target_node_id = Some(chapter);
+        upsert_block(&conn, &linked).unwrap();
+
+        let mut other = dto(DAY, "08:00", 60, "History reading", 2);
+        other.target_kind = "node_minutes".into();
+        other.target_node_id = Some(unrelated);
+        upsert_block(&conn, &other).unwrap();
+
+        // No exam yet → nothing is urgent.
+        let snap = build_day_snapshot(&conn, DAY).unwrap();
+        assert!(snap.blocks.iter().all(|b| !b.exam_linked));
+
+        upsert_exam(&conn, &exam_dto("Finals", Some(physics), "2026-08-14", 60, 3)).unwrap();
+        let snap = build_day_snapshot(&conn, DAY).unwrap();
+        let waves = snap.blocks.iter().find(|b| b.title == "Waves revision").unwrap();
+        let history = snap.blocks.iter().find(|b| b.title == "History reading").unwrap();
+        assert!(waves.exam_linked, "a chapter under the exam's course is exam work");
+        assert!(!history.exam_linked, "an unrelated course is not");
+        assert!(
+            waves.value() > history.value(),
+            "exam work must outrank equal-weight non-exam work in triage"
+        );
+
+        // A PAST exam stops conferring urgency on its own.
+        let conn2 = test_conn();
+        let n = crate::db::queries::upsert_root_node(&conn2, "Physics").unwrap();
+        let mut b = dto(DAY, "06:00", 60, "Revision", 2);
+        b.target_kind = "node_minutes".into();
+        b.target_node_id = Some(n);
+        upsert_block(&conn2, &b).unwrap();
+        upsert_exam(&conn2, &exam_dto("Old", Some(n), "2026-07-01", 60, 0)).unwrap();
+        let snap = build_day_snapshot(&conn2, DAY).unwrap();
+        assert!(!snap.blocks[0].exam_linked, "a finished exam is not urgent");
     }
 
     /// The Today payload exposes the window, totals, and the advisory pre-mortem together.

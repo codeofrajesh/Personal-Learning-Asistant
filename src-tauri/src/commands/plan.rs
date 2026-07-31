@@ -20,8 +20,8 @@
 use tauri::State;
 
 use crate::db::plan::{
-    self, BlockInputDto, DayPlan, PlanBlock, PlanTemplate, PlanTemplateBlock, ReminderState,
-    TemplateBlockInputDto, TemplateInputDto,
+    self, BlockInputDto, DayPlan, Exam, ExamInputDto, ExamPlan, PlanBlock, PlanTemplate,
+    PlanTemplateBlock, ReminderState, TemplateBlockInputDto, TemplateInputDto,
 };
 use crate::db::queries::{self, ScoreWindow};
 use crate::db::Db;
@@ -261,6 +261,37 @@ pub fn suggested_plan_template(
     weekday: i64,
 ) -> AppResult<Option<PlanTemplate>> {
     db.with(|conn| plan::suggested_template(conn, weekday))
+}
+
+// ── Exams & backward planning (v10) ──────────────────────────────────────────
+
+/// All exams, soonest first. Archived ones are excluded unless asked for.
+#[tauri::command]
+pub fn list_exams(db: State<'_, Db>, include_archived: Option<bool>) -> AppResult<Vec<Exam>> {
+    let all = include_archived.unwrap_or(false);
+    db.with(|conn| plan::list_exams(conn, all))
+}
+
+/// Create or update an exam. Returns its id.
+#[tauri::command]
+pub fn upsert_exam(db: State<'_, Db>, exam: ExamInputDto) -> AppResult<i64> {
+    db.with(|conn| plan::upsert_exam(conn, &exam))
+}
+
+/// Delete an exam. Blocks already scheduled for it are kept — the work still happened.
+#[tauri::command]
+pub fn delete_exam(db: State<'_, Db>, id: i64) -> AppResult<()> {
+    db.with(|conn| plan::delete_exam(conn, id))
+}
+
+/// Backward plans for every active exam, as of the caller's LOCAL `today`.
+///
+/// Derived on read, never stored: materials are added, watched and completed constantly, so a
+/// cached projection would be wrong within a day.
+#[tauri::command]
+pub fn exam_plans(db: State<'_, Db>, today: String) -> AppResult<Vec<ExamPlan>> {
+    validate_day(&today)?;
+    db.with(|conn| plan::exam_plans(conn, &today))
 }
 
 /// Reconcile every past day from the caller's LOCAL date, then re-snapshot.

@@ -30,7 +30,13 @@
 ///     scoring formula can evolve without rewriting the meaning of historical snapshots.
 ///     NOTE: no new scoring tables — Weekly/Monthly/Rolling-90 are DERIVED aggregates over
 ///     the existing one-row-per-day `consistency_log`.
-pub const SCHEMA_VERSION: i64 = 9;
+/// v10: added the `exams` table — dated exams attached to a course subtree, enabling
+///     backward-planning ("cover the remaining syllabus before this date"). This is what
+///     makes `solver::DayBlock.exam_linked` real: before v10 it was hardcoded `false`, so no
+///     block could claim exam urgency and the solver's 1.5x multiplier was dead code. New
+///     table only — `CREATE TABLE IF NOT EXISTS` covers both fresh installs and migrations,
+///     so there are no guarded ALTERs for this step.
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// The complete v1 schema. Every statement is `IF NOT EXISTS` where SQLite allows,
 /// so re-application is a no-op.
@@ -304,6 +310,31 @@ CREATE TABLE IF NOT EXISTS reminder_state (
     ack_at     TEXT,
     snooze_to  TEXT
 );
+
+-- Dated exams (v10) — the target that makes backward-planning possible.
+--
+-- An exam is a HARD deadline attached to a course subtree: everything under `node_id` that
+-- isn't finished yet has to be covered before `exam_date`. This is the table that finally
+-- makes `DayBlock.exam_linked` real; before v10 the solver hardcoded it to false, so no
+-- block could ever claim exam urgency and the 1.5x triage multiplier was dead code.
+CREATE TABLE IF NOT EXISTS exams (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    node_id      INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+    exam_date    TEXT NOT NULL,                  -- YYYY-MM-DD (local)
+    -- Minutes/day the student intends to give this exam. Advisory: the backward plan reports
+    -- what the syllabus actually demands, which is frequently more.
+    daily_target_mins INTEGER NOT NULL DEFAULT 60,
+    -- Stop scheduling new content this many days out and leave the tail for revision. A plan
+    -- that has you learning new material the night before is a plan that fails.
+    revision_days INTEGER NOT NULL DEFAULT 3,
+    is_archived  INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT DEFAULT (datetime('now'))
+);
+
+-- NOTE: the partial index on exams(exam_date) lives in `connection.rs::migrate`, not here —
+-- see the comment there. Every partial index in this project is kept in one place because a
+-- partial index referencing a recently-added column is exactly what broke the v8 migration.
 
 -- Learned pace per course. `pace_ratio` is an EWMA of (wall minutes spent / content minutes
 -- consumed): 1.0 = real-time, 1.6 = this student needs 96 min of clock for 60 min of

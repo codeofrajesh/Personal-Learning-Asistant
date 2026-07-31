@@ -202,6 +202,14 @@ fn migrate(conn: &Connection) -> AppResult<()> {
             "CREATE INDEX IF NOT EXISTS idx_blocks_status ON plan_blocks(status)
              WHERE status IN ('pending','active')",
         )?;
+
+        // v10: the `exams` table itself is created by SCHEMA_SQL above (a brand-new table, so
+        // CREATE TABLE IF NOT EXISTS covers fresh installs and migrations alike — no ALTERs).
+        // Its partial index is created here for the same reason as the two above.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_exams_date ON exams(exam_date)
+             WHERE is_archived = 0",
+        )?;
         Ok(())
     })();
 
