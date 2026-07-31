@@ -948,9 +948,35 @@ noise). Sleeps until the next future rung, bounded to 15 min.
   `useMiniPlayer(s => s.rect)` is non-null. A toast over that clip-path hole is unreadable (mpv
   is behind it, not the app background) and covers the video.
 
-### 14.8 Next — Phase D onward
-- **D:** Recovery Card (inline, never a modal; suppressed during fullscreen video; one prompt
-  per drift event via `plan_days.adjust_state`; 10s Undo).
+### 14.8 Phase D — DONE (Recovery Card)
+Inline in the Today rail, above the pre-mortem: "today is off the rails" outranks "this plan was
+ambitious", and the card is actionable while the verdict is not.
+
+- `useRecovery.ts` owns *when the card may speak*; `RecoveryCard.tsx` is presentation only.
+- **`DayPlan` now carries `adjust_state`** (new field, `db/plan.rs` + `types.ts`). Without it the
+  client cannot tell a *dismissed* day from a fresh one, so the gate could not survive a remount.
+  A missing `plan_days` row and a row with a NULL `adjust_state` both read as "never prompted" —
+  setting a day window creates the row, and that must not silence the card forever (2 tests).
+- **One prompt per DAY, then only on request.** The original brief said "one prompt per drift
+  *event*", and escalating buckets (30 → 60 → 90 min) was implemented first — then removed:
+  `adjust_state` records only THAT the student answered, not at what drift, so after a restart
+  there is no way to distinguish a genuine escalation from the prompt they already declined.
+  Re-opening a dismissed card is the worst thing this feature could do, so worsening drift now
+  surfaces a quiet one-line `ReopenRow` (`canOpen` + `open()`) instead. Storing the answered
+  drift would need a v10 migration — not worth it for this.
+- **Fullscreen suppression is a hold, not a skip** — checked after `hasOffer`, so leaving
+  fullscreen brings the card back rather than losing the event.
+- Consequences in CONTENT terms (the backend's `summary`), coverage as "keeps 91% of what today
+  was worth". The per-block diff is behind a disclosure; the summary is enough to decide.
+- "Leave it as it is" is a first-class button, not an X: sometimes today is honestly a write-off,
+  and a card that only offers rescue teaches the student to lie to it.
+- 10s `UndoBar` replaces the card after an apply — that undo is what makes pre-selecting a
+  recommendation defensible. Undo clears `adjust_state` server-side, so the offer returns.
+- `aria-live="polite"`, never `assertive`: an offer must not interrupt a screen reader to deliver
+  bad news. Apply/undo both `bumpPlanRevision()` so the reminder ladder re-arms on new starts.
+- Verified: `cargo test --lib` **83 passed**, `tsc --noEmit` clean, `npm run build` green.
+
+### 14.9 Next — Phase E onward
 - **E:** Score drill-downs (Today/Week/Month/Rolling-90) + weekly review.
 - **F:** Innovations — Plan Integrity surfacing, templates UI, **exam backward-planning**,
   learned peak hours, streak insurance, Pomodoro↔block binding, focus contract.

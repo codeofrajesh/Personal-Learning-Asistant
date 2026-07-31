@@ -531,6 +531,10 @@ export interface DayPlan {
   executed_mins: number;
   blocks: PlanBlock[];
   integrity: IntegrityVerdict;
+  /** `plan_days.adjust_state`: `null` (never prompted) | `"dismissed"` | `"applied"`.
+   *  This is what lets the Recovery Card honour "one prompt per drift event" across a
+   *  remount or restart - without it a declined day looks identical to a fresh one. */
+  adjust_state: string | null;
 }
 
 /** Create/update payload for a block (backend `BlockInputDto`). `id` omitted = create. */

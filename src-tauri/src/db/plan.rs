@@ -89,6 +89,10 @@ pub struct DayPlan {
     pub blocks: Vec<PlanBlock>,
     /// Pre-mortem verdict (advisory only — never blocks saving an ambitious plan).
     pub integrity: IntegrityVerdict,
+    /// `plan_days.adjust_state`: `None` (never prompted) | `"dismissed"` | `"applied"`.
+    /// Surfaced so the Recovery Card can honour "one prompt per drift event" across a
+    /// remount or restart; without it the client cannot tell a declined day from a fresh one.
+    pub adjust_state: Option<String>,
 }
 
 /// Create/update payload for a block.
@@ -366,6 +370,17 @@ pub fn day_plan(conn: &Connection, day: &str) -> AppResult<DayPlan> {
         .sum();
     let executed_mins: f64 = blocks.iter().map(|b| b.executed_mins).sum();
 
+    // Missing row = never prompted. A day only gets a `plan_days` row once its window is set
+    // or an adjustment touches it, so absence must read as "fresh", not as an error.
+    let adjust_state: Option<String> = conn
+        .query_row(
+            "SELECT adjust_state FROM plan_days WHERE day = ?1",
+            [day],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+
     Ok(DayPlan {
         day: day.to_string(),
         wake_at: fmt_hhmm(wake),
@@ -374,6 +389,7 @@ pub fn day_plan(conn: &Connection, day: &str) -> AppResult<DayPlan> {
         executed_mins,
         blocks,
         integrity,
+        adjust_state,
     })
 }
 
@@ -1407,6 +1423,32 @@ mod tests {
             .query_row("SELECT adjust_state FROM plan_days WHERE day = ?1", [DAY], |r| r.get(0))
             .unwrap();
         assert_eq!(state, "dismissed");
+    }
+
+    /// The Today payload must carry `adjust_state`, or the client cannot honour "one prompt per
+    /// drift event" across a remount: a dismissed day would look identical to a fresh one.
+    #[test]
+    fn day_plan_exposes_adjust_state() {
+        let conn = test_conn();
+        upsert_block(&conn, &dto(DAY, "06:00", 60, "A", 2)).unwrap();
+
+        // No `plan_days` row yet — absence must read as "never prompted", not error.
+        assert_eq!(day_plan(&conn, DAY).unwrap().adjust_state, None);
+
+        dismiss_recovery(&conn, DAY).unwrap();
+        assert_eq!(
+            day_plan(&conn, DAY).unwrap().adjust_state.as_deref(),
+            Some("dismissed")
+        );
+    }
+
+    /// Setting a day window creates a `plan_days` row with a NULL `adjust_state`. That must
+    /// still read as "never prompted" rather than suppressing the card forever.
+    #[test]
+    fn day_window_row_leaves_adjust_state_unset() {
+        let conn = test_conn();
+        set_day_window(&conn, DAY, Some("06:00"), Some("22:00")).unwrap();
+        assert_eq!(day_plan(&conn, DAY).unwrap().adjust_state, None);
     }
 
     /// Boot reconciliation closes out abandoned PAST days and leaves today alone.

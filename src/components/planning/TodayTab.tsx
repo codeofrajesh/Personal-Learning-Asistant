@@ -36,6 +36,8 @@ import {
   Moon,
 } from "lucide-react";
 import BlockModal from "./BlockModal";
+import RecoveryCard from "./RecoveryCard";
+import { useRecovery } from "./useRecovery";
 import {
   BLOCK_STATE_META,
   blockStartMins,
@@ -63,6 +65,8 @@ export default function TodayTab({ schedule }: Props) {
   const navigate = useNavigate();
   // ONE subscription to the shared clock, minute-resolution. Nothing here ticks per second.
   const nowMins = useScheduleClock((s) => s.minutes);
+  // Drift detection + apply/undo/dismiss. Owns its own gating; renders nothing when quiet.
+  const recovery = useRecovery(schedule);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editBlock, setEditBlock] = useState<PlanBlock | null>(null);
@@ -113,6 +117,9 @@ export default function TodayTab({ schedule }: Props) {
 
       {/* ── Side rail ── */}
       <div className="flex flex-col gap-6">
+        {/* Above the pre-mortem on purpose: "today is already off the rails" outranks "this plan
+            was ambitious to begin with", and the card is actionable while the verdict is not. */}
+        <RecoveryCard recovery={recovery} />
         <IntegrityCard plan={plan} remainingMins={remaining} />
         <UpNextCard
           blocks={blocks}
