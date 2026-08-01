@@ -11,7 +11,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
-import { bumpPlanRevision } from "../../lib/scheduleReminders";
+import { bumpPlanRevision } from "../../lib/planRevision";
 import { toast } from "../../lib/toastStore";
 import type { PlanTemplate, PlanTemplateBlock, TemplateBlockInput, TemplateInput } from "../../lib/types";
 

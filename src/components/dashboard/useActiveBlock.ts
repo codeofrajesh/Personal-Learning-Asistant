@@ -20,7 +20,7 @@
 import { useEffect, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
 import { useScheduleClock } from "../../lib/scheduleClock";
-import { usePlanRevision } from "../../lib/scheduleReminders";
+import { usePlanRevision } from "../../lib/planRevision";
 import { useTimerStore } from "../../lib/timerStore";
 import type { PlanBlock } from "../../lib/types";
 

@@ -28,7 +28,7 @@
 import { useEffect, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
 import { useScheduleClock } from "../../lib/scheduleClock";
-import { usePlanRevision } from "../../lib/scheduleReminders";
+import { usePlanRevision } from "../../lib/planRevision";
 import type { StudyMeter } from "../../lib/types";
 
 export function useStudyMeter(): StudyMeter | null {

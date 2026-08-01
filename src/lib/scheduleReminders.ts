@@ -36,10 +36,10 @@
  */
 
 import { useEffect, useState } from "react";
-import { create } from "zustand";
 import { ipc, isTauri } from "./ipc";
 import { toast } from "./toastStore";
 import { playChime } from "./timerStore";
+import { usePlanRevision } from "./planRevision";
 import {
   clockNow,
   dayMinsToMs,
@@ -231,27 +231,6 @@ export function armReminders(blocks: PlanBlock[]): () => void {
 export function pruneReminderLedger() {
   if (!isTauri()) return;
   void ipc.pruneReminders(14).catch(() => {});
-}
-
-/**
- * Revision counter for "today's plan has changed".
- *
- * The reminder ladder must run on EVERY route (a student watching a video is exactly who needs
- * telling that the next block started), so it is armed once in `AppShell` — not by the Planning
- * page, which is usually unmounted. But the Planning page is where blocks get edited, and it
- * would otherwise have no way to tell the global ladder that the day changed.
- *
- * A counter is the cheapest correct link: writers bump it, the global hook refetches. The
- * alternative — the ladder polling for changes — is the poll this whole design removed.
- */
-export const usePlanRevision = create<{ revision: number; bump: () => void }>((set) => ({
-  revision: 0,
-  bump: () => set((s) => ({ revision: s.revision + 1 })),
-}));
-
-/** Announce that today's plan changed (called after any block mutation). */
-export function bumpPlanRevision() {
-  usePlanRevision.getState().bump();
 }
 
 /**

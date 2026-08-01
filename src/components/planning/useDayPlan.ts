@@ -16,7 +16,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
-import { bumpPlanRevision } from "../../lib/scheduleReminders";
+import { bumpPlanRevision, usePlanRevision } from "../../lib/planRevision";
 import { dayOffset, localDay, useScheduleClock } from "../../lib/scheduleClock";
 import type { BlockInput, BlockStatus, DayPlan, PlanBlock } from "../../lib/types";
 
@@ -54,6 +54,7 @@ export interface DayPlanState {
 
 export function useDayPlan(): DayPlanState {
   const clockDay = useScheduleClock((s) => s.day);
+  const revision = usePlanRevision((s) => s.revision);
   const [day, setDay] = useState<string>(() => localDay());
   const [plan, setPlan] = useState<DayPlan | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -83,9 +84,12 @@ export function useDayPlan(): DayPlanState {
     }
   }, [day]);
 
+  // Reload on day change OR on a plan revision bump (watch path / Pomodoro credit / manual edit).
+  // The watch path credits the active block and bumps the revision; this hook re-reads so the
+  // block card shows fresh executed_mins while the mini-player is still playing.
   useEffect(() => {
     void reload();
-  }, [reload]);
+  }, [reload, revision]);
 
   // The reminder ladder is NOT armed here. It lives in AppShell (`useBlockReminders`) because a
   // reminder is worthless if it only fires while the Planning page happens to be open — the

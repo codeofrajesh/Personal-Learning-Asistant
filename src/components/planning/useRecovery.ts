@@ -24,7 +24,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
 import { subscribeFullscreen } from "../../lib/fullscreen";
 import { dayOffset, useScheduleClock } from "../../lib/scheduleClock";
-import { bumpPlanRevision } from "../../lib/scheduleReminders";
+import { bumpPlanRevision } from "../../lib/planRevision";
 import { toast } from "../../lib/toastStore";
 import type { RecoveryReport } from "../../lib/types";
 import type { DayPlanState } from "./useDayPlan";

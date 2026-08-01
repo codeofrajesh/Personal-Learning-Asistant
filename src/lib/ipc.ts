@@ -8,6 +8,7 @@
  */
 
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { bumpPlanRevision } from "./planRevision";
 import type {
   BlockInput,
   BlockStatus,
@@ -198,13 +199,18 @@ export const ipc = {
    * `materialId` is optional (a Pomodoro focus block need not target a file) and
    * `sessionType` (`work` | `short_break` | `long_break`, default `work`) lets the
    * Pomodoro timer record breaks separately — only `work` counts as study time.
+   *
+   * On success, bumps the global plan revision so any mounted `useDayPlan`/`StudyMeter`
+   * re-reads the active block's updated `executed_mins` — the block card moves while the
+   * mini-player is still playing in the corner.
    */
   logSession(
     materialId: number | null,
     seconds: number,
     sessionType: "work" | "short_break" | "long_break" = "work",
   ): Promise<void> {
-    return call<void>("log_session", { materialId, seconds, sessionType });
+    return call<void>("log_session", { materialId, seconds, sessionType })
+      .then(() => bumpPlanRevision());
   },
 
   /** Full-text search over materials for the Ctrl+K palette. */
