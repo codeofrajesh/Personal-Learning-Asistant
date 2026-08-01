@@ -302,8 +302,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               }
 
               // Accumulate genuinely-watched time (delta from last time-pos, only while
-              // playing and time moved forward).
-              if (!isPausedRef.current && t > lastTimePosRef.current) {
+              // playing, not scrubbing, and time moved forward). `draggingRef` mirrors the
+              // HTML5 path's `!v.seeking` guard: while the user is dragging the seek bar,
+              // position jumps are the user's hand, not playback.
+              if (!isPausedRef.current && !draggingRef.current && t > lastTimePosRef.current) {
                 watchedSecondsRef.current += t - lastTimePosRef.current;
               }
               lastTimePosRef.current = t;
@@ -719,14 +721,29 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   // REAL backend state.
   const togglePlay = () =>
     void setProperty("pause", isPlayingRef.current).catch(() => {});
+  /**
+   * Seek to an absolute position, WITHOUT crediting the skipped span as watched time.
+   *
+   * The `time-pos` observer accumulates `t - lastTimePosRef.current` as watched seconds. If a
+   * seek only updated `timePosRef`, the first observed position after the jump would be far ahead
+   * of `lastTimePosRef` and the whole skipped span (e.g. scrubbing 10s → 9801s in a 2h45m video)
+   * would be billed as study time. Seeding `lastTimePosRef` to the target BEFORE the command means
+   * the next `time-pos` delta is ~0, so a seek grants nothing. This is the same invariant the
+   * resume safety net already relied on.
+   */
+  const seekAbsolute = (t: number) => {
+    const d = durationRef.current;
+    const target = Math.max(0, d > 0 ? Math.min(d, t) : t);
+    timePosRef.current = target;
+    lastTimePosRef.current = target; // the skipped span must not be billed as watched
+    void command("seek", [target, "absolute"]).catch(() => {});
+    if (seekFillRef.current && d > 0) seekFillRef.current.style.width = `${(target / d) * 100}%`;
+    saveProgress(true);
+  };
   const seekTo = (frac: number) => {
     const d = durationRef.current;
     if (d <= 0) return;
-    const t = Math.max(0, Math.min(d, frac * d));
-    if (seekFillRef.current) seekFillRef.current.style.width = `${(t / d) * 100}%`;
-    void command("seek", [t, "absolute"]).catch(() => {});
-    timePosRef.current = t; // reflect the new position so the save persists where we sought
-    saveProgress(true);
+    seekAbsolute(frac * d);
   };
   const onTrackPointerDown = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -780,12 +797,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
    * `speed` observer, so it reflects the real engine speed even if it was changed elsewhere.
    */
   const nudgeRate = (dir: 1 | -1) => changeRate(stepRate(rateRef.current, dir), false);
-  const skip = (secs: number) => {
-    const t = Math.max(0, Math.min(durationRef.current, timePosRef.current + secs));
-    void command("seek", [t, "absolute"]).catch(() => {});
-    timePosRef.current = t; // reflect the new position so the save persists where we sought
-    saveProgress(true);
-  };
+  const skip = (secs: number) => seekAbsolute(timePosRef.current + secs);
   const openInSystemPlayer = () => void ipc.openInSystemPlayer(path);
 
   // ── Keyboard shortcuts (window-level, bound ONCE) ─────────────────────────
@@ -874,10 +886,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       () => timePosRef.current,
       (secs: number) => {
         const d = durationRef.current;
-        const t = Math.max(0, d > 0 ? Math.min(d, secs) : secs);
-        void command("seek", [t, "absolute"]).catch(() => {});
-        timePosRef.current = t;
-        if (seekFillRef.current && d > 0) seekFillRef.current.style.width = `${(t / d) * 100}%`;
+        seekAbsolute(d > 0 ? Math.min(d, secs) : secs);
       },
     );
     return () => playerBridge.unregister(materialId);
