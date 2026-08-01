@@ -1642,6 +1642,10 @@ pub fn log_study_session(
     if seconds <= 0.0 {
         return Ok(());
     }
+    // Server-side sanity cap: reject absurd values (client bug / overflow / runaway timer).
+    // 12 hours is longer than any legitimate session; a 25-hour day is impossible.
+    const MAX_SECONDS: f64 = 12.0 * 3600.0;
+    let seconds = seconds.min(MAX_SECONDS);
     let stype = match session_type {
         "short_break" | "long_break" => session_type,
         _ => "work",
