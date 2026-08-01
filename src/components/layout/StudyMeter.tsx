@@ -50,15 +50,20 @@ function fmtMins(mins: number): string {
 
 /**
  * Compact label for the collapsed ring: at most three characters, because the ring's inner
- * diameter is ~28px. Hours once past an hour ("1.5h"), minutes below it, and a dash at zero — "0m"
- * inside a glowing ring reads as broken rather than as "not started".
+ * diameter is ~28px. It shows an HOUR COUNT — whole hours once past an hour ("2h"), minutes
+ * below it, and a dash at zero — "0m" inside a glowing ring reads as broken rather than as
+ * "not started". The full sentence ("1h 30m studied today…") lives in `title`/`aria-label`.
+ *
+ * The previous form rendered hours to one decimal (`h.toFixed(1)`), which produced trailing
+ * zeros ("1.0h" for 61m, "3.0h" for 179m), four-to-five glyphs that overflowed the ring, and a
+ * "10.0h" at the 9h59m boundary — where the `h < 10` gate contradicted the rounded value it
+ * displayed. Whole-hour rounding keeps every label to three characters and never lies.
  */
 function fmtTiny(mins: number): string {
   const m = Math.max(0, Math.round(mins));
   if (m <= 0) return "–";
   if (m < 60) return `${m}`;
-  const h = m / 60;
-  return h < 10 && m % 60 !== 0 ? `${h.toFixed(1)}h` : `${Math.round(h)}h`;
+  return `${Math.min(99, Math.round(m / 60))}h`;
 }
 
 export default function StudyMeter({ collapsed }: Props) {

@@ -4431,7 +4431,13 @@ mod tests {
             [],
         )
         .unwrap();
-        claim_reminder(&conn, "fresh", "2026-07-31 06:00").unwrap();
+        // "Fresh" must be relative to NOW, not a fixed literal: `prune_reminders` compares
+        // against `datetime('now')`, so a hardcoded date goes stale as the wall clock advances
+        // and this test started failing after 06:00 on the day after the literal.
+        let fresh_at: String = conn
+            .query_row("SELECT datetime('now')", [], |r| r.get(0))
+            .unwrap();
+        claim_reminder(&conn, "fresh", &fresh_at).unwrap();
 
         let removed = prune_reminders(&conn, 30).unwrap();
         assert_eq!(removed, 2, "only the two spent old rows go");
