@@ -770,8 +770,9 @@ Time-blocked scheduling with an Intelligent Adjustment engine, an advisory pre-m
 pace, and schedule-adherence scoring. **ALL phases (A–F) are DONE**: `cargo test --lib`
 **137 passed** (was 14), no new clippy warnings; `npm run build` + `tsc --noEmit` clean.
 **38 plan commands** registered. Post-QA fixes in §14.11 (tracking attribution, timeline geometry,
-timer visibility) and §14.12 (revision credit, rendered-space collisions, progress visibility,
-routines UI, sidebar Study Meter). Still owed: a live smoke test against a real pre-v9 DB (§14.13).
+timer visibility), §14.12 (revision credit, rendered-space collisions, progress visibility,
+routines UI, sidebar Study Meter) and §14.13 (player granular speed + the resume-position race).
+Still owed: a live smoke test against a real pre-v9 DB (§14.14).
 
 ### 14.0 Architectural decisions (pushbacks accepted by the user)
 These were argued *against* the original brief and approved — they are load-bearing, not
@@ -1261,11 +1262,96 @@ already does capture, apply, per-block editing and delete.
   rolling over. Fills are CSS gradients driven by one custom property — no JS animation, no SVG.
   Colour carries state (cyan → orange → lime) and is never red: an unfinished day is not a failure.
 
-### 14.13 Still owed
+### 14.13 Player: granular speed + the resume-position bug (no schema change)
+`tsc --noEmit` + `npm run build` clean; `cargo test --lib` 137 (backend untouched); clippy still 18.
+Frontend only — no command, DTO or schema change, so nothing crosses the IPC boundary that didn't
+before.
+
+**The resume bug was a stale-state race, not a missing seek.** Both players already contained resume
+code, and the backend was already returning `position_secs` correctly
+(`COALESCE(wp.position_secs, 0.0)` in `material_for_player`, threaded through `PlayerPage`). What
+failed was `MpvVideoPlayer`'s gate:
+
+```
+if (!resumeAppliedRef.current && ready && startPosition > 0 && duration > 0) { … }
+```
+
+`duration` was React **state**, and the load effect calls `setDuration(0)` on every file change. mpv
+reports the real duration through an async property event, so for a locally-cached file that event
+routinely landed *before* React committed the 0 — the effect ran, saw `duration === 0`, skipped, and
+latched `resumeAppliedRef` for the path so it never retried. The DB held 29% and the video sat at
+0:00. Whether it worked was a race, which is why it looked intermittent.
+
+**The fix: resume is applied BY the load, not after it.** `loadfile` carries `start=<secs>` as a
+per-file option, so the first frame mpv decodes and presents *is* the resume frame. This is also the
+architecture-safe shape: one IPC call on a path that already ran, no dependency on any React state
+having settled, no second command, and nothing whatsoever touching the anchor, the wrapper tree or
+the layout — so it cannot reintroduce the §12.3 class of bug. The old post-load `seek` was worse than
+unreliable: even when it fired it decoded frames from 0:00 first and then jumped, a visible flash of
+the wrong content.
+- **Argument order is version-sensitive and fails hard.** mpv 0.38.0 inserted an insertion `index`
+  parameter: `loadfile <url> [<flags> [<index> [<options>]]]`. Options are the **fourth** argument.
+  Passing them third (correct pre-0.38) makes mpv reject the whole command, so *nothing loads* — a
+  black screen. Verified against the bundled `src-tauri/lib/libmpv-2.dll` (**v0.41.0**) and the 0.41
+  manual before writing the call; `index` is passed as -1, which `replace` ignores.
+- **A safety net, because that's a version-coupled assumption.** `pendingResumeRef` is armed before
+  the load and checked by the first `time-pos` observation: if playback began more than 2s away from
+  the target (a future libmpv bump moving the argument again, or a container that can't seek
+  precisely on open), it issues one corrective seek and disarms. Fires at most once per load, so it
+  can never fight a deliberate seek.
+- **Guards.** `> 1` rules out negatives, which `start` would read as *relative to the end of the
+  file*. `toFixed(3)` keeps the value inside the documented `[[hh:]mm:]ss[.ms]` grammar — a raw float
+  in exponential notation is not a valid timestamp. Position mirrors are seeded before the load so a
+  flush firing before the first `time-pos` can't persist 0 over a real resume point.
+- **The reconnect guard survives by construction.** `start=` only exists on the `loadfile` call, and
+  that call is already skipped when the component reattaches to an engine holding this path (the
+  `globalLoadedPath === path` early return, which now also disarms `pendingResumeRef`). A fullscreen
+  remount still can't yank playback back to the old DB position — previously the job of a
+  `didLoadFileRef` flag, now structural.
+- **`duration` React state deleted.** It existed *only* to gate that broken effect; the duration
+  label has always been a direct `textContent` write per the §15 perf rule. Removing it drops a
+  re-render per file load.
+- **HTML5 + audio had a quieter version of the same race.** `onLoadedMetadata` as a React prop is
+  attached when the element commits, but an asset-protocol local file can reach `readyState >= 1`
+  first — in which case the event has already fired and resume never runs. Both now also apply start
+  state from an effect when metadata is already available, and re-arm on `path`. Their clamp
+  `Math.min(startPosition, Math.max(0, (duration || 0) - 1))` was itself a bug: with duration
+  unknown, `NaN || 0` is 0, so the clamp collapsed the resume point to 0. Duration is only used as a
+  bound when it is finite.
+
+**Granular speed — `src/lib/playbackRate.ts`,** shared by both engines so `[` behaves identically on
+an MKV and an MP4. `[` / `]` step by 0.10×, `\` (and `Backspace`) resets to 1× — the same bindings
+mpv itself uses, so the shortcut a student knows from mpv/VLC works here.
+- **Float arithmetic is the whole reason this is a module.** 0.1 isn't representable in binary, so
+  naive stepping gives `0.7000000000000001`, which renders verbatim in the control bar and never
+  compares equal to a preset. Stepping is done in integer tenths and snapped by `quantizeRate`;
+  verified by hand that 1.0 steps down to exactly 0.9 … 0.25 with no drift, that off-grid presets
+  (1.25) snap onto the grid rather than carrying the 0.05 forever, and that the clamps hold.
+  Quantized on the way *in* from the mpv `speed` observer too, so a rate set from anywhere still
+  displays cleanly.
+- **`rateRef` mirrors the state** for the same reason `isPlayingRef` exists: both keyboard listeners
+  are deliberately bound once with empty deps, so a closure over `rate` would be frozen at 1× and
+  every press would recompute from there.
+- **HTML5 speed now survives a lesson change.** `playbackRate` is an element property that resets to
+  1 on a source swap; the ref is re-applied on `loadedmetadata`, so the engine matches the UI.
+- **UI reflects granular values**: `formatRate` trims trailing zeros (`1.2×`, not `1.20×`), the
+  trigger turns lime when off 1× so a non-preset speed is visible without opening the menu, and the
+  menu gained a −/+ stepper naming the `[` / `]` keys so the shortcut is discoverable. Both control
+  bars match.
+
+**No React unmounts introduced.** No component boundaries, keys, conditional subtrees or wrapper
+structure changed in any of the three players; the mpv effect graph lost one effect and gained none.
+
+### 14.14 Still owed
 - **Live smoke test against a real pre-v9 DB.** Everything above is compile-, test- and
   build-verified only. The v9→v10 migration path is covered by unit tests but has never run
   against a real user database. The attribution funnel in particular has never been exercised
   against a real playing video — only against its unit tests.
+- **Resume + speed need one live pass.** The `start=` option and the `[`/`]` bindings are verified
+  against the mpv 0.41 manual and the bundled DLL version, not against a running video. Worth
+  confirming once with `npm run tauri dev`: watch ~30% of an MKV, leave, reopen (should open AT the
+  saved position with no flash of 0:00), then step speed with `[`/`]` and toggle fullscreen to
+  confirm neither resume nor speed is disturbed.
 - **A frontend test runner (Vitest).** Phase E's client-side derivations had to be verified with a
   throwaway esbuild harness, and it found a genuine bug (`longestStreak`'s dead contiguity check).
   That shouldn't be a manual step. Phase F's client logic is thinner but equally unguarded.

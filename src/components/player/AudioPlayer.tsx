@@ -59,13 +59,33 @@ export default function AudioPlayer({ path, materialId, startPosition }: Props) 
     return () => cancelAnimationFrame(raf);
   }, [accumulatedRef]);
 
-  const onLoadedMetadata = () => {
+  /**
+   * Resume from the saved position once metadata is available.
+   *
+   * `Math.max(0, (a.duration || 0) - 1)` used to clamp this, which silently discarded the resume
+   * point whenever duration wasn't known yet: `NaN || 0` is 0, so the clamp collapsed to 0 and the
+   * track restarted. Duration is only used as a bound when it is actually a finite number.
+   */
+  const applyStartState = () => {
     const a = audioRef.current;
-    if (a && !resumeAppliedRef.current && startPosition > 0) {
-      a.currentTime = Math.min(startPosition, Math.max(0, (a.duration || 0) - 1));
-      resumeAppliedRef.current = true;
-    }
+    if (!a || resumeAppliedRef.current || startPosition <= 0) return;
+    const dur = a.duration;
+    a.currentTime = Number.isFinite(dur) && dur > 0 ? Math.min(startPosition, dur - 1) : startPosition;
+    resumeAppliedRef.current = true;
   };
+
+  /**
+   * Covers the race the `onLoadedMetadata` prop alone can't: a local file served over the asset
+   * protocol can reach `readyState >= 1` before React attaches the listener, in which case the
+   * event has already fired and resume would never run. Re-arms on `path` so switching tracks
+   * resumes the new one instead of reusing a latched flag.
+   */
+  useEffect(() => {
+    resumeAppliedRef.current = false;
+    const a = audioRef.current;
+    if (a && a.readyState >= 1) applyStartState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path, startPosition]);
 
   const togglePlay = () => {
     const a = audioRef.current;
@@ -125,7 +145,7 @@ export default function AudioPlayer({ path, materialId, startPosition }: Props) 
             setIsPlaying(false);
             flush();
           }}
-          onLoadedMetadata={onLoadedMetadata}
+          onLoadedMetadata={applyStartState}
         />
       ) : (
         <div className="text-sm text-content-muted">Loading audio…</div>

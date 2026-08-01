@@ -32,6 +32,13 @@ import { gsap } from "gsap";
 import { useGSAP } from "@gsap/react";
 import { ipc, isTauri } from "../../lib/ipc";
 import { subscribeFullscreen } from "../../lib/fullscreen";
+import {
+  SPEED_PRESETS,
+  formatRate,
+  quantizeRate,
+  sameRate,
+  stepRate,
+} from "../../lib/playbackRate";
 import { playerBridge } from "../../lib/playerBridge";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { formatDuration } from "../../lib/utils";
@@ -48,7 +55,8 @@ import {
   ExternalLinkIcon,
 } from "./PremiumIcons";
 
-const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+/** Quick-pick speeds. Granular values come from `[`/`]` — see `lib/playbackRate`. */
+const SPEEDS = SPEED_PRESETS;
 
 // Global singleton for MPV. MPV is a heavy C-library and should only be 
 // initialized and observed ONCE per application lifecycle to avoid Tauri IPC 
@@ -105,9 +113,16 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   const draggingRef = useRef(false);
   const initedRef = useRef(false);
   
-  // Tracks if THIS component instance actually loaded the file, or if it just
-  // connected to an already-running global engine (e.g., during fullscreen toggle).
-  const didLoadFileRef = useRef(false);
+  /**
+   * Resume point still owed to the current file, in seconds; 0 when nothing is pending.
+   *
+   * This is the belt to `start=`'s braces. `start=` is the primary mechanism and the only one that
+   * avoids showing a frame from 0:00, but it is a per-file option on a command whose argument order
+   * changed across mpv versions — so if it is ever ignored, this ref lets the FIRST observed
+   * `time-pos` notice playback began at the wrong place and correct it once. Cleared as soon as it
+   * is satisfied or superseded, so it can never fight a user seek.
+   */
+  const pendingResumeRef = useRef(0);
   const disposedRef = useRef(false);
   // Debounce timer for alignViewport (Bug 2 fix: let the OS window
   // layout settle for ~80 ms before measuring + sending coordinates).
@@ -127,9 +142,17 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
 
   const [ready, setReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(!globalMpvState.pause);
-  const [duration, setDuration] = useState(globalMpvState.duration);
+  // NOTE: there is deliberately no `duration` React state. It used to exist only to gate the old
+  // resume effect (the source of the resume bug — see the load effect); the duration LABEL has
+  // always been written straight to a DOM ref from the property observer, per the §15 perf rule.
+  // Keeping the state would mean a re-render on every file load for a value nothing renders.
   const [volume, setVolume] = useState(globalMpvState.volume);
   const [rate, setRate] = useState(globalMpvState.speed);
+  // Ref mirror of `rate`, for the same reason `isPlayingRef` exists: the keyboard listener is bound
+  // once with empty deps, so a closure over the state would be frozen at its initial value and
+  // every `[`/`]` press would compute from 1x. Written by both `changeRate` and the mpv `speed`
+  // observer, so it always reflects the real engine speed.
+  const rateRef = useRef(globalMpvState.speed);
   const [speedOpen, setSpeedOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -252,6 +275,32 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               break;
             case "time-pos": {
               const t = (data as number | null) ?? 0;
+
+              // ── Resume safety net ──
+              // `start=` on loadfile is the primary mechanism and normally means the first position
+              // we ever see IS the resume point. If it was ignored (a version whose argument order
+              // differs, or a container that can't seek precisely on open), playback begins near 0
+              // instead — so correct it on the first observed position and disarm.
+              //
+              // Only fires when the gap is real (> 2s): a successful `start=` lands within a
+              // keyframe of the target, and re-seeking that would be a pointless second jump.
+              // Disarmed unconditionally either way, so this can run at most once per load and can
+              // never fight a deliberate seek by the student.
+              const owed = pendingResumeRef.current;
+              if (owed > 0) {
+                pendingResumeRef.current = 0;
+                if (owed - t > 2) {
+                  // eslint-disable-next-line no-console
+                  console.log("[MpvVideoPlayer] start= did not take; seeking to", owed);
+                  void command("seek", [owed, "absolute"]).catch(() => {});
+                  // Treat the target as the current position so the delta below can't bill the
+                  // skipped span as watched time.
+                  lastTimePosRef.current = owed;
+                  timePosRef.current = owed;
+                  break;
+                }
+              }
+
               // Accumulate genuinely-watched time (delta from last time-pos, only while
               // playing and time moved forward).
               if (!isPausedRef.current && t > lastTimePosRef.current) {
@@ -270,16 +319,24 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
             case "duration": {
               const d = (data as number | null) ?? 0;
               durationRef.current = d;
-              setDuration(d);
+              // Ref + DOM write only, no React state: nothing renders `duration` as state, and the
+              // label is a direct textContent write per the §15 perf rule.
               if (durationLabelRef.current) durationLabelRef.current.textContent = formatDuration(d);
               break;
             }
             case "volume":
               setVolume(data as number);
               break;
-            case "speed":
-              setRate(data as number);
+            case "speed": {
+              // Quantized on the way in as well as out: mpv echoes back the double it holds, and a
+              // value that arrived from anywhere other than `changeRate` (a config default, a
+              // future script binding) must still render as a clean "1.2×" rather than a float
+              // artefact. Keeps the ref and the state in lockstep for the keyboard path.
+              const s = quantizeRate(data as number);
+              rateRef.current = s;
+              setRate(s);
               break;
+            }
             case "eof-reached":
               if (data) {
                 saveProgress(true); // save on end (forced)
@@ -333,6 +390,13 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Mirror of `startPosition` so the load effect can read the resume point WITHOUT taking it as a
+  // dependency. This is deliberate: adding it to the deps below would make a prop change re-run
+  // `loadfile` and restart the video mid-playback. Assigned during render so it is always current
+  // before any effect runs; never read during render, so it can't affect output.
+  const startPositionRef = useRef(startPosition);
+  startPositionRef.current = startPosition;
+
   // ── Load the file (re-runs when init completes via `ready` AND on path change) ─
   // CRITICAL: deps include `ready` so this fires AFTER init completes. Without it,
   // the effect runs on mount when initedRef is still false → skips → dead player.
@@ -343,6 +407,12 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       // The video is ALREADY loaded in the global MPV engine! 
       // (This happens when the component unmounts/remounts quickly, e.g. toggling fullscreen layout).
       // DO NOT reload the file. Just sync the visual DOM refs to the engine's current state.
+      //
+      // Resume must stay disarmed on this path. The engine is mid-playback and its position is
+      // ahead of whatever the DB held when this component mounted, so applying a resume here would
+      // yank the video backwards on every fullscreen toggle — which is exactly what the old
+      // "did this instance load the file?" guard existed to prevent.
+      pendingResumeRef.current = 0;
       const d = globalMpvState.duration;
       const t = globalMpvState["time-pos"];
       durationRef.current = d;
@@ -359,10 +429,9 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     }
 
     globalLoadedPath = path;
-    didLoadFileRef.current = true;
 
-    // Reset state for the (new) file.
-    setDuration(0);
+    // Reset state for the (new) file. Refs and DOM only — no React state write here, which is
+    // also what removes the race the old resume effect depended on.
     durationRef.current = 0;
     timePosRef.current = 0;
     lastTimePosRef.current = 0;
@@ -375,7 +444,56 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     console.log("[MpvVideoPlayer] loadfile:", path);
     void (async () => {
       try {
-        await command("loadfile", [path]);
+        // ── Resume is applied AS PART OF THE LOAD, not as a seek afterwards ──
+        //
+        // The old flow was: loadfile → wait for the `duration` property to arrive → then
+        // `seek absolute`. That is what made resume unreliable, for two reasons:
+        //
+        //   1. The seek effect gated on `duration > 0` from React STATE. The load effect
+        //      calls `setDuration(0)` on every file change, and mpv reports the real duration
+        //      through an async property event. If that event landed before React had committed
+        //      the 0 (the common case for a locally-cached file), the resume effect saw
+        //      `duration === 0`, skipped, and then never ran again — `resumeAppliedRef` was
+        //      already latched for the path. The video stayed at 0:00 with the DB holding 29%.
+        //   2. Even when it did fire, seeking after playback had begun meant decoding and
+        //      showing frames from 0:00 first, then jumping — a visible flash of the wrong
+        //      content, exactly the kind of frame disturbance we're told to avoid.
+        //
+        // mpv's `loadfile` accepts per-file options, and `start` is honoured while the file is
+        // being OPENED: the very first frame decoded and presented is the resume frame. One IPC
+        // call, no second command, no dependency on any React state having settled, and no layout
+        // involvement whatsoever — the anchor and the React tree are untouched by this, which is
+        // what keeps it clear of the black-screen class of bug.
+        //
+        // ARGUMENT ORDER IS VERSION-SENSITIVE, and getting it wrong does not degrade gracefully:
+        // mpv rejects the whole command and NOTHING loads, which is a black screen. mpv 0.38.0
+        // inserted an insertion `index` parameter, so the signature is now
+        // `loadfile <url> [<flags> [<index> [<options>]]]` — options are the FOURTH argument.
+        // Verified against the bundled libmpv (v0.41.0, see src-tauri/lib/libmpv-2.dll) and the
+        // 0.41 manual. `index` is passed as -1, which mpv ignores for `replace` mode.
+        //
+        // `pendingResumeRef` (checked by the `time-pos` observer) is the belt to this brace: if a
+        // future libmpv bump moves the argument again, or a container ignores `start`, resume still
+        // happens via one corrective seek instead of silently failing.
+        const resumeAt = startPositionRef.current;
+        // `> 1` also rules out negatives, which `start` would interpret as "relative to the END of
+        // the file" — a saved position of -5 must never mean "five seconds before the end".
+        const shouldResume = Number.isFinite(resumeAt) && resumeAt > 1;
+        // Arm the fallback BEFORE loading, so it covers the load however the load behaves.
+        pendingResumeRef.current = shouldResume ? resumeAt : 0;
+        if (shouldResume) {
+          // eslint-disable-next-line no-console
+          console.log("[MpvVideoPlayer] resuming at", resumeAt, "s");
+          // Seed the position mirrors so a flush firing before the first `time-pos` event can't
+          // persist 0 over a real resume point.
+          timePosRef.current = resumeAt;
+          lastTimePosRef.current = resumeAt;
+          // Fixed 3dp: the time format is `[[hh:]mm:]ss[.ms]`, and a float rendered in exponential
+          // notation ("1e-7") or with 15 decimals is not a valid timestamp.
+          await command("loadfile", [path, "replace", -1, `start=${resumeAt.toFixed(3)}`]);
+        } else {
+          await command("loadfile", [path]);
+        }
         // Mark this video as the globally-active one so the docked mini-player can take
         // over if the user navigates away mid-playback.
         setMiniActive(materialId, fileName ?? path.split(/[\\/]/).pop() ?? "Now playing");
@@ -400,24 +518,24 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     // it should only trigger on an actual init/loadfile ERROR, not a timer.
   }, [path, ready]);
 
-  // ── Resume from saved position once duration is known ──────────────────────
-  const resumeAppliedRef = useRef(false);
-  useEffect(() => {
-    resumeAppliedRef.current = false;
-  }, [path]);
-  useEffect(() => {
-    if (!resumeAppliedRef.current && ready && startPosition > 0 && duration > 0) {
-      if (didLoadFileRef.current) {
-        // Only seek to the DB startPosition if WE just loaded the file!
-        // If we just reconnected to the global engine (fullscreen toggle),
-        // we DO NOT want to seek backwards to the old DB position.
-        void command("seek", [Math.min(startPosition, Math.max(0, duration - 1)), "absolute"]).catch(
-          () => {},
-        );
-      }
-      resumeAppliedRef.current = true;
-    }
-  }, [ready, startPosition, duration, path]);
+  // ── Resume: applied by the LOAD, not by a follow-up seek ───────────────────
+  //
+  // There is deliberately no resume effect here any more. Position is handed to mpv as a
+  // `start=` option on `loadfile` (see the load effect above), which fixes the reported bug at
+  // its root:
+  //
+  //   * the old effect gated on `duration > 0` read from React STATE, which the load effect had
+  //     just reset to 0 — if mpv's async duration event beat React's commit, the gate saw 0,
+  //     skipped, and latched `resumeAppliedRef` so it never retried. The DB held 29% and the
+  //     video sat at 0:00, exactly as reported;
+  //   * and even on success it seeked AFTER playback had begun, so frames from 0:00 were decoded
+  //     and shown before the jump.
+  //
+  // The "only if this instance loaded the file" guard it carried is preserved by construction
+  // rather than by a flag: the `start=` option only exists on the `loadfile` call, and that call is
+  // already skipped when the component reconnects to an engine that has this path loaded (the
+  // `globalLoadedPath === path` early return, which also disarms `pendingResumeRef`). So a
+  // fullscreen remount still cannot yank playback back to the old DB position.
 
   // ── Video anchor ↔ mpv alignment via setVideoMarginRatio ───────────────────────
   // Pixel bounding: get the anchor's exact CSS-pixel rect (getBoundingClientRect)
@@ -634,11 +752,34 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     setVolume(v);
     void setProperty("volume", v).catch(() => {});
   };
-  const changeRate = (r: number) => {
-    setRate(r);
-    void setProperty("speed", r).catch(() => {});
-    setSpeedOpen(false);
+  /**
+   * Set an absolute speed (preset menu, or the target of a nudge).
+   *
+   * Quantized before it leaves: mpv accepts any double, so an unsnapped 0.7000000000000001 would be
+   * accepted, echoed back by the `speed` observer, and rendered in the control bar verbatim.
+   *
+   * `closeMenu` is false for keyboard nudges — `[`/`]` shouldn't require the menu to be open, and
+   * shouldn't close it if it is.
+   */
+  const changeRate = (r: number, closeMenu = true) => {
+    const q = quantizeRate(r);
+    // Optimistic local update so the label moves on the same frame as the keypress. The `speed`
+    // observer will confirm the same value; because both sides quantize, it can't disagree.
+    setRate(q);
+    rateRef.current = q;
+    void setProperty("speed", q).catch(() => {});
+    if (closeMenu) setSpeedOpen(false);
   };
+
+  /**
+   * Step the speed by one 0.10x increment (`]` faster, `[` slower).
+   *
+   * Reads `rateRef`, never the `rate` state: the keyboard listener below is bound ONCE with empty
+   * deps (deliberately — see its comment) so a closure over state would be frozen at 1x forever and
+   * every press would produce the same value. The ref is updated by both this path and the mpv
+   * `speed` observer, so it reflects the real engine speed even if it was changed elsewhere.
+   */
+  const nudgeRate = (dir: 1 | -1) => changeRate(stepRate(rateRef.current, dir), false);
   const skip = (secs: number) => {
     const t = Math.max(0, Math.min(durationRef.current, timePosRef.current + secs));
     void command("seek", [t, "absolute"]).catch(() => {});
@@ -674,6 +815,24 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
         case "F":
           e.preventDefault();
           toggleFullscreen();
+          break;
+        // Granular speed, 0.10x per press. Bracket keys match mpv's own defaults, so the shortcut
+        // a student already knows from mpv/VLC works here too. Reads `rateRef` via `nudgeRate`
+        // (see there) because this listener is intentionally bound once.
+        case "[":
+          e.preventDefault();
+          nudgeRate(-1);
+          break;
+        case "]":
+          e.preventDefault();
+          nudgeRate(1);
+          break;
+        // Back to 1x. mpv binds BACKSPACE for this; `\` is offered alongside because BACKSPACE is
+        // ambiguous in a webview (it can mean "navigate back" depending on focus).
+        case "Backspace":
+        case "\\":
+          e.preventDefault();
+          changeRate(1, false);
           break;
         case "Escape":
           // The browser natively handles Esc for HTML5 Fullscreen API, but since we are
@@ -848,31 +1007,67 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
           {/* Spacer */}
           <div className="flex-1" />
 
-          {/* Speed selector */}
+          {/* Speed selector — presets plus a granular 0.10× stepper.
+              `formatRate` is what makes granular values presentable: the raw double would render
+              as "1.2000000000000002×" in a bar this dense. A non-preset speed is highlighted on the
+              trigger so the student can see they're off the presets without opening the menu. */}
           <div className="relative shrink-0">
             <button
               type="button"
               onClick={() => setSpeedOpen((o) => !o)}
-              className="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-content-secondary transition-colors hover:bg-white/[0.1] hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20"
-              aria-label="Playback speed"
+              className={
+                "flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-colors hover:bg-white/[0.1] hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20 " +
+                (sameRate(rate, 1) ? "text-content-secondary" : "text-lime")
+              }
+              aria-label={`Playback speed, currently ${formatRate(rate)}x`}
               aria-expanded={speedOpen}
+              title="Playback speed ( [ slower · ] faster )"
             >
               <SpeedIcon size={14} />
-              <span>{rate}×</span>
+              <span className="tabular-nums">{formatRate(rate)}×</span>
             </button>
             {speedOpen && (
-              <div className="absolute bottom-11 right-0 z-20 flex flex-col rounded-btn border border-white/10 bg-ink-850 py-1 shadow-card">
-                {SPEEDS.map((s) => (
+              <div className="absolute bottom-11 right-0 z-20 flex w-40 flex-col rounded-btn border border-white/10 bg-ink-850 py-1 shadow-card">
+                {/* Granular stepper. Mirrors the [ / ] shortcuts for anyone on a mouse, and names
+                    those keys so the shortcut is discoverable rather than hidden in a manual. */}
+                <div className="flex items-center justify-between gap-1 px-2 pb-1.5 pt-1">
                   <button
-                    key={s}
                     type="button"
-                    onClick={() => changeRate(s)}
-                    className={"flex items-center gap-1.5 px-4 py-1.5 text-left text-xs transition-colors hover:bg-white/[0.06] " + (s === rate ? "font-bold text-lime" : "text-content-secondary")}
+                    onClick={() => nudgeRate(-1)}
+                    className="grid h-6 w-7 place-items-center rounded-btn border border-white/10 text-xs text-content-secondary transition-colors hover:bg-white/[0.08] hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-lime/40"
+                    aria-label="Slower by 0.1x"
+                    title="Slower ( [ )"
                   >
-                    <SpeedIcon size={12} className={s === rate ? "text-lime" : "text-content-faint"} />
-                    {s}×
+                    −
                   </button>
-                ))}
+                  <span className="flex-1 text-center text-xs font-semibold tabular-nums text-content-primary">
+                    {formatRate(rate)}×
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => nudgeRate(1)}
+                    className="grid h-6 w-7 place-items-center rounded-btn border border-white/10 text-xs text-content-secondary transition-colors hover:bg-white/[0.08] hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-lime/40"
+                    aria-label="Faster by 0.1x"
+                    title="Faster ( ] )"
+                  >
+                    +
+                  </button>
+                </div>
+                <div className="mx-2 mb-1 border-t border-white/[0.08]" aria-hidden />
+                {SPEEDS.map((s) => {
+                  const active = sameRate(s, rate);
+                  return (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => changeRate(s)}
+                      className={"flex items-center gap-1.5 px-4 py-1.5 text-left text-xs transition-colors hover:bg-white/[0.06] " + (active ? "font-bold text-lime" : "text-content-secondary")}
+                    >
+                      <SpeedIcon size={12} className={active ? "text-lime" : "text-content-faint"} />
+                      {formatRate(s)}×
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>
