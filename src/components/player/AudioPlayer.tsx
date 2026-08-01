@@ -48,8 +48,10 @@ export default function AudioPlayer({ path, materialId, startPosition }: Props) 
           if (currentLabelRef.current) currentLabelRef.current.textContent = formatDuration(pos);
           if (durationLabelRef.current) durationLabelRef.current.textContent = formatDuration(dur);
         }
+        // Accumulate genuinely-watched time (wall-clock only).
+        // Do NOT multiply by playbackRate — currentTime already advances at wall-clock speed.
         if (lastTs && !a.paused && !a.seeking && a.readyState >= 2) {
-          accumulatedRef.current += ((ts - lastTs) / 1000) * (a.playbackRate || 1);
+          accumulatedRef.current += (ts - lastTs) / 1000;
         }
       }
       lastTs = ts;

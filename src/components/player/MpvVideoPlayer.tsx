@@ -191,24 +191,15 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   /**
    * Drain genuinely-watched seconds into `log_session`.
    *
-   * This is the frontend half of the "time on a course never updates the block" bug. The
-   * backend hook was only ever reached from `log_session`, and this player called it in exactly
-   * ONE place: its unmount cleanup. So watching two minutes of an MKV credited the active block
-   * nothing until the student left the player — which reads as the block being stuck at 0m, and
-   * loses the time entirely if the app is closed on the video.
-   *
-   * The HTML5 path already drained on its 15s flush (`useMediaProgress`); mpv simply never got
-   * the same treatment. Draining is a MOVE, not a copy: the counter is zeroed before the await
-   * so a concurrent flush can't bill the same seconds twice, and every caller reports one
-   * discrete chunk, which is what makes the backend's summing safe.
+   * Matches `useMediaProgress.flush`: any positive seconds are logged (no 1s threshold)
+   * so a final <1s tail at EOF isn't lost — the "ended leak". Draining is a MOVE, not a copy:
+   * the counter is zeroed before the await so a concurrent flush can't bill the same seconds twice.
    */
   const drainSession = useCallback(() => {
     const secs = watchedSecondsRef.current;
-    if (secs < 1) return;
+    if (secs <= 0) return;
     watchedSecondsRef.current = 0;
     void ipc.logSession(materialId, secs).catch(() => {
-      // Best-effort: put the seconds back so the next flush can retry rather than silently
-      // discarding real study time.
       watchedSecondsRef.current += secs;
     });
   }, [materialId]);
