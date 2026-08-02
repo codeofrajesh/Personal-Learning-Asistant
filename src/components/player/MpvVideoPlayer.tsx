@@ -110,6 +110,12 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   const durationRef = useRef(0);
   const lastTimePosRef = useRef(0);
   const watchedSecondsRef = useRef(0);
+  // Wall-clock baseline (performance.now) of the last processed `time-pos` event. Watch-time is
+  // accumulated as REAL elapsed time between position events — never as `time-pos` deltas, which
+  // advance at playbackRate content-seconds per real second (see the time-pos handler). Zeroed on
+  // every discontinuity (pause / drag / seek / file change / window hide) so a gap in position
+  // events can never bill skipped wall time.
+  const lastWallTsRef = useRef(0);
   const draggingRef = useRef(false);
   const initedRef = useRef(false);
   
@@ -262,10 +268,17 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
                 // Pausing is a natural boundary: bank the watched time now rather than
                 // holding it in memory while the student walks away.
                 drainSession();
+                // No `time-pos` events flow while paused, so the baseline would otherwise stay
+                // at its pre-pause value and the first post-resume event would bill the whole
+                // pause as watched time. Zero it: the next event after resume seeds fresh.
+                lastWallTsRef.current = 0;
               }
               break;
             case "time-pos": {
               const t = (data as number | null) ?? 0;
+              // Monotonic wall clock at this event's processing time. Watch-time accrues as
+              // `nowWall - lastWallTsRef` (real elapsed seconds), never `t - lastTimePosRef`.
+              const nowWall = performance.now();
 
               // ── Resume safety net ──
               // `start=` on loadfile is the primary mechanism and normally means the first position
@@ -288,17 +301,33 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
                   // skipped span as watched time.
                   lastTimePosRef.current = owed;
                   timePosRef.current = owed;
+                  // A corrective seek is a discontinuity — seed the wall-clock baseline fresh on
+                  // the next event so the seek + settle gap isn't billed either.
+                  lastWallTsRef.current = 0;
                   break;
                 }
               }
 
-              // Accumulate genuinely-watched time (delta from last time-pos, only while
-              // playing, not scrubbing, and time moved forward). `draggingRef` mirrors the
-              // HTML5 path's `!v.seeking` guard: while the user is dragging the seek bar,
-              // position jumps are the user's hand, not playback.
-              if (!isPausedRef.current && !draggingRef.current && t > lastTimePosRef.current) {
-                watchedSecondsRef.current += t - lastTimePosRef.current;
+              // Accumulate genuinely-watched time in WALL-CLOCK seconds.
+              //
+              // `time-pos` advances at playbackRate content-seconds per real second — at 2x the
+              // position moves 2 content-seconds per real second — so a position delta would bill
+              // 2 study-seconds per real second (the fake-time bug this must not regress). Real
+              // elapsed time between position events sums to exactly the time the player was live,
+              // at ANY speed. This is the same invariant the HTML5 path enforces with rAF
+              // timestamps instead of `currentTime` deltas.
+              //
+              // `draggingRef` mirrors the HTML5 path's `!v.seeking` guard: while the user is
+              // dragging the seek bar, position jumps are the user's hand, not playback.
+              // `t > lastTimePosRef.current` is the "the video actually moved" test — a stalled
+              // player with the position frozen is not study time. When the player is NOT live the
+              // baseline is zeroed, so the next genuine playback seeds fresh instead of billing the
+              // gap.
+              const isLive = !isPausedRef.current && !draggingRef.current && t > lastTimePosRef.current;
+              if (isLive && lastWallTsRef.current > 0) {
+                watchedSecondsRef.current += (nowWall - lastWallTsRef.current) / 1000;
               }
+              lastWallTsRef.current = isLive ? nowWall : 0;
               lastTimePosRef.current = t;
               timePosRef.current = t;
               playbackStartedRef.current = true; // we received a position → playback live
@@ -429,6 +458,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     timePosRef.current = 0;
     lastTimePosRef.current = 0;
     watchedSecondsRef.current = 0;
+    lastWallTsRef.current = 0;
     playbackStartedRef.current = false;
     if (seekFillRef.current) seekFillRef.current.style.width = "0%";
     if (currentLabelRef.current) currentLabelRef.current.textContent = "0:00";
@@ -727,6 +757,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     const target = Math.max(0, d > 0 ? Math.min(d, t) : t);
     timePosRef.current = target;
     lastTimePosRef.current = target; // the skipped span must not be billed as watched
+    // Same rule for the wall-clock baseline: a seek (keyboard skip, notes jump, skip buttons) is
+    // a discontinuity, so the first post-seek `time-pos` event seeds fresh rather than billing
+    // the seek + settle gap as watched time.
+    lastWallTsRef.current = 0;
     void command("seek", [target, "absolute"]).catch(() => {});
     if (seekFillRef.current && d > 0) seekFillRef.current.style.width = `${(target / d) * 100}%`;
     saveProgress(true);
@@ -858,6 +892,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     const onHide = () => {
       saveProgress(true);
       drainSession();
+      // If playback continued while the window was hidden, the next `time-pos` event would arrive
+      // with a large wall-clock gap and bill the hidden time. Zero the baseline so it seeds fresh
+      // on return — hidden playback is not watched time.
+      lastWallTsRef.current = 0;
     };
     const onVisibility = () => {
       if (document.visibilityState === "hidden") onHide();

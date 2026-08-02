@@ -100,9 +100,11 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
           if (durationLabelRef.current) durationLabelRef.current.textContent = formatDuration(dur);
         }
         // Accumulate genuinely-watched time (skip while paused/seeking/buffering).
-        // Wall-clock only: do NOT multiply by playbackRate — the element's currentTime
-        // already advances at wall-clock speed (2x video plays twice as many frames in
-        // the same real seconds, but currentTime delta is still 1s per real second).
+        // Measured with rAF timestamps — the WALL clock — never `currentTime` deltas:
+        // `currentTime` advances at playbackRate content-seconds per real second (2x = 2
+        // content-seconds per real second), so a position delta would bill 2 study-seconds
+        // per real second. The rAF `ts` is monotonic real time, so the delta is 1:1 at any
+        // speed. The mpv path enforces the same rule with `performance.now()` deltas.
         if (lastTs && !v.paused && !v.seeking && v.readyState >= 2) {
           const delta = (ts - lastTs) / 1000;
           accumulatedRef.current += delta;
