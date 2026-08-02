@@ -17,7 +17,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { PictureInPicture2 } from "lucide-react";
+import { AlertCircle, PictureInPicture2 } from "lucide-react";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   command,
   init,
@@ -162,6 +163,51 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   const [speedOpen, setSpeedOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // ── Watchdog Timer (Bug 2 fix for OS sleep/resume) ──────────────────────────
+  const [engineStalled, setEngineStalled] = useState(false);
+  const watchdogBaselineRef = useRef<{ wall: number, pos: number, duration: number } | null>(null);
+
+  useEffect(() => {
+    if (!ready || !path) return;
+    const interval = window.setInterval(() => {
+      if (disposedRef.current) return;
+      
+      // If we haven't loaded yet or it's genuinely paused/dragging, reset watchdog
+      if (isPausedRef.current || draggingRef.current) {
+        watchdogBaselineRef.current = null;
+        return;
+      }
+
+      const now = performance.now();
+      const pos = timePosRef.current;
+      const dur = durationRef.current;
+
+      const baseline = watchdogBaselineRef.current;
+      if (!baseline) {
+        watchdogBaselineRef.current = { wall: now, pos, duration: dur };
+        return;
+      }
+
+      const elapsedWall = (now - baseline.wall) / 1000;
+      
+      // Local files should never buffer for 8 seconds. If position hasn't moved 
+      // or duration is still 0, the engine (hwdec/audio) crashed after OS sleep.
+      if (elapsedWall >= 8.0) {
+        if (dur === 0 || pos === baseline.pos) {
+          // eslint-disable-next-line no-console
+          console.error("[MpvVideoPlayer] Watchdog detected engine stall! elapsed:", elapsedWall, "pos:", pos, "dur:", dur);
+          setEngineStalled(true);
+          window.clearInterval(interval);
+        } else {
+          // Healthy, update baseline
+          watchdogBaselineRef.current = { wall: now, pos, duration: dur };
+        }
+      }
+    }, 1000);
+
+    return () => window.clearInterval(interval);
+  }, [ready, path]);
 
   const callOnFail = useCallback(
     (reason: string) => {
@@ -466,72 +512,48 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     // eslint-disable-next-line no-console
     console.log("[MpvVideoPlayer] loadfile:", path);
     void (async () => {
-      try {
-        // ── Resume is applied AS PART OF THE LOAD, not as a seek afterwards ──
-        //
-        // The old flow was: loadfile → wait for the `duration` property to arrive → then
-        // `seek absolute`. That is what made resume unreliable, for two reasons:
-        //
-        //   1. The seek effect gated on `duration > 0` from React STATE. The load effect
-        //      calls `setDuration(0)` on every file change, and mpv reports the real duration
-        //      through an async property event. If that event landed before React had committed
-        //      the 0 (the common case for a locally-cached file), the resume effect saw
-        //      `duration === 0`, skipped, and then never ran again — `resumeAppliedRef` was
-        //      already latched for the path. The video stayed at 0:00 with the DB holding 29%.
-        //   2. Even when it did fire, seeking after playback had begun meant decoding and
-        //      showing frames from 0:00 first, then jumping — a visible flash of the wrong
-        //      content, exactly the kind of frame disturbance we're told to avoid.
-        //
-        // mpv's `loadfile` accepts per-file options, and `start` is honoured while the file is
-        // being OPENED: the very first frame decoded and presented is the resume frame. One IPC
-        // call, no second command, no dependency on any React state having settled, and no layout
-        // involvement whatsoever — the anchor and the React tree are untouched by this, which is
-        // what keeps it clear of the black-screen class of bug.
-        //
-        // ARGUMENT ORDER IS VERSION-SENSITIVE, and getting it wrong does not degrade gracefully:
-        // mpv rejects the whole command and NOTHING loads, which is a black screen. mpv 0.38.0
-        // inserted an insertion `index` parameter, so the signature is now
-        // `loadfile <url> [<flags> [<index> [<options>]]]` — options are the FOURTH argument.
-        // Verified against the bundled libmpv (v0.41.0, see src-tauri/lib/libmpv-2.dll) and the
-        // 0.41 manual. `index` is passed as -1, which mpv ignores for `replace` mode.
-        //
-        // `pendingResumeRef` (checked by the `time-pos` observer) is the belt to this brace: if a
-        // future libmpv bump moves the argument again, or a container ignores `start`, resume still
-        // happens via one corrective seek instead of silently failing.
-        const resumeAt = startPositionRef.current;
-        // `> 1` also rules out negatives, which `start` would interpret as "relative to the END of
-        // the file" — a saved position of -5 must never mean "five seconds before the end".
-        const shouldResume = Number.isFinite(resumeAt) && resumeAt > 1;
-        // Arm the fallback BEFORE loading, so it covers the load however the load behaves.
-        pendingResumeRef.current = shouldResume ? resumeAt : 0;
-        if (shouldResume) {
+      let attempts = 0;
+      const resumeAt = startPositionRef.current;
+      const shouldResume = Number.isFinite(resumeAt) && resumeAt > 1;
+      pendingResumeRef.current = shouldResume ? resumeAt : 0;
+
+      while (attempts < 3) {
+        try {
+          if (disposedRef.current || globalLoadedPath !== path) return; // Navigated away
+
+          if (shouldResume) {
+            // eslint-disable-next-line no-console
+            console.log("[MpvVideoPlayer] resuming at", resumeAt, "s (attempt", attempts + 1, ")");
+            timePosRef.current = resumeAt;
+            lastTimePosRef.current = resumeAt;
+            await command("loadfile", [path, "replace", -1, `start=${resumeAt.toFixed(3)}`]);
+          } else {
+            await command("loadfile", [path]);
+          }
+          
+          if (disposedRef.current || globalLoadedPath !== path) return;
+
+          setMiniActive(materialId, fileName ?? path.split(/[\\/]/).pop() ?? "Now playing");
+          const actualPause = await getProperty("pause", "flag");
+          if (actualPause !== null && actualPause !== undefined) {
+             globalMpvState.pause = actualPause;
+             setIsPlaying(!actualPause);
+             isPlayingRef.current = !actualPause;
+             isPausedRef.current = actualPause;
+          }
+          return; // Success
+        } catch (e) {
+          attempts++;
           // eslint-disable-next-line no-console
-          console.log("[MpvVideoPlayer] resuming at", resumeAt, "s");
-          // Seed the position mirrors so a flush firing before the first `time-pos` event can't
-          // persist 0 over a real resume point.
-          timePosRef.current = resumeAt;
-          lastTimePosRef.current = resumeAt;
-          // Fixed 3dp: the time format is `[[hh:]mm:]ss[.ms]`, and a float rendered in exponential
-          // notation ("1e-7") or with 15 decimals is not a valid timestamp.
-          await command("loadfile", [path, "replace", -1, `start=${resumeAt.toFixed(3)}`]);
-        } else {
-          await command("loadfile", [path]);
+          console.error(`[MpvVideoPlayer] loadfile rejected (attempt ${attempts}):`, e);
+          if (attempts >= 3) {
+            // eslint-disable-next-line no-console
+            console.error("[MpvVideoPlayer] loadfile failed completely after 3 attempts.");
+            return;
+          }
+          // Wait 300ms before retry
+          await new Promise((r) => setTimeout(r, 300));
         }
-        // Mark this video as the globally-active one so the docked mini-player can take
-        // over if the user navigates away mid-playback.
-        setMiniActive(materialId, fileName ?? path.split(/[\\/]/).pop() ?? "Now playing");
-        // After loading a file, MPV auto-plays WITHOUT emitting a pause event.
-        // We MUST manually sync the true pause state to fix the initial freeze.
-        const actualPause = await getProperty("pause", "flag");
-        if (actualPause !== null && actualPause !== undefined) {
-           globalMpvState.pause = actualPause;
-           setIsPlaying(!actualPause);
-           isPlayingRef.current = !actualPause;
-           isPausedRef.current = actualPause;
-        }
-      } catch (e) {
-        // eslint-disable-next-line no-console
-        console.error("[MpvVideoPlayer] loadfile rejected (likely a rapid-switch race):", e);
       }
     })();
 
@@ -948,7 +970,30 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
 
   return (
     <div ref={videoAnchorRef} id="video-anchor" className="relative h-full w-full bg-transparent outline-none" tabIndex={0}>
-      {!ready && (
+      {/* Watchdog Engine Stalled Overlay */}
+      {engineStalled && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 p-6 text-center text-white backdrop-blur-md">
+          <div className="mb-4 rounded-full bg-orange-500/20 p-4">
+            <AlertCircle className="h-8 w-8 text-orange-500" />
+          </div>
+          <p className="mb-2 text-xl font-medium tracking-tight">Video Engine Stalled</p>
+          <p className="mb-6 max-w-md text-sm text-neutral-400">
+            The system resumed from sleep and the media engine lost its hardware connection.
+          </p>
+          <button
+            onClick={() => {
+              saveProgress(true);
+              drainSession();
+              void relaunch();
+            }}
+            className="rounded-full bg-white/10 px-6 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
+          >
+            Restart Player
+          </button>
+        </div>
+      )}
+
+      {!ready && !engineStalled && (
         <div className="grid h-full place-items-center text-sm text-content-muted">Starting native player…</div>
       )}
 
