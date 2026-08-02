@@ -300,20 +300,26 @@ export const ipc = {
     return call<DayPlan>("plan_day", { day });
   },
 
-  /** Create (no `id`) or update (with `id`) a time block. Returns its id. */
+  /** Create (no `id`) or update (with `id`) a time block. Returns its id.
+   *  Bumps the plan revision on success so the reminder ladder + block surfaces re-read. */
   upsertPlanBlock(block: BlockInput): Promise<number> {
-    return call<number>("upsert_plan_block", { block });
+    return call<number>("upsert_plan_block", { block }).then((id) => {
+      bumpPlanRevision();
+      return id;
+    });
   },
 
-  /** Delete a block outright — distinct from skipping it, which keeps the record. */
+  /** Delete a block outright — distinct from skipping it, which keeps the record.
+   *  Bumps the plan revision on success so the reminder ladder + block surfaces re-read. */
   deletePlanBlock(id: number): Promise<void> {
-    return call<void>("delete_plan_block", { id });
+    return call<void>("delete_plan_block", { id }).then(() => bumpPlanRevision());
   },
 
   /**
    * Set a block's status, re-snapshotting the day so the score updates immediately.
    * Pass `day` to snapshot the block's OWN day: confirming yesterday's block during an
    * end-of-day review must move yesterday's score, not today's.
+   * Bumps the plan revision on success so the reminder ladder + block surfaces re-read.
    */
   setPlanBlockStatus(
     id: number,
@@ -321,12 +327,15 @@ export const ipc = {
     executedMins: number | null = null,
     day: string | null = null,
   ): Promise<void> {
-    return call<void>("set_plan_block_status", { id, status, executedMins, day });
+    return call<void>("set_plan_block_status", { id, status, executedMins, day }).then(() =>
+      bumpPlanRevision(),
+    );
   },
 
-  /** Mark a block as started (at most one is active at a time). */
+  /** Mark a block as started (at most one is active at a time).
+   *  Bumps the plan revision on success so the reminder ladder + block surfaces re-read. */
   startPlanBlock(id: number): Promise<void> {
-    return call<void>("start_plan_block", { id });
+    return call<void>("start_plan_block", { id }).then(() => bumpPlanRevision());
   },
 
   /** The block currently in progress, if any. */
@@ -334,13 +343,16 @@ export const ipc = {
     return call<PlanBlock | null>("active_plan_block");
   },
 
-  /** Set (or clear, with nulls) a day's wake / hard-stop overrides. */
+  /** Set (or clear, with nulls) a day's wake / hard-stop overrides.
+   *  Bumps the plan revision on success so the reminder ladder + block surfaces re-read. */
   setPlanDayWindow(
     day: string,
     wakeAt: string | null,
     hardStopAt: string | null,
   ): Promise<void> {
-    return call<void>("set_plan_day_window", { day, wakeAt, hardStopAt });
+    return call<void>("set_plan_day_window", { day, wakeAt, hardStopAt }).then(() =>
+      bumpPlanRevision(),
+    );
   },
 
   /** Compute recovery options. READ-ONLY — safe to call as often as the UI likes. */

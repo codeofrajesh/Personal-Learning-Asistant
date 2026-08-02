@@ -16,7 +16,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
-import { bumpPlanRevision, usePlanRevision } from "../../lib/planRevision";
+import { usePlanRevision } from "../../lib/planRevision";
 import { dayOffset, localDay, useScheduleClock } from "../../lib/scheduleClock";
 import type { BlockInput, BlockStatus, DayPlan, PlanBlock } from "../../lib/types";
 
@@ -87,18 +87,15 @@ export function useDayPlan(): DayPlanState {
   // Reload on day change OR on a plan revision bump (watch path / Pomodoro credit / manual edit).
   // The watch path credits the active block and bumps the revision; this hook re-reads so the
   // block card shows fresh executed_mins while the mini-player is still playing.
+  //
+  // The bump that feeds this effect is announced by the WRITERS (`ipc.logSession`,
+  // `ipc.upsertPlanBlock`, …), never by this hook's own effect. The old "bump on every `blocks`
+  // change" effect made this hook its own writer — every reload produced a fresh `blocks`
+  // reference, bumped the revision, and re-ran this effect in an infinite loop that flooded the
+  // IPC channel and the single shared SQLite connection. This hook now only ever READS revision.
   useEffect(() => {
     void reload();
   }, [reload, revision]);
-
-  // The reminder ladder is NOT armed here. It lives in AppShell (`useBlockReminders`) because a
-  // reminder is worthless if it only fires while the Planning page happens to be open — the
-  // student needs it most while they're on the player. This hook just announces that the day
-  // changed, and the global ladder re-arms itself.
-  const blocks = plan?.blocks;
-  useEffect(() => {
-    if (isToday && blocks) bumpPlanRevision();
-  }, [isToday, blocks]);
 
   const goToDay = useCallback((next: string) => {
     pinnedRef.current = next === localDay();
