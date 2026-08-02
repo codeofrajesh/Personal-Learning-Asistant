@@ -1,7 +1,7 @@
 {
   "name": "personal-learning-environment",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "description": "Local-First Personal Learning Environment (PLE) — Tauri v2 + React desktop app",
   "scripts": {
