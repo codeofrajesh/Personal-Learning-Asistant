@@ -22,3 +22,6 @@ src-tauri/gen/
 # Logs
 *.log
 npm-debug.log*
+
+# Notes
+Errors.md
