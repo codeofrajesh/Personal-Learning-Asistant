@@ -15,7 +15,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import {
   Eye, EyeOff, ArrowUp, ArrowDown, Timer, Coffee, Moon, RotateCcw,
-  Folder, Palette, Play, Database, Info, DownloadCloud,
+  Folder, Palette, Play, Database, Info, DownloadCloud, Puzzle, Pin,
 } from "lucide-react";
 import { usePerf, detectTier, type PerfPreference } from "../lib/perfStore";
 import Breadcrumb from "../components/layout/Breadcrumb";
@@ -36,6 +36,9 @@ import {
   type DashboardLayout,
 } from "../lib/dashboardLayout";
 import type { ImportSummary, RegisteredDir } from "../lib/types";
+import { pinnablePlugins } from "../lib/plugins/registry";
+import { usePins } from "../lib/plugins/pinStore";
+import { getPluginSettingsSections } from "../lib/plugins/settings";
 
 // ── Shared bits ──────────────────────────────────────────────────────────────
 
@@ -956,9 +959,91 @@ function DashboardWidgets() {
   );
 }
 
+// ── Plugins ───────────────────────────────────────────────────────────────────
+
+function PluginsSection() {
+  const plugins = pinnablePlugins();
+  const pins = usePins((s) => s.pins);
+  const hydrated = usePins((s) => s.hydrated);
+  const hydrate = usePins((s) => s.hydrate);
+  const setPinned = usePins((s) => s.setPinned);
+
+  useEffect(() => {
+    void hydrate();
+  }, [hydrate]);
+
+  return (
+    <Section
+      title="Plugins"
+      description="Tools installed into PLE. Pin a tool to the sidebar, or open its settings here. More tools can be added from the Plugins page."
+    >
+      {!hydrated && (
+        <p className="text-sm text-content-muted">Loading plugins…</p>
+      )}
+
+      {plugins.length === 0 && (
+        <p className="text-sm text-content-muted">No external plugins installed yet.</p>
+      )}
+
+      <ul className="flex flex-col gap-2">
+        {plugins.map((p) => {
+          const Icon = p.icon;
+          const pinned = pins[p.id] ?? p.nav?.defaultPinned ?? false;
+          return (
+            <li
+              key={p.id}
+              className="flex items-center gap-3 rounded-btn bg-white/[0.03] px-3 py-2.5"
+            >
+              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-btn border border-white/[0.06] bg-white/[0.05]">
+                <Icon className="h-5 w-5 text-lime" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm text-content-primary">{p.name}</p>
+                <p className="mt-0.5 truncate text-xs text-content-muted">{p.description}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPinned(p.id, !pinned)}
+                disabled={!hydrated}
+                aria-pressed={pinned}
+                aria-label={pinned ? `Unpin ${p.name} from sidebar` : `Pin ${p.name} to sidebar`}
+                className={
+                  "flex items-center gap-1.5 rounded-btn border px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-50 " +
+                  (pinned
+                    ? "border-lime/40 bg-lime/10 text-lime"
+                    : "border-white/10 text-content-secondary hover:bg-white/[0.05]")
+                }
+              >
+                <Pin size={13} strokeWidth={2} aria-hidden />
+                {pinned ? "Pinned" : "Pin"}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+
+      {getPluginSettingsSections().length > 0 && (
+        <div className="mt-4 flex flex-col gap-gutter">
+          {getPluginSettingsSections().map((s) => (
+            <div key={s.id}>{s.render()}</div>
+          ))}
+        </div>
+      )}
+    </Section>
+  );
+}
+
 // ── Page (two-pane: left-nav tab rail + content panel) ───────────────────────
 
-type CategoryId = "library" | "appearance" | "focus" | "playback" | "data" | "update" | "about";
+type CategoryId =
+  | "library"
+  | "appearance"
+  | "focus"
+  | "playback"
+  | "plugins"
+  | "data"
+  | "update"
+  | "about";
 
 interface Category {
   id: CategoryId;
@@ -1007,6 +1092,13 @@ const CATEGORIES: Category[] = [
     icon: Play,
     description: "The default in-app video engine.",
     render: () => <DefaultPlayer />,
+  },
+  {
+    id: "plugins",
+    label: "Plugins",
+    icon: Puzzle,
+    description: "Manage installed tools and their settings.",
+    render: () => <PluginsSection />,
   },
   {
     id: "data",

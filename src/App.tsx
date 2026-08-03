@@ -13,6 +13,7 @@
 import { lazy, Suspense } from "react";
 import { HashRouter, Navigate, Routes, Route, useParams } from "react-router-dom";
 import AppShell from "./components/layout/AppShell";
+import { getPluginRoutes } from "./lib/plugins/routes";
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const CoursesPage = lazy(() => import("./pages/CoursesPage"));
@@ -21,6 +22,7 @@ const PlanningHub = lazy(() => import("./pages/PlanningHub"));
 const PlayerPage = lazy(() => import("./pages/PlayerPage"));
 const Settings = lazy(() => import("./pages/Settings"));
 const NotFound = lazy(() => import("./pages/NotFound"));
+const PluginsPage = lazy(() => import("./pages/PluginsPage"));
 
 /** Lightweight route fallback while a page chunk loads. */
 function PageFallback() {
@@ -43,7 +45,27 @@ function NodeRedirect({ param }: { param: string }) {
   return <Navigate to={id != null ? `/courses/${id}` : "/courses"} replace />;
 }
 
+/**
+ * Build a lazy route for a plugin path that isn't pre-registered in App.tsx.
+ * Plugin manifests declare their own lazy import; this wraps it with Suspense.
+ */
+function PluginRoute({ path, importFn }: { path: string; importFn: () => Promise<{ default: React.ComponentType }> }) {
+  const LazyComponent = lazy(importFn);
+  return (
+    <Route
+      path={path}
+      element={
+        <Suspense fallback={<PageFallback />}>
+          <LazyComponent />
+        </Suspense>
+      }
+    />
+  );
+}
+
 export default function App() {
+  const pluginRoutes = getPluginRoutes();
+
   return (
     <HashRouter>
       <Routes>
@@ -110,6 +132,18 @@ export default function App() {
               </Suspense>
             }
           />
+          <Route
+            path="plugins"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <PluginsPage />
+              </Suspense>
+            }
+          />
+          {/* Plugin routes — code-split via their manifests. */}
+          {pluginRoutes.map((r) => (
+            <PluginRoute key={r.path} path={r.path} importFn={r.lazy} />
+          ))}
           <Route
             path="*"
             element={

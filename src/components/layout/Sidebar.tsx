@@ -15,11 +15,12 @@
  * progress readout that displaced it would trade the primary job for a secondary one.
  */
 
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { Link, matchPath, useLocation } from "react-router-dom";
-import { NAV_ITEMS, type NavItem } from "./nav";
 import StudyMeter from "./StudyMeter";
 import { GraduationIcon, SearchIcon } from "../ui/icons";
+import { usePins } from "../../lib/plugins/pinStore";
+import { useNavItems } from "../../lib/plugins/nav";
 import { navSource } from "../../lib/navigation";
 import { cn } from "../../lib/utils";
 
@@ -38,6 +39,14 @@ interface SidebarProps {
 export default function Sidebar({ collapsed, onOpenSearch, floating = true }: SidebarProps) {
   const listRef = useRef<HTMLUListElement>(null);
   const location = useLocation();
+  const navItems = useNavItems();
+  const hydrate = usePins((s) => s.hydrate);
+
+  // Hydrate plugin pin state once on mount (the store dedupes); keeps the nav in sync
+  // with the persisted settings table after a restart.
+  useEffect(() => {
+    void hydrate();
+  }, [hydrate]);
 
   // Context-aware active state. The Player route (/library/material/:id) is a prefix
   // match for the Library tab, so a player launched from Courses would light up
@@ -47,7 +56,7 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
     matchPath("/library/material/*", location.pathname) != null &&
     navSource(location) === "courses";
 
-  const isItemActive = (item: NavItem): boolean => {
+  const isItemActive = (item: { to: string; end?: boolean }): boolean => {
     const base = item.end
       ? location.pathname === item.to
       : location.pathname === item.to || location.pathname.startsWith(item.to + "/");
@@ -127,7 +136,7 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
       {/* Primary nav */}
       <nav aria-label="Primary" className="mt-4">
         <ul ref={listRef} onKeyDown={onKeyDown} className="flex flex-col gap-4">
-          {NAV_ITEMS.map((item) => {
+          {navItems.map((item) => {
             const { to, label, icon: Icon } = item;
             const active = isItemActive(item);
             return (
