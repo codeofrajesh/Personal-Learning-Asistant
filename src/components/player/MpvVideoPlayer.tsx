@@ -256,6 +256,20 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     });
   }, [materialId]);
 
+  // ── Periodic Save & Drain (every 15s) ───────────────────────────────────────
+  // A safety net to flush watched seconds and position to the backend during long
+  // uninterrupted playback. Without this, a student watching a 45m lecture without
+  // pausing wouldn't see their Study Meter update until the video ended.
+  useEffect(() => {
+    if (!ready || !path) return;
+    const id = window.setInterval(() => {
+      if (disposedRef.current) return;
+      saveProgress(false); // coalesced save
+      drainSession();
+    }, 15000);
+    return () => window.clearInterval(id);
+  }, [ready, path, saveProgress, drainSession]);
+
   // ── Init mpv once (init FIRST, then observe) ───────────────────────────────
   useEffect(() => {
     if (!isTauri()) {
