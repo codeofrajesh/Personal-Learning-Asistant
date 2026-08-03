@@ -23,6 +23,13 @@ pub enum LinkTarget {
     PrivateChannel { channel_id: i64 },
     /// A public chat addressed by `@username`. Needs a network round trip to resolve.
     Username { username: String },
+    /// A private invite link (`t.me/+hash` or `t.me/joinchat/hash`).
+    ///
+    /// The hash is NOT a chat id: it must be exchanged for the real peer via
+    /// `messages.checkChatInvite`. This is the only handle a student has for a private
+    /// channel that has no username — including one they own — so it is a first-class target
+    /// rather than an error case.
+    Invite { hash: String },
 }
 
 /// A parsed `t.me` message link.
@@ -78,6 +85,16 @@ pub fn parse_message_link(input: &str) -> AppResult<MessageLink> {
         .trim_end_matches('/');
 
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // Invite links carry an opaque hash, never a message id, so they can only ever identify a
+    // *channel*. Detected before the generic shapes below because `+AAAA/1` would otherwise
+    // parse as an (invalid) username with a message id.
+    if invite_hash(&segments).is_some() {
+        return Err(AppError::Invalid(
+            "That's an invite link, which points at a whole channel rather than one lesson. Paste it into \"Browse channel\" to list the channel's media, or open the lesson in Telegram and copy its message link (t.me/c/…)."
+                .into(),
+        ));
+    }
 
     match segments.as_slice() {
         // Private channel: /c/<bare_channel_id>/<message_id>
@@ -187,19 +204,46 @@ fn parse_message_id(raw: &str) -> AppResult<i32> {
     Ok(id)
 }
 
+/// Extract an invite hash from the path segments, if this is an invite link.
+///
+/// Two equivalent shapes exist and both are still issued in the wild:
+///   · `t.me/+<hash>`          — the modern form
+///   · `t.me/joinchat/<hash>`  — the legacy form
+///
+/// The hash is opaque (base64url-ish), so it is only length- and charset-checked; the real
+/// validation is `messages.checkChatInvite` rejecting it.
+fn invite_hash(segments: &[&str]) -> Option<String> {
+    let raw = match segments {
+        // `t.me/joinchat/<hash>` — legacy form.
+        [first, second] if first.eq_ignore_ascii_case("joinchat") => *second,
+        // `t.me/+<hash>`, with or without a trailing segment. An invite link can't address a
+        // message, so anything after the hash is ignored rather than treated as a message id.
+        [first] | [first, _] => first.strip_prefix('+')?,
+        _ => return None,
+    };
+
+    let hash = raw.trim();
+    let ok = (8..=64).contains(&hash.len())
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    ok.then(|| hash.to_string())
+}
+
 /// Validate a `@username` path segment.
 ///
 /// Telegram usernames are 5-32 chars of `[A-Za-z0-9_]`. Checking the shape here means a
 /// mistyped URL is reported as a bad link rather than spending a network round trip to be
 /// told the peer doesn't exist. Reserved path prefixes that are never channels are rejected
-/// by name, because `t.me/joinchat/<hash>/…` would otherwise parse as a username.
+/// by name, because `t.me/share/<...>` would otherwise parse as a username.
 fn validate_username(raw: &str) -> AppResult<String> {
     let name = raw.trim().trim_start_matches('@');
 
-    const RESERVED: [&str; 6] = ["joinchat", "addstickers", "share", "proxy", "socks", "iv"];
+    // `joinchat` is deliberately NOT here — it's handled as a real invite target upstream.
+    const RESERVED: [&str; 5] = ["addstickers", "share", "proxy", "socks", "iv"];
     if RESERVED.contains(&name.to_ascii_lowercase().as_str()) {
         return Err(AppError::Invalid(
-            "That's an invite or share link, not a message link.".into(),
+            "That's a share link, not a message link.".into(),
         ));
     }
 
@@ -215,6 +259,66 @@ fn validate_username(raw: &str) -> AppResult<String> {
 
 fn not_a_link() -> String {
     "That doesn't look like a Telegram message link. Copy one from Telegram — it looks like https://t.me/c/1234567890/42.".to_string()
+}
+
+/// Parse a link that identifies a CHANNEL (rather than one message).
+///
+/// Used by the browse view, which needs a channel and doesn't care about message ids. Accepts
+/// everything `parse_message_link` does (taking just the channel half), plus the two shapes
+/// that can only ever mean a channel: an invite link and a bare `@username`.
+///
+/// Invite links matter specifically because a private channel with no username — including
+/// one the user owns — has no other pasteable handle.
+pub fn parse_channel_link(input: &str) -> AppResult<LinkTarget> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(AppError::Invalid(
+            "Paste a channel link, invite link, or @username.".into(),
+        ));
+    }
+
+    // A bare @username never parses as a URL, so handle it before anything else.
+    if let Some(name) = raw.strip_prefix('@') {
+        return Ok(LinkTarget::Username {
+            username: validate_username(name)?,
+        });
+    }
+
+    // Invite link, in either shape.
+    let no_scheme = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .unwrap_or(raw);
+    let no_scheme = no_scheme.strip_prefix("www.").unwrap_or(no_scheme);
+    if let Some((host, path)) = no_scheme.split_once('/') {
+        if matches!(host, "t.me" | "telegram.me" | "telegram.dog") {
+            let path = path
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/');
+            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if let Some(hash) = invite_hash(&segments) {
+                return Ok(LinkTarget::Invite { hash });
+            }
+        }
+    }
+
+    // A full message link — reuse the real parser so every shape it understands (forum
+    // topics, query strings, -100 ids) works here too; only the channel half is kept.
+    if let Ok(link) = parse_message_link(raw) {
+        return Ok(link.target);
+    }
+
+    // Channel-only links (`t.me/c/<id>`, `t.me/<username>`): append a dummy message id so the
+    // same parser can validate the channel half, then discard it.
+    if let Ok(link) = parse_message_link(&format!("{}/1", raw.trim_end_matches('/'))) {
+        return Ok(link.target);
+    }
+
+    Err(AppError::Invalid(
+        "That doesn't look like a Telegram channel link, invite link, or @username.".into(),
+    ))
 }
 
 /// The synthetic `file_path` for a Telegram material.
@@ -327,10 +431,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invite_and_share_links() {
-        // `t.me/joinchat/<hash>/1` would otherwise parse as username "joinchat".
-        let err = parse_message_link("https://t.me/joinchat/AAAAAE/1").unwrap_err();
-        assert!(err.to_string().contains("invite or share"), "{err}");
+    fn rejects_share_links() {
+        // `t.me/share/...` would otherwise parse as username "share".
+        let err = parse_message_link("https://t.me/share/url").unwrap_err();
+        assert!(err.to_string().contains("share link"), "{err}");
     }
 
     #[test]
@@ -360,6 +464,80 @@ mod tests {
     fn rejects_too_short_usernames() {
         // Telegram's minimum is 5 characters.
         assert!(parse_message_link("https://t.me/ab/42").is_err());
+    }
+
+    #[test]
+    fn rejects_invite_links_as_message_links_with_a_useful_message() {
+        // An invite link identifies a channel, not a lesson. The error has to say where to
+        // paste it instead, or the user is stuck with the only handle a username-less private
+        // channel has.
+        for url in [
+            "https://t.me/+0fNyqiUncH5mNjE9",
+            "https://t.me/joinchat/AAAAAEjq0Ns4nqPZ7A",
+        ] {
+            let err = parse_message_link(url).unwrap_err().to_string();
+            assert!(err.contains("invite link"), "{url}: {err}");
+            assert!(err.contains("Browse channel"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn parses_invite_links_as_channel_links() {
+        // The real fix for a private channel with no username: the invite hash IS the handle.
+        assert_eq!(
+            parse_channel_link("https://t.me/+0fNyqiUncH5mNjE9").unwrap(),
+            LinkTarget::Invite {
+                hash: "0fNyqiUncH5mNjE9".into()
+            }
+        );
+        // Legacy shape.
+        assert_eq!(
+            parse_channel_link("https://t.me/joinchat/AAAAAEjq0Ns4nqPZ7A").unwrap(),
+            LinkTarget::Invite {
+                hash: "AAAAAEjq0Ns4nqPZ7A".into()
+            }
+        );
+        // Scheme-less, and with a query string.
+        assert_eq!(
+            parse_channel_link("t.me/+0fNyqiUncH5mNjE9?foo=1").unwrap(),
+            LinkTarget::Invite {
+                hash: "0fNyqiUncH5mNjE9".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_channel_link_still_handles_every_other_shape() {
+        assert_eq!(
+            parse_channel_link("@somechannel").unwrap(),
+            LinkTarget::Username {
+                username: "somechannel".into()
+            }
+        );
+        assert_eq!(
+            parse_channel_link("https://t.me/c/1234567890/42").unwrap(),
+            LinkTarget::PrivateChannel {
+                channel_id: 1234567890
+            }
+        );
+        assert_eq!(
+            parse_channel_link("https://t.me/c/1234567890").unwrap(),
+            LinkTarget::PrivateChannel {
+                channel_id: 1234567890
+            }
+        );
+        assert!(parse_channel_link("   ").is_err());
+        assert!(parse_channel_link("https://example.com/foo").is_err());
+    }
+
+    #[test]
+    fn invite_hash_rejects_things_that_are_not_hashes() {
+        // Too short, and a plain username must NOT be read as an invite.
+        assert!(invite_hash(&["+short"]).is_none());
+        assert!(invite_hash(&["durov"]).is_none());
+        assert!(invite_hash(&["c", "1234567890", "42"]).is_none());
+        // A `+` prefix with an invalid charset.
+        assert!(invite_hash(&["+has/slash!chars"]).is_none());
     }
 
     #[test]

@@ -15,14 +15,17 @@
 
 use grammers_client::media::Media;
 use grammers_client::message::Message;
-use grammers_client::session::types::PeerId;
-use grammers_client::{Client, InvocationError};
+use grammers_client::session::types::{PeerAuth, PeerId, PeerRef};
+use grammers_client::session::Session;
+use grammers_client::{tl, Client, InvocationError};
 use tauri::{AppHandle, State};
 
 use crate::db::Db;
 use crate::plugins::telegram::auth::map_invocation;
-use crate::plugins::telegram::link::{parse_message_link, synthetic_path, LinkTarget};
-use crate::plugins::telegram::session::TgState;
+use crate::plugins::telegram::link::{
+    parse_channel_link, parse_message_link, synthetic_path, LinkTarget,
+};
+use crate::plugins::telegram::session::{FileSession, TgState};
 use crate::utils::errors::{AppError, AppResult};
 
 /// One importable media message.
@@ -61,11 +64,15 @@ pub struct TgImportResult {
 /// `PeerRef`, which works because the sender pool fills in the access hash from the session's
 /// cached peers. If the account has never seen the channel, the request fails — handled by
 /// the caller with a membership-flavored message rather than a raw RPC error.
-async fn resolve_target(client: &Client, target: &LinkTarget) -> AppResult<PeerId> {
+async fn resolve_target(client: &Client, target: &LinkTarget) -> AppResult<PeerRef> {
     match target {
-        LinkTarget::PrivateChannel { channel_id } => PeerId::channel(*channel_id).ok_or_else(|| {
-            AppError::Invalid("That channel id is outside Telegram's valid range.".into())
-        }),
+        // Bare id only — no access hash in the link, so the hash has to come from the session
+        // peer cache. Returns an ambient ref here; `resolve_peer_ref` upgrades it.
+        LinkTarget::PrivateChannel { channel_id } => PeerId::channel(*channel_id)
+            .map(PeerId::to_ambient_ref)
+            .ok_or_else(|| {
+                AppError::Invalid("That channel id is outside Telegram's valid range.".into())
+            }),
         LinkTarget::Username { username } => {
             let peer = client
                 .resolve_username(username)
@@ -74,8 +81,82 @@ async fn resolve_target(client: &Client, target: &LinkTarget) -> AppResult<PeerI
                 .ok_or_else(|| {
                     AppError::NotFound(format!("No Telegram channel called @{username}."))
                 })?;
-            Ok(peer.id())
+            // `contacts.resolveUsername` returns the access hash, so this ref is complete and
+            // needs no cache lookup.
+            peer.to_ref().await.ok().flatten().ok_or_else(|| {
+                AppError::NotFound(format!("Couldn't resolve @{username}."))
+            })
         }
+        LinkTarget::Invite { hash } => resolve_invite(client, hash).await,
+    }
+}
+
+/// Exchange an invite hash for a real `PeerRef` via `messages.checkChatInvite`.
+///
+/// This is what makes a username-less private channel reachable at all — including one the
+/// user owns, where the invite link is the only handle that exists. `checkChatInvite` is a
+/// read-only lookup: it does NOT join anything (that would be `importChatInvite`), so pasting
+/// a link can never silently change the account's memberships.
+///
+/// Telegram answers in three shapes, and the distinction is the whole point:
+///   · `ChatInviteAlready` / `ChatInvitePeek` — already a member (or allowed to peek), and the
+///     response carries the full `Chat` **with its access hash**. This is the success path.
+///   · `ChatInvite` — a *preview* for a channel the account has NOT joined. It deliberately
+///     carries no id or hash, so the channel cannot be read. Reported as "join first".
+async fn resolve_invite(client: &Client, hash: &str) -> AppResult<PeerRef> {
+    use tl::enums::ChatInvite as CI;
+
+    let result = client
+        .invoke(&tl::functions::messages::CheckChatInvite {
+            hash: hash.to_string(),
+        })
+        .await
+        .map_err(|e| {
+            if let InvocationError::Rpc(rpc) = &e {
+                if rpc.name == "INVITE_HASH_EXPIRED" {
+                    return AppError::Invalid(
+                        "That invite link has expired. Generate a fresh one in Telegram.".into(),
+                    );
+                }
+                if rpc.name == "INVITE_HASH_INVALID" {
+                    return AppError::Invalid("That invite link isn't valid.".into());
+                }
+            }
+            map_invocation(e)
+        })?;
+
+    let chat = match result {
+        CI::Already(already) => already.chat,
+        CI::Peek(peek) => peek.chat,
+        CI::Invite(preview) => {
+            return Err(AppError::NotFound(format!(
+                "You haven't joined “{}” yet. Open the invite link in Telegram and join, then paste it here again.",
+                preview.title
+            )))
+        }
+    };
+
+    // Pull the id + access hash straight out of the returned Chat.
+    match chat {
+        tl::enums::Chat::Channel(c) => {
+            let id = PeerId::channel(c.id).ok_or_else(|| {
+                AppError::Invalid("That channel id is outside Telegram's valid range.".into())
+            })?;
+            let access_hash = c.access_hash.ok_or_else(|| {
+                AppError::NotFound(
+                    "Telegram didn't return access to that channel. Join it in Telegram and try again."
+                        .into(),
+                )
+            })?;
+            Ok(PeerRef {
+                id,
+                auth: PeerAuth::from_hash(access_hash),
+            })
+        }
+        // Basic groups and forbidden channels can't host a course library.
+        _ => Err(AppError::Invalid(
+            "That invite is for a group, not a channel. Only channels can be imported.".into(),
+        )),
     }
 }
 
@@ -285,14 +366,80 @@ fn unreachable_peer_or(e: InvocationError) -> AppError {
     map_invocation(e)
 }
 
-/// Fetch one message, mapping the "peer unknown to this session" case to a useful message.
+/// Walk the dialog list so every joined chat lands in the session's peer cache.
+///
+/// This is the only way to learn a private channel's `access_hash` without an invite link:
+/// `messages.getDialogs` returns the full `Chat` objects, and `build_peer_map` feeds each one
+/// through `Session::cache_peer` (grammers' `auto_cache_peers` defaults to true). The account
+/// must already be a member — which is exactly the case we're serving.
+///
+/// Bounded at ~200 dialogs: enough to cover any realistic account, and a hard stop so a
+/// pathological list can't spin here. Best-effort by contract; the caller reports the failure.
+async fn prime_peer_cache(client: &Client) {
+    log::info!("telegram: peer cache miss, priming via iter_dialogs");
+    let mut dialogs = client.iter_dialogs();
+    for _ in 0..200 {
+        match dialogs.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("telegram: dialog priming stopped early: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// Resolve a bare channel id into a `PeerRef` carrying a REAL `access_hash`.
+///
+/// This is the crux of private-channel support, and the reason a retry-the-same-request
+/// approach cannot work. A `t.me/c/<id>/<msg>` link carries only the bare id, so the only
+/// available `PeerRef` is `PeerId::to_ambient_ref()` — and that is defined as
+/// `PeerAuth::default()`, i.e. **`access_hash: 0`**. `channels.getMessages` rejects that with
+/// `CHANNEL_INVALID` for any channel that isn't public.
+///
+/// Crucially, `get_messages_by_id` does `channel: peer.into()` with no session lookup at all.
+/// So priming the cache and then re-issuing the *same* ambient call rebuilds byte-identical
+/// wire data and fails identically — the primed `access_hash` is never read. The fix is to ask
+/// the session for the hash and send a `PeerRef` that actually carries it.
+///
+/// Order matters: check the cache first (free), and only walk the dialog list if that misses.
+async fn resolve_peer_ref(
+    client: &Client,
+    session: &FileSession,
+    peer: PeerRef,
+) -> AppResult<PeerRef> {
+    // A username or invite link already produced a real hash — nothing to look up.
+    if peer.auth != PeerAuth::default() {
+        return Ok(peer);
+    }
+
+    if let Ok(Some(cached)) = session.peer_ref(peer.id).await {
+        return Ok(cached);
+    }
+
+    prime_peer_cache(client).await;
+
+    if let Ok(Some(cached)) = session.peer_ref(peer.id).await {
+        return Ok(cached);
+    }
+
+    // Still unknown after enumerating every joined dialog: the account genuinely can't see
+    // this channel, or the id in the link is wrong. An invite link is the remaining option, so
+    // the message points there rather than dead-ending.
+    Err(AppError::NotFound(
+        "This Telegram account can't see that channel. If you're a member, open the channel in Telegram once and retry — otherwise paste the channel's invite link (t.me/+…) instead.".into(),
+    ))
+}
+
+/// Fetch one message using a cache-resolved peer reference.
 async fn fetch_message(
     client: &Client,
-    peer: PeerId,
+    peer_ref: PeerRef,
     message_id: i32,
 ) -> AppResult<Message> {
     let messages = client
-        .get_messages_by_id(peer.to_ambient_ref(), &[message_id])
+        .get_messages_by_id(peer_ref, &[message_id])
         .await
         .map_err(unreachable_peer_or)?;
 
@@ -333,12 +480,18 @@ pub async fn tg_import_link(
     }
 
     let peer = resolve_target(&client, &link.target).await?;
-    let message = fetch_message(&client, peer, link.message_id).await?;
+    // Resolve through the session cache so the request carries a real `access_hash`; an
+    // ambient ref (hash 0) is rejected by every private channel.
+    let session = state.get_session().await.ok_or_else(|| {
+        AppError::Other("Telegram session is not initialized.".into())
+    })?;
+    let peer_ref = resolve_peer_ref(&client, &session, peer).await?;
+    let message = fetch_message(&client, peer_ref, link.message_id).await?;
 
     // Store the BARE channel id, matching what a `/c/` link carries and what
     // `synthetic_path` builds. Storing the Bot-API form here would make the same channel
     // look like two different ones depending on which link shape was imported.
-    let chat_id = peer.bare_id().ok_or_else(|| {
+    let chat_id = peer_ref.id.bare_id().ok_or_else(|| {
         AppError::Invalid("That link doesn't point at a channel.".into())
     })?;
 
@@ -380,7 +533,7 @@ pub async fn tg_channel_media(
 ) -> AppResult<Vec<TgMediaItem>> {
     // The same parser serves both: a student can paste any message link from the channel they
     // want to browse, which is far easier than finding its numeric id.
-    let link = parse_channel_reference(&url)?;
+    let link = parse_channel_link(&url)?;
     let client = state.ensure_client(&app, &db).await?;
     let peer = resolve_target(&client, &link).await?;
 
@@ -388,12 +541,21 @@ pub async fn tg_channel_media(
     // render a list nobody scrolls. 200 is well within one page of history.
     let limit = limit.unwrap_or(60).clamp(1, 200) as usize;
 
-    let chat_id = peer
+    // Same resolution as the import path: an ambient ref carries `access_hash: 0`, which any
+    // private channel rejects, so the hash has to come from the session's peer cache.
+    let session = state
+        .get_session()
+        .await
+        .ok_or_else(|| AppError::Other("Telegram session is not initialized.".into()))?;
+    let peer_ref = resolve_peer_ref(&client, &session, peer).await?;
+
+    let chat_id = peer_ref
+        .id
         .bare_id()
         .ok_or_else(|| AppError::Invalid("That link doesn't point at a channel.".into()))?;
 
     let mut items = Vec::new();
-    let mut iter = client.iter_messages(peer.to_ambient_ref());
+    let mut iter = client.iter_messages(peer_ref);
     // Scan a bounded window of history rather than `limit` messages: a course channel
     // interleaves text announcements with the actual lessons, so stopping after `limit`
     // *messages* could return almost no media.
@@ -440,40 +602,6 @@ pub async fn tg_channel_media(
     }
 
     Ok(items)
-}
-
-/// Parse either a full message link or a bare channel reference for the browse view.
-///
-/// Accepts `t.me/c/<id>/<msg>` (message link — the channel part is what matters here),
-/// `t.me/c/<id>`, `t.me/<username>` and a bare `@username`.
-fn parse_channel_reference(input: &str) -> AppResult<LinkTarget> {
-    let raw = input.trim();
-    if raw.is_empty() {
-        return Err(AppError::Invalid("Paste a channel link or @username.".into()));
-    }
-
-    // A bare @username never parses as a URL, so handle it before trying.
-    if let Some(name) = raw.strip_prefix('@') {
-        return Ok(LinkTarget::Username {
-            username: name.to_string(),
-        });
-    }
-
-    // A full message link is the most common paste — reuse the real parser so every shape it
-    // understands (forum topics, query strings, -100 ids) works here too.
-    if let Ok(link) = parse_message_link(raw) {
-        return Ok(link.target);
-    }
-
-    // Channel-only links: append a dummy message id so the same parser can validate the
-    // channel half, then discard it.
-    if let Ok(link) = parse_message_link(&format!("{}/1", raw.trim_end_matches('/'))) {
-        return Ok(link.target);
-    }
-
-    Err(AppError::Invalid(
-        "That doesn't look like a Telegram channel link or @username.".into(),
-    ))
 }
 
 #[cfg(test)]
@@ -541,27 +669,43 @@ mod tests {
         assert!(name.chars().count() <= 85, "was {} chars", name.chars().count());
     }
 
+    // Channel-reference parsing now lives in `link.rs` as `parse_channel_link` (it grew invite
+    // support), and is tested there.
+}
+
+#[cfg(test)]
+mod peer_ref_tests {
+    use super::*;
+
+    /// The whole reason Gemini's retry could not work.
+    ///
+    /// `to_ambient_ref()` is defined as `PeerAuth::default()`, which is `PeerAuth(0)` — and
+    /// `get_messages_by_id` serializes `channel: peer.into()` with NO session lookup. So
+    /// priming the cache and re-issuing the same ambient call rebuilds byte-identical wire
+    /// data and fails identically. If this assertion ever breaks, the ambient ref started
+    /// carrying real authority and `resolve_peer_ref`'s early return must be re-examined.
     #[test]
-    fn parses_channel_references_in_every_accepted_shape() {
+    fn ambient_ref_carries_no_access_hash() {
+        let id = PeerId::channel(3718178315).expect("valid channel id");
         assert_eq!(
-            parse_channel_reference("@somechannel").unwrap(),
-            LinkTarget::Username {
-                username: "somechannel".into()
-            }
+            id.to_ambient_ref().auth,
+            PeerAuth::default(),
+            "an ambient ref must be the zero authority — this is what private channels reject"
         );
-        assert_eq!(
-            parse_channel_reference("https://t.me/c/1234567890/42").unwrap(),
-            LinkTarget::PrivateChannel {
-                channel_id: 1234567890
-            }
-        );
-        // Channel-only link (no message id).
-        assert_eq!(
-            parse_channel_reference("https://t.me/c/1234567890").unwrap(),
-            LinkTarget::PrivateChannel {
-                channel_id: 1234567890
-            }
-        );
-        assert!(parse_channel_reference("   ").is_err());
+        assert_eq!(PeerAuth::default().hash(), 0);
+    }
+
+    /// A resolved hash must survive into the PeerRef unchanged; a truncated or re-derived
+    /// hash would fail exactly like the ambient one and look like the same bug.
+    #[test]
+    fn resolved_hash_is_preserved_verbatim() {
+        let id = PeerId::channel(3718178315).expect("valid channel id");
+        let hash = -8_223_372_036_854_775_123_i64; // large negative: the common real shape
+        let peer_ref = PeerRef {
+            id,
+            auth: PeerAuth::from_hash(hash),
+        };
+        assert_eq!(peer_ref.auth.hash(), hash);
+        assert_ne!(peer_ref.auth, PeerAuth::default());
     }
 }

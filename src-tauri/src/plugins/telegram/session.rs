@@ -256,6 +256,12 @@ pub struct TgState {
 
 struct TgInner {
     client: Client,
+    /// The same session handed to the `SenderPool`.
+    ///
+    /// Kept because `Client.session` is `pub(crate)` in grammers, yet the peer cache it holds
+    /// is the ONLY way to turn a bare channel id (what a `t.me/c/…` link carries) into a
+    /// `PeerRef` with a real `access_hash`. See `import::resolve_peer_ref`.
+    session: Arc<FileSession>,
     /// The `SenderPoolRunner` task. The client is useless once this stops, so it is kept
     /// alive here and joined on sign-out — dropping the handle alone would only *detach*
     /// the task, leaving it holding the session DB open (and unlinkable on Windows).
@@ -339,7 +345,10 @@ impl TgState {
             .map_err(|e| AppError::Other(format!("tg session load failed: {e}")))?;
         let session = Arc::new(session);
 
-        let pool = SenderPool::new(session, api_id);
+        // Clone the Arc rather than moving it: the pool needs it, and so do we (peer-cache
+        // lookups). Both point at the same session, so a peer cached by any request is
+        // immediately visible to our own reads.
+        let pool = SenderPool::new(session.clone(), api_id);
         let runner_handle = pool.runner;
         let handle = pool.handle;
 
@@ -353,6 +362,7 @@ impl TgState {
 
         *guard = Some(TgInner {
             client: client.clone(),
+            session,
             runner: Some(runner),
         });
 
@@ -363,6 +373,17 @@ impl TgState {
     pub async fn get_client(&self) -> Option<Client> {
         let guard = self.inner.lock().await;
         guard.as_ref().map(|i| i.client.clone())
+    }
+
+    /// The live session, for peer-cache lookups.
+    ///
+    /// grammers keeps `Client.session` private, but we built the session, so we can keep our
+    /// own handle to it. This is what lets a bare channel id be resolved to a `PeerRef`
+    /// carrying a real `access_hash` — `to_ambient_ref()` yields `PeerAuth(0)`, which private
+    /// channels always reject.
+    pub async fn get_session(&self) -> Option<Arc<FileSession>> {
+        let guard = self.inner.lock().await;
+        guard.as_ref().map(|i| i.session.clone())
     }
 
     /// Drop the current client so the next command rebuilds the pool.

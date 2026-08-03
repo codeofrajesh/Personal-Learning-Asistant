@@ -178,13 +178,13 @@ export default function LinkImport() {
 
       <label className="block">
         <span className="mb-1 block text-sm font-medium text-content-secondary">
-          {mode === "link" ? "Message link" : "Channel link or @username"}
+          {mode === "link" ? "Message link" : "Channel, invite link, or @username"}
         </span>
         <input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder={
-            mode === "link" ? "https://t.me/c/1234567890/42" : "@mychannel or https://t.me/c/1234567890"
+            mode === "link" ? "https://t.me/c/1234567890/42" : "https://t.me/+AbCdEf… or @mychannel"
           }
           spellCheck={false}
           className={cn(inputClass, "font-mono text-xs")}
@@ -192,7 +192,7 @@ export default function LinkImport() {
         <span className="mt-1 block text-xs text-content-faint">
           {mode === "link"
             ? "In Telegram: right-click the message → Copy Message Link."
-            : "Any message link from the channel works too."}
+            : "An invite link works for private channels with no username — including your own. Nothing is joined; the channel is only read."}
         </span>
       </label>
 
