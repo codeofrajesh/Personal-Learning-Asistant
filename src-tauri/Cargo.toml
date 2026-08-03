@@ -44,8 +44,20 @@ tauri-plugin-shell = "2.3.5"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 grammers-client = "0.10"
-grammers-session = "0.10"
 grammers-tl-types = "0.10"
+# `default-features = false` drops the `sqlite-storage` feature, and with it `libsql`.
+#
+# This is NOT a size optimization — it is required for the app to run. libsql bundles its own
+# SQLite C library, and rusqlite (features = ["bundled"]) bundles another; both export the same
+# symbols into one binary. `libsql::Database::new` asserts
+# `sqlite3_config(SQLITE_CONFIG_SERIALIZED) == SQLITE_OK`, but `sqlite3_config` returns
+# SQLITE_MISUSE once SQLite is already initialized — and `ple.db` opens at boot, long before
+# any Telegram command. The result was a hard panic ("libsql was configured with an incorrect
+# threading configuration") the moment a session was opened.
+#
+# `serde` instead gives us the derives needed to persist the session as JSON (see
+# `plugins/telegram/session.rs::FileSession`), which is what telegram.md §3.2 specified.
+grammers-session = { version = "0.10", default-features = false, features = ["serde"] }
 
 [profile.release]
 # Optimize for the small-binary / low-memory target (Section 1: 30-50MB idle).

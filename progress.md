@@ -1475,7 +1475,47 @@ principle that the shell never imports a plugin:
 
 
 
-### 15.4 Still owed
+### 15.4 The `libsql` × `rusqlite` symbol collision (crash fix)
+First live run of Phase 3 panicked the moment a session was opened:
+
+```
+libsql was configured with an incorrect threading configuration and the api is not safe to use.
+```
+
+**Cause (verified in the crate sources, not guessed).** `grammers-session`'s default feature set
+is `["sqlite-storage"]`, which pulls in `libsql` — and `libsql` bundles its own SQLite C library
+while `rusqlite = { features = ["bundled"] }` bundles another. Both export the same symbols into
+one binary. `libsql::Database::new` (`libsql-0.9.30/src/local/database.rs:326`) **asserts**
+`sqlite3_config(SQLITE_CONFIG_SERIALIZED) == SQLITE_OK`, but `sqlite3_config` returns
+`SQLITE_MISUSE` once SQLite has been initialized — and `ple.db` opens at boot, long before any
+`tg_*` command runs. So the assert could never hold in this app: the ordering guarantees it.
+
+**Fix — drop `libsql`, persist as JSON** (`default-features = false, features = ["serde"]`).
+This returns to what `telegram.md` §3.2 specified in the first place (`FileSession`); the
+`SqliteSession` was the deviation. Two traps found while implementing it, both of which would
+have failed a naive port:
+- **`SessionData` has no serde derives** — only its *component* types (`DcOption`, `PeerInfo`,
+  `UpdatesState`) do. So persistence goes through a `PersistedSession` mirror struct rather
+  than serializing `SessionData` directly, which does not compile.
+- **`peer_infos: HashMap<PeerId, PeerInfo>` cannot be a JSON object.** `PeerId` is a newtype
+  over `i64` and serializes as a *scalar*, which `serde_json` rejects as a map key at runtime
+  (it would have compiled and then failed on first peer cache). Both maps are persisted as
+  arrays and re-keyed on load — `PeerInfo`/`DcOption` each carry their own id.
+- `auth_key` survives because grammers hex-encodes it via `serde_with`; a raw `[u8; 256]` would
+  not round-trip through JSON. **This is the property the file exists for** — losing the key
+  forces a fresh login, the most flood-limited operation Telegram has — so it is covered by a
+  dedicated test rather than trusted.
+
+Writes are synchronous and immediate (temp file + atomic rename, so a crash mid-write leaves
+either the old session or the new one, never a truncated file that would lock the user out). A
+**corrupt file is a hard error, not a silent reset**, for the same reason. `sign_out` now also
+sweeps the legacy `tg.session` + `-wal`/`-shm` left behind by the crashing build.
+
+Verified: `cargo tree` shows **zero** `libsql` (only rusqlite's `libsqlite3-sys` remains — one
+SQLite in the binary); `cargo test --lib` **152 passed** (+4 session round-trip tests); clippy
+back to the 18-warning baseline with zero telegram warnings.
+
+### 15.5 Still owed
 - **LIVE SMOKE TEST (`npm run tauri dev`) — nothing below has run against real Telegram.**
   Everything is compile-, test- and build-verified only. Verify in order: (a) Settings → Plugins
   shows the credentials form, and a bad `api_hash` is rejected next to the field; (b) save real
@@ -1484,8 +1524,8 @@ principle that the shell never imports a plugin:
   code (this is the token-retention fix, and the highest-value thing to confirm); (d) 2FA path if
   the account has it, including a wrong password then the right one; (e) **restart the app — the
   nav dot must be lime before you open the plugin page** (session restore + boot `init`, the two
-  headline fixes); (f) Disconnect, then confirm `tg.session` and its `-wal`/`-shm` are gone from
-  `app_data_dir` and the dot is gray; (g) unplug the network while connected → status should read
+  headline fixes); (f) Disconnect, then confirm `tg.session.json` is gone from `app_data_dir`
+  and the dot is gray; (g) unplug the network while connected → status should read
   "unreachable", NOT "not connected".
 - **Phase 4+ is unstarted:** `link.rs` / `tg_import_link` / `tg_channel_media`, the `materials`
   `source` + `tg_*` columns migration, scanner skip, `reader.rs`/`server.rs` streaming, and the

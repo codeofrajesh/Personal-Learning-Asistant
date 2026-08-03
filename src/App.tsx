@@ -10,7 +10,7 @@
  * index.css.
  */
 
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useMemo } from "react";
 import { HashRouter, Navigate, Routes, Route, useParams } from "react-router-dom";
 import AppShell from "./components/layout/AppShell";
 import { getPluginRoutes } from "./lib/plugins/routes";
@@ -45,26 +45,14 @@ function NodeRedirect({ param }: { param: string }) {
   return <Navigate to={id != null ? `/courses/${id}` : "/courses"} replace />;
 }
 
-/**
- * Build a lazy route for a plugin path that isn't pre-registered in App.tsx.
- * Plugin manifests declare their own lazy import; this wraps it with Suspense.
- */
-function PluginRoute({ path, importFn }: { path: string; importFn: () => Promise<{ default: React.ComponentType }> }) {
-  const LazyComponent = lazy(importFn);
-  return (
-    <Route
-      path={path}
-      element={
-        <Suspense fallback={<PageFallback />}>
-          <LazyComponent />
-        </Suspense>
-      }
-    />
-  );
-}
-
 export default function App() {
-  const pluginRoutes = getPluginRoutes();
+  // Memoize lazy components so they don't unmount on every App render
+  const mappedPluginRoutes = useMemo(() => {
+    return getPluginRoutes().map((r) => ({
+      path: r.path,
+      Component: lazy(r.lazy),
+    }));
+  }, []);
 
   return (
     <HashRouter>
@@ -141,8 +129,16 @@ export default function App() {
             }
           />
           {/* Plugin routes — code-split via their manifests. */}
-          {pluginRoutes.map((r) => (
-            <PluginRoute key={r.path} path={r.path} importFn={r.lazy} />
+          {mappedPluginRoutes.map((r) => (
+            <Route
+              key={r.path}
+              path={r.path}
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <r.Component />
+                </Suspense>
+              }
+            />
           ))}
           <Route
             path="*"
