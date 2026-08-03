@@ -178,6 +178,9 @@ pub fn run() {
             plugins::telegram::auth::tg_sign_in_2fa,
             plugins::telegram::auth::tg_sign_out,
             plugins::telegram::auth::tg_get_me,
+            // Telegram import (Phase 4)
+            plugins::telegram::import::tg_import_link,
+            plugins::telegram::import::tg_channel_media,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

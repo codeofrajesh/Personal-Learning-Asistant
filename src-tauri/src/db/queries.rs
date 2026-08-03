@@ -2050,13 +2050,20 @@ pub fn mark_subject_missing_except(
             UNION ALL
             SELECT n.id FROM nodes n JOIN subtree st ON n.parent_id = st.id
         )";
+    // `source = 'local'` is load-bearing (v11). A plugin-sourced material (Telegram) has no
+    // file on disk — its `file_path` is a synthetic `tg://` key — so it can never appear in
+    // `seen`, and without this guard every filesystem rescan would flip it to 'missing' and
+    // the lesson would disappear from the library. The scanner's authority extends only to
+    // the rows it actually owns.
     if seen.is_empty() {
-        // No files on disk at all → mark every active material in the subtree missing.
+        // No files on disk at all → mark every active LOCAL material in the subtree missing.
         conn.execute(
             &format!(
                 "{SUBTREE_CTE}
                  UPDATE materials SET status='missing', updated_at=datetime('now')
-                 WHERE node_id IN (SELECT id FROM subtree) AND status='active'"
+                 WHERE node_id IN (SELECT id FROM subtree)
+                   AND status='active'
+                   AND source = 'local'"
             ),
             [root_node_id],
         )?;
@@ -2069,6 +2076,7 @@ pub fn mark_subject_missing_except(
          UPDATE materials SET status='missing', updated_at=datetime('now')
          WHERE node_id IN (SELECT id FROM subtree)
            AND status='active'
+           AND source = 'local'
            AND file_path NOT IN ({placeholders})"
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(root_node_id)];
@@ -2961,6 +2969,63 @@ mod tests {
             extension: "mp4".to_string(),
             size_bytes: size,
         }
+    }
+
+    /// A filesystem rescan must NEVER touch a plugin-sourced material (v11).
+    ///
+    /// A Telegram row's `file_path` is a synthetic `tg://<chat>/<msg>` key, so it can never
+    /// appear in the `seen` set the scanner builds from disk. Before the `source = 'local'`
+    /// guard, every rescan of the enclosing folder flipped such rows to `status='missing'`
+    /// and the lesson silently disappeared from the library. This is a regression test for a
+    /// failure that is invisible until a user rescans.
+    #[test]
+    fn rescan_never_marks_telegram_materials_missing() {
+        let conn = test_conn();
+        let root = upsert_root_node(&conn, "Course").unwrap();
+
+        // A local file and a Telegram-sourced lesson, both in the same node.
+        let local = file("/lib/local.mp4", "local.mp4", 100);
+        insert_material(&conn, root, &local).unwrap();
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                   source, tg_chat_id, tg_message_id)
+             VALUES(?1, 'tg://123/45', 'lesson.mp4', 'video', 'mp4', 'telegram', 123, 45)",
+            [root],
+        )
+        .unwrap();
+
+        let status = |path: &str| -> String {
+            conn.query_row(
+                "SELECT status FROM materials WHERE file_path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Rescan that still sees the local file: nothing should change.
+        let mut seen = std::collections::HashSet::new();
+        seen.insert("/lib/local.mp4".to_string());
+        mark_subject_missing_except(&conn, root, &seen).unwrap();
+        assert_eq!(status("/lib/local.mp4"), "active");
+        assert_eq!(
+            status("tg://123/45"),
+            "active",
+            "a Telegram lesson is not a file on disk and must survive a rescan"
+        );
+
+        // Rescan where the local file is now gone: it flips to missing, the tg row does not.
+        mark_subject_missing_except(&conn, root, &std::collections::HashSet::new()).unwrap();
+        assert_eq!(
+            status("/lib/local.mp4"),
+            "missing",
+            "a genuinely absent local file must still be flagged"
+        );
+        assert_eq!(
+            status("tg://123/45"),
+            "active",
+            "an empty folder must not wipe streamed lessons either"
+        );
     }
 
     /// insert_material diffs: a first import writes the row, a byte-identical re-import

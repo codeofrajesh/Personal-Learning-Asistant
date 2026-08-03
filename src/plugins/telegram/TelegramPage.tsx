@@ -10,7 +10,6 @@
 import { Link } from "react-router-dom";
 import {
   SendHorizontal,
-  MessageSquare,
   Link as LinkIcon,
   LogOut,
   HelpCircle,
@@ -19,6 +18,7 @@ import {
 } from "lucide-react";
 import Breadcrumb from "../../components/layout/Breadcrumb";
 import ConnectFlow from "./ConnectFlow";
+import LinkImport from "./LinkImport";
 import { useAuth } from "./authStore";
 import { cn } from "../../lib/utils";
 
@@ -141,33 +141,21 @@ export default function TelegramPage() {
           </div>
         )}
 
-        {/* Feature exposes (placeholder grid for Phase 4/5 content) */}
-        <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div className="glass rounded-card p-card shadow-card">
-            <div className="flex items-center gap-2 text-sm font-medium text-content-primary">
-              <MessageSquare size={16} strokeWidth={2} className="text-lime" aria-hidden />
-              Channels
-            </div>
-            <p className="mt-1.5 text-sm text-content-muted">
-              Browse a channel's recent media and import lessons with one click.
-            </p>
-          </div>
-          <div className="glass rounded-card p-card shadow-card">
-            <div className="flex items-center gap-2 text-sm font-medium text-content-primary">
+        {/* Import — only reachable once connected, since every path here needs the session. */}
+        {connected && (
+          <section className="glass mt-6 rounded-card p-card shadow-card">
+            <div className="mb-4 flex items-center gap-2">
               <LinkIcon size={16} strokeWidth={2} className="text-lime" aria-hidden />
-              Import link
+              <h2 className="text-base font-semibold text-content-primary">Import lessons</h2>
             </div>
-            <p className="mt-1.5 text-sm text-content-muted">
-              Paste a <span className="font-mono text-xs">t.me/c/…</span> link to pull a specific
-              lesson into your library.
-            </p>
-          </div>
-        </div>
+            <LinkImport />
+          </section>
+        )}
 
         <p className="mt-6 flex items-center gap-1.5 text-xs text-content-faint">
           <HelpCircle size={13} strokeWidth={2} aria-hidden />
-          Telegram access is read-only. Low ban risk, documented in-app. Link importing and
-          streaming arrive in a later phase.
+          Telegram access is read-only — nothing is uploaded or posted. Imported lessons stream
+          on demand and are not copied to your disk.
         </p>
 
         <Link

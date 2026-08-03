@@ -36,7 +36,15 @@
 ///     block could claim exam urgency and the solver's 1.5x multiplier was dead code. New
 ///     table only — `CREATE TABLE IF NOT EXISTS` covers both fresh installs and migrations,
 ///     so there are no guarded ALTERs for this step.
-pub const SCHEMA_VERSION: i64 = 10;
+/// v11: plugin-sourced materials. Adds `materials.source` ('local' | 'telegram') plus the
+///     `tg_chat_id` / `tg_message_id` identity for Telegram-hosted media. A material is no
+///     longer necessarily a file on disk: the player resolves a row's playable URL through
+///     the frontend source-adapter registry, and the filesystem scanner skips any row whose
+///     `source` is not 'local' (its `file_path` is a synthetic `tg://` key, not a real path,
+///     and the scanner's upsert keys on `file_path`). Progress, notes, bookmarks, tasks and
+///     schedule attribution all key on `materials.id`, so they work unchanged for either
+///     source.
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// The complete v1 schema. Every statement is `IF NOT EXISTS` where SQLite allows,
 /// so re-application is a no-op.
@@ -87,6 +95,12 @@ CREATE TABLE IF NOT EXISTS materials (
     last_opened_at  TEXT,
     sort_order      INTEGER DEFAULT 0,
     metadata_attempts INTEGER NOT NULL DEFAULT 0,  -- times the metadata engine tried this file (v7)
+    -- Where this material's bytes live (v11). 'local' = a real file at `file_path`;
+    -- 'telegram' = streamed, with `file_path` holding a synthetic `tg://<chat>/<msg>` key
+    -- (the column is NOT NULL UNIQUE, and the scanner skips non-local rows).
+    source          TEXT NOT NULL DEFAULT 'local',
+    tg_chat_id      INTEGER,                       -- bare channel id (v11)
+    tg_message_id   INTEGER,                       -- message id within that channel (v11)
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );

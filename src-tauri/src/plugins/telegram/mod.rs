@@ -3,6 +3,8 @@
 //! Registers the `tg_*` IPC commands and manages the `TgState` lifecycle.
 
 pub mod auth;
+pub mod import;
+pub mod link;
 pub mod session;
 
 use crate::plugins::telegram::session::TgState;

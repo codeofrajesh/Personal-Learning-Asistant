@@ -210,6 +210,40 @@ fn migrate(conn: &Connection) -> AppResult<()> {
             "CREATE INDEX IF NOT EXISTS idx_exams_date ON exams(exam_date)
              WHERE is_archived = 0",
         )?;
+
+        // v11: plugin-sourced materials (Telegram). `materials` predates v11 on every existing
+        // DB, so these need guarded ALTERs.
+        //
+        // `source` defaults to 'local' rather than being nullable: every existing row IS a
+        // local file, and a NULL would force every read site to decide what NULL means. The
+        // scanner and the player both branch on this column, so one unambiguous value matters
+        // more than saving a few bytes.
+        for (col, decl) in [
+            ("source", "TEXT NOT NULL DEFAULT 'local'"),
+            ("tg_chat_id", "INTEGER"),
+            ("tg_message_id", "INTEGER"),
+        ] {
+            if !column_exists(conn, "materials", col)? {
+                conn.execute_batch(&format!("ALTER TABLE materials ADD COLUMN {col} {decl}"))?;
+            }
+        }
+        // Partial index: every query that cares about this column is looking for the *rare*
+        // case (non-local rows), so indexing only those keeps it tiny on a library of
+        // thousands of local files. Created here for the same reason as the three above —
+        // it references a column that only exists after the ALTER on a migrating DB.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_materials_source ON materials(source)
+             WHERE source <> 'local'",
+        )?;
+        // Identity for a Telegram material. UNIQUE so re-importing the same link updates the
+        // existing row instead of silently creating a duplicate lesson; partial so the
+        // millions of local rows (all NULL here) are not indexed and do not collide — SQLite
+        // treats NULLs as distinct, but excluding them keeps the index small.
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_materials_tg_identity
+             ON materials(tg_chat_id, tg_message_id)
+             WHERE tg_chat_id IS NOT NULL",
+        )?;
         Ok(())
     })();
 
@@ -574,6 +608,138 @@ mod tests {
             .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// v11: a pre-v11 `materials` table gains `source` / `tg_chat_id` / `tg_message_id`.
+    ///
+    /// The load-bearing assertion is that EXISTING rows come out as `source = 'local'`, not
+    /// NULL. Every read site branches on this column (the scanner's missing-sweep, the
+    /// metadata engine, the player's source resolution), and a NULL would make each of them
+    /// decide independently what NULL means — with the scanner's answer being "not a local
+    /// file, skip it", which would strand every pre-existing library file.
+    #[test]
+    fn migrates_pre_v11_materials_by_defaulting_existing_rows_to_local() {
+        let conn = Connection::open_in_memory().expect("open");
+        configure_pragmas(&conn).unwrap();
+
+        // A pre-v11 materials table (no source / tg_* columns) holding a real local file.
+        conn.execute_batch(
+            "CREATE TABLE nodes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id   INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                kind        TEXT NOT NULL DEFAULT 'folder',
+                description TEXT,
+                icon        TEXT,
+                color       TEXT,
+                depth       INTEGER NOT NULL DEFAULT 0,
+                path        TEXT,
+                sort_order  INTEGER DEFAULT 0,
+                is_pinned   INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT DEFAULT (datetime('now')),
+                updated_at  TEXT DEFAULT (datetime('now')),
+                UNIQUE(parent_id, name)
+            );
+            -- The real v10 materials shape, minus only the v11 columns. Indexes in SCHEMA_SQL
+            -- reference several of these, so a trimmed-down fixture would fail for reasons
+            -- that have nothing to do with v11.
+            CREATE TABLE materials (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id         INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                file_path       TEXT NOT NULL UNIQUE,
+                file_name       TEXT NOT NULL,
+                file_type       TEXT NOT NULL,
+                file_extension  TEXT NOT NULL,
+                file_size_bytes INTEGER DEFAULT 0,
+                duration_secs   REAL,
+                thumbnail_path  TEXT,
+                resolution      TEXT,
+                codec           TEXT,
+                bitrate         INTEGER,
+                page_count      INTEGER,
+                status          TEXT DEFAULT 'active',
+                is_bookmarked   INTEGER DEFAULT 0,
+                is_completed    INTEGER DEFAULT 0,
+                last_opened_at  TEXT,
+                sort_order      INTEGER DEFAULT 0,
+                metadata_attempts INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT DEFAULT (datetime('now')),
+                updated_at      TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO nodes(name) VALUES ('Course');
+            INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension)
+                VALUES (1, '/lib/lecture.mp4', 'lecture.mp4', 'video', 'mp4');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 10i64).unwrap();
+        assert!(!column_exists(&conn, "materials", "source").unwrap());
+
+        migrate(&conn).unwrap();
+
+        for c in ["source", "tg_chat_id", "tg_message_id"] {
+            assert!(
+                column_exists(&conn, "materials", c).unwrap(),
+                "materials.{c} must be added"
+            );
+        }
+
+        // The pre-existing row is still a local file, and still active.
+        let (source, status): (String, String) = conn
+            .query_row(
+                "SELECT source, status FROM materials WHERE file_path = '/lib/lecture.mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            source, "local",
+            "an existing library file must migrate to 'local', never NULL"
+        );
+        assert_eq!(status, "active", "migration must not disturb status");
+
+        // Both v11 indexes exist. The UNIQUE one is what makes re-importing the same link
+        // update instead of duplicating, so its absence would be silent data corruption.
+        for idx in ["idx_materials_source", "idx_materials_tg_identity"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name = ?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{idx} must exist");
+        }
+
+        // The partial UNIQUE index must reject a second row for the same (chat, message)…
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                   source, tg_chat_id, tg_message_id)
+             VALUES (1, 'tg://7/1', 'a.mp4', 'video', 'mp4', 'telegram', 7, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                       source, tg_chat_id, tg_message_id)
+                 VALUES (1, 'tg://7/1-dup', 'a.mp4', 'video', 'mp4', 'telegram', 7, 1)",
+                [],
+            )
+            .is_err(),
+            "the same Telegram message must not import twice"
+        );
+        // …while leaving local rows (NULL tg ids) entirely unconstrained by it.
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension)
+             VALUES (1, '/lib/second.mp4', 'second.mp4', 'video', 'mp4')",
+            [],
+        )
+        .expect("local rows must not collide on the partial unique index");
+
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
     }
 
     /// v9: a pre-v9 DB gains the whole planner (new tables) AND the adherence columns added to

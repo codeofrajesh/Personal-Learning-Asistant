@@ -104,10 +104,17 @@ pub async fn extract_missing_metadata(app: AppHandle) -> AppResult<()> {
     let pending = db.with(|conn| {
         // Exclude files that have already failed MAX_METADATA_ATTEMPTS times, so a corrupt
         // or unsupported file is not re-ffmpeg'd on every boot/import forever.
+        //
+        // `source = 'local'` (v11): a plugin-sourced row's `file_path` is a synthetic
+        // `tg://<chat>/<msg>` key, not a path ffprobe can open. Without this guard every
+        // imported Telegram lesson would spawn ffprobe MAX_METADATA_ATTEMPTS times — a real
+        // CPU cost on exactly the low-end machines this engine was rewritten to protect — and
+        // fail every time. Telegram supplies duration in the message metadata at import.
         let mut stmt = conn.prepare(
             "SELECT id, file_path, file_type
              FROM materials
              WHERE status = 'active'
+               AND source = 'local'
                AND file_type IN ('video', 'audio')
                AND metadata_attempts < ?1
                AND (duration_secs IS NULL OR (file_type = 'video' AND thumbnail_path IS NULL))",

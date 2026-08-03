@@ -47,6 +47,31 @@ export interface TgCredentials {
   has_api_hash: boolean;
 }
 
+/** One importable media message from a channel (`tg_channel_media`). */
+export interface TgMediaItem {
+  chat_id: number;
+  message_id: number;
+  file_name: string;
+  /** PLE's own classification: video | audio | pdf | image | note. */
+  file_type: string;
+  file_extension: string;
+  size_bytes: number;
+  duration_secs: number | null;
+  mime_type: string | null;
+  caption: string | null;
+  /** True when a material row for this (chat, message) already exists. */
+  already_imported: boolean;
+}
+
+/** Result of importing one link (`tg_import_link`). */
+export interface TgImportResult {
+  material_id: number;
+  file_name: string;
+  /** False when the row already existed and was refreshed rather than created. */
+  created: boolean;
+  node_id: number;
+}
+
 /** The `tg_*` command surface. */
 export const tg = {
   /** Read the saved api_id + whether an api_hash is stored. */
@@ -87,6 +112,20 @@ export const tg = {
   /** Current account info (requires an authorized session). */
   async getMe(): Promise<TgMe> {
     return invokeCommand("tg_get_me");
+  },
+
+  /** Import one `t.me` message link into `nodeId`. */
+  async importLink(url: string, nodeId: number): Promise<TgImportResult> {
+    return invokeCommand("tg_import_link", { url, nodeId });
+  },
+
+  /**
+   * List recent media in a channel. `url` accepts any message link from the channel, a
+   * channel link, or a bare `@username` — finding a numeric channel id is not something a
+   * student should have to do.
+   */
+  async channelMedia(url: string, limit?: number): Promise<TgMediaItem[]> {
+    return invokeCommand("tg_channel_media", { url, limit: limit ?? null });
   },
 };
 

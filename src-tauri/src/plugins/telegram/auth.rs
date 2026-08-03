@@ -322,7 +322,7 @@ pub async fn tg_get_me(
 /// The taxonomy from the plan (`FloodWait`, `InvalidPhone`, `CodeExpired`, `SessionRevoked`,
 /// `Network`) is expressed as prose rather than as an enum: the UI's only job is to show it,
 /// and `AppError` already serializes to a string across the IPC boundary.
-fn map_invocation(e: InvocationError) -> AppError {
+pub fn map_invocation(e: InvocationError) -> AppError {
     match e {
         InvocationError::Rpc(rpc) => map_rpc(&rpc),
         InvocationError::Io(e) => AppError::Other(format!(
@@ -359,6 +359,9 @@ fn map_rpc(rpc: &RpcError) -> AppError {
         "SESSION_PASSWORD_NEEDED" => {
             AppError::Invalid("This account needs its 2FA password.".into())
         }
+        "AUTH_RESTART" => AppError::Invalid(
+            "Telegram restarted the login process. Please click 'Start over' and request a new code.".into(),
+        ),
         "AUTH_KEY_UNREGISTERED" | "AUTH_KEY_DUPLICATED" | "SESSION_REVOKED" | "USER_DEPRECATED" => {
             AppError::Invalid(
                 "This session was signed out from another device. Disconnect and connect again."
