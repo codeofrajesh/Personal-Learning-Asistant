@@ -16,6 +16,7 @@ import type { PluginManifest } from "./types";
 import { validateManifest } from "./types";
 import { DashboardIcon, SettingsIcon } from "../../components/ui/icons";
 import { GraduationCap, CalendarCheck } from "lucide-react";
+import { telegramManifest } from "../../plugins/telegram/manifest";
 
 /** Built-in core nav manifests. These are never pinnable; they always render. */
 function corePlugins(): PluginManifest[] {
@@ -73,9 +74,7 @@ function corePlugins(): PluginManifest[] {
  * (YouTube, podcast sources, …) register here instead of touching the shell.
  */
 function externalPlugins(): PluginManifest[] {
-  // Phase 2 implements `src/plugins/telegram/manifest.ts`. Phase 1 keeps the shell able
-  // to compose ANY plugin; the Telegram entry is added in the Phase 2 commit.
-  return [];
+  return [telegramManifest];
 }
 
 let cache: PluginManifest[] | null = null;

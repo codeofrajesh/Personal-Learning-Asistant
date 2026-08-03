@@ -13,7 +13,11 @@
 import { getPlugins } from "./registry";
 import { usePins } from "./pinStore";
 import { Puzzle } from "lucide-react";
-import type { ElementType } from "react";
+import { StatusDot } from "./statusDot";
+import type { ElementType, ComponentType } from "react";
+
+/** A plugin status-dot renderer for a nav item (`pluginId` + `collapsed`). */
+export type NavStatusDot = ComponentType<{ pluginId: string; collapsed?: boolean }>;
 
 /** The nav item shape shared with the Sidebar (compatible with the old `NavItem`). */
 export interface NavItem {
@@ -27,6 +31,8 @@ export interface NavItem {
   pinned?: boolean;
   /** Registered plugin this item belongs to (`undefined` for core + the Plugins overflow item). */
   pluginId?: string;
+  /** Rendered after the label when the plugin's manifest declares `badge: "status-dot"`. */
+  statusDot?: NavStatusDot;
 }
 
 /**
@@ -63,6 +69,8 @@ export function useNavItems(): NavItem[] {
       label: p.name,
       icon: p.icon,
       pluginId: p.id,
+      // A plugin declaring `badge: "status-dot"` gets its nav dot via the shared shell.
+      statusDot: p.nav?.badge === "status-dot" ? StatusDot : undefined,
     });
   }
 

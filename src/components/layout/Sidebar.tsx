@@ -172,6 +172,11 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
                     )}
                   />
                   {!collapsed && <span className="truncate">{label}</span>}
+                  {/* Plugin status dot (e.g. Telegram connected/offline) — only when the
+                      plugin's manifest declares `badge: "status-dot"`. */}
+                  {item.statusDot && (
+                    <item.statusDot pluginId={item.pluginId!} collapsed={collapsed} />
+                  )}
                 </Link>
               </li>
             );
