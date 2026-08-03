@@ -7,6 +7,7 @@
 pub mod commands;
 pub mod db;
 pub mod planner;
+pub mod plugins;
 pub mod player;
 pub mod scanner;
 pub mod utils;
@@ -35,6 +36,13 @@ pub fn run() {
 
             let db = Db::open(&db_path).expect("failed to open/initialize database");
             app.manage(db);
+
+            // Initialize Telegram plugin state (registers TgState in managed state).
+            // This does NOT connect to Telegram yet; the client is started lazily
+            // on first tg_* command that needs it.
+            if let Err(e) = plugins::telegram::init(app.handle()) {
+                log::error!("telegram: init failed: {e}");
+            }
 
             // Start the live file watcher on every active registered folder (Section 11
             // App Boot step 4). A failure to start the watcher must not block boot.
@@ -161,6 +169,15 @@ pub fn run() {
             commands::plan::ack_reminder,
             commands::plan::snooze_reminder,
             commands::plan::prune_reminders,
+            // Telegram auth commands (Phase 3) — from plugins::telegram::auth
+            plugins::telegram::auth::tg_get_api_credentials,
+            plugins::telegram::auth::tg_set_api_credentials,
+            plugins::telegram::auth::tg_check_auth,
+            plugins::telegram::auth::tg_request_code,
+            plugins::telegram::auth::tg_sign_in,
+            plugins::telegram::auth::tg_sign_in_2fa,
+            plugins::telegram::auth::tg_sign_out,
+            plugins::telegram::auth::tg_get_me,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

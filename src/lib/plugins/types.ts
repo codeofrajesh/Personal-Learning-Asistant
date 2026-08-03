@@ -75,6 +75,22 @@ export interface PluginManifest {
   routes: PluginRoute[];
   settingsSections?: PluginSettingsSection[];
   sourceAdapters?: SourceAdapterDescriptor[];
+  /**
+   * Run once at app boot, from `AppShell`.
+   *
+   * A plugin whose nav item carries a live badge has to know its state before the user
+   * visits its page — otherwise the status dot is decoration until it's too late to be
+   * useful. Keep this cheap: it runs on every launch, on the boot path.
+   */
+  init?: () => void | Promise<void>;
+  /**
+   * Live status for the `badge: "status-dot"` nav contribution.
+   *
+   * A **hook**, deliberately: the plugin owns its subscription (Zustand selector, context,
+   * …) so the shell's `StatusDot` re-renders on change without importing the plugin's store.
+   * Must obey the rules of hooks — it is called unconditionally by `StatusDot`.
+   */
+  useStatus?: () => "connected" | "disconnected" | "unknown";
   /** The `tg_*` IPC command names this plugin owns (validated against the id prefix in dev). */
   commands?: string[];
   capabilities: PluginCapability[];
@@ -94,15 +110,44 @@ export function validateManifest(m: PluginManifest): string[] {
     problems.push(`${m.id}: a plugin needs at least one route`);
   }
 
-  // Nav contribution sanity: order must be >= 0, and status-dot plugins are expected to
-  // eventually render a status (warn-only in Phase 1).
+  // Nav contribution sanity: order must be >= 0, and a status-dot needs something to report.
   if (m.nav) {
     if (m.nav.order < 0) problems.push(`${m.id}: nav.order must be >= 0`);
     if (m.nav.badge === "status-dot") {
       // Status dots are only valid on a *pinnable* nav item.
       if (m.core) problems.push(`${m.id}: core nav items cannot carry a status-dot`);
+      // A dot with no resolver renders permanently idle, which reads as "broken" rather
+      // than as "unknown" — the exact failure this validation exists to catch early.
+      if (!m.useStatus) {
+        problems.push(`${m.id}: nav.badge "status-dot" requires a useStatus() contribution`);
+      }
+    }
+  }
+
+  // The manifest↔command-prefix contract (telegram.md §6.7): a plugin may only declare
+  // commands in its own namespace, so one plugin can't claim another's IPC surface.
+  const prefix = commandPrefix(m.id);
+  for (const command of m.commands ?? []) {
+    if (!command.startsWith(prefix)) {
+      problems.push(`${m.id}: command "${command}" must start with "${prefix}"`);
     }
   }
 
   return problems;
+}
+
+/**
+ * The Rust command prefix a plugin owns.
+ *
+ * Telegram's commands are `tg_*` rather than `telegram_*`, so the mapping is explicit
+ * instead of derived — guessing from the id would either reject the real command names or
+ * silently accept anything.
+ */
+export function commandPrefix(id: string): string {
+  switch (id) {
+    case "telegram":
+      return "tg_";
+    default:
+      return `${id}_`;
+  }
 }

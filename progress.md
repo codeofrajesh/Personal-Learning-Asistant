@@ -1359,3 +1359,139 @@ structure changed in any of the three players; the mpv effect graph lost one eff
 - **Known minor:** on the Planning page `useDayPlan` and the global `useBlockReminders` both read
   `plan_day` for today, so that day is fetched twice while the page is open. Cheap and correct,
   but redundant — worth collapsing if that wiring is touched again.
+
+---
+
+## 15. Plugin System & Telegram Integration (Phases 1–3)
+
+Source of truth: `telegram.md` (architecture) + `implementation_plan.md` (Phases 1–2 detail).
+Turns Telegram into a **first-class plugin** rather than a hard-coded page: a contribution-point
+registry (VSCode-style) owns nav, routes, settings sections, boot hooks and status badges, so
+future integrations register a manifest instead of editing the shell. Phases 1–3 are DONE;
+`cargo test --lib` **148 passed** (was 137), clippy still 18 pre-existing warnings,
+`tsc --noEmit` + `npm run build` clean.
+
+### 15.1 Phase 1 — the contribution-point shell (`src/lib/plugins/`)
+- `types.ts` — `PluginManifest` + contribution types (`nav`, `routes`, `settingsSections`,
+  `sourceAdapters`, `init`, `useStatus`, `capabilities`) and `validateManifest`.
+- `registry.ts` — the ONE list. The four core surfaces (Dashboard / Courses / Planning /
+  Settings) are declared as built-in manifests too, so nav composition has a single path
+  instead of "static array + special cases".
+- `nav.ts` (`useNavItems`) — core items in order, pinned plugins spliced in by `nav.order`,
+  and a permanent **Plugins** overflow item before Settings. `Sidebar` renders this instead of
+  the old static `NAV_ITEMS`; its active-state and roving-focus logic was untouched.
+- `pinStore.ts` — pin state in the existing `settings` table (`plugins.<id>.pinned`), so no new
+  table and the same optimistic-write shape as `perfStore`.
+- `routes.ts` / `settings.tsx` / `sourceAdapter.ts` — lazy route composition, contributed
+  Settings sections, and the material-source resolution seam (default local resolver).
+- `/plugins` hub (`PluginsPage.tsx`) + a `Plugins` category in Settings. Pure refactor: with
+  every built-in present, nav output is byte-identical to before.
+
+### 15.2 Phase 2 — Telegram skeleton
+`src/plugins/telegram/` — `manifest.ts` (nav `defaultPinned: false`, `order: 3`,
+`badge: "status-dot"`, lazy route), `TelegramPage.tsx`, and the shared `StatusDot`. Proved the
+contribution points end-to-end with zero backend.
+
+### 15.3 Phase 3 — auth core (reviewed, repaired, completed)
+Deps: `grammers-client`/`grammers-session`/`grammers-tl-types` 0.10. Backend in
+`src-tauri/src/plugins/telegram/{mod,session,auth}.rs`, registered in `lib.rs` (8 `tg_*`
+commands). **Phase 3 was ~70% written and did not compile;** the phase gate
+(`cargo test --lib`) had never passed. What the review found and this session fixed:
+
+1. **Build break:** `grammers_client::RpcError` doesn't exist — `RpcError` is re-exported at
+   `grammers_client::sender::RpcError`. The `lib` compiled; only the test cfg referenced it, so
+   `cargo build` looked fine while `cargo test` failed.
+2. **No way to enter credentials — Phase 3 was unreachable.** `ensure_client` hard-errors
+   without `api_id`/`api_hash`, and the `tg_*_api_credentials` commands from `telegram.md` §3.3
+   were never written. Added both commands + a **contributed** `TelegramSettings` section
+   (rendered through the registry, so `Settings.tsx` still never imports Telegram) and a
+   credential gate in `ConnectFlow`. `api_hash` is **write-only**: the backend returns
+   `has_api_hash`, never the value, so a stored secret can't be read back out of the UI. Shape
+   is validated on save (32-char hex) because the common error is pasting the two fields
+   swapped, and reporting that at connect time blames the phone number instead.
+3. **The session never restored — the headline feature of the phase.** `is_authorized()` read
+   the in-memory client, which is `None` until a login runs, so a valid `tg.session` reported
+   `Disconnected` on **every launch** and the user would re-login daily. `tg_check_auth` now
+   brings the client up from the session file and asks Telegram. It short-circuits on
+   `has_session_file()` first, so a fresh install never dials Telegram (or complains about
+   unset credentials) merely to render a gray dot.
+4. **`LoginHandle` serde mismatch — runtime-only failure.** Rust had a unit struct (serde
+   expects `null`); `api.ts` sent `{ handle: {} }`, so **every** sign-in would have failed
+   deserialization. Compiles clean, breaks only live. Resolved by removing the handle from the
+   wire entirely: no token ever crosses IPC, so `tg_sign_in` takes only the code, and
+   `tg_request_code` returns the normalized phone (for the UI's "sent to +1 555…" line).
+5. **One wrong digit destroyed the login.** `take_login_token()` consumed the token *before*
+   `sign_in`, so a typo forced a brand-new code request — walking the user toward
+   `FLOOD_WAIT` for a typo. Tokens are now held in a `login_guard()` and cleared only on
+   **success**. Same bug on 2FA, and worse: `check_password` returns a *fresh*
+   `PasswordToken` on failure and the old one is spent — that token is now put back, which is
+   what lets the user simply retype the password. The guard is deliberately held across the
+   network call, which also makes a double-submit unable to spend the token twice.
+6. **`sign_out` didn't sign out.** It never called `auth.logOut` (the session stayed valid
+   server-side — a real security gap, not a cosmetic one), never stopped the sender-pool
+   runner, and left `-wal`/`-shm` behind. Order is now load-bearing: revoke while the client
+   still works → `disconnect()` → **await the runner's join handle** → unlink. Dropping the
+   handle only *detaches* the task, which keeps the session SQLite file open, and **Windows
+   refuses to unlink an open file** — so on Windows the old code's `remove_file` would fail and
+   the session would survive a "sign out". Local wipe proceeds even if Telegram is
+   unreachable, so a network failure can't strand the user connected with no way out.
+7. **Error taxonomy** (`implementation_plan.md` §A.4) was unimplemented — `FLOOD_WAIT` surfaced
+   as `"Telegram error (420): FLOOD_WAIT"` and **discarded `rpc.value`**, the one field that
+   makes it actionable. `map_rpc` now names the wait ("wait 2 minutes") and maps
+   `PHONE_NUMBER_INVALID`, `PHONE_CODE_EXPIRED/INVALID`, `AUTH_KEY_*`/`SESSION_REVOKED`,
+   `API_ID_INVALID`; unknown errors are de-screamed rather than shown raw. Expressed as prose,
+   not an enum: `AppError` already serializes to a string and the UI's only job is to show it.
+   Pure `map_rpc`/`humanize_secs` are unit-tested (`InvocationError` can't be constructed for
+   every case; `RpcError` can).
+8. **`normalize_phone` rejected what people actually type.** It refused `+1 (555) 000-1234`
+   outright; it now strips punctuation and validates E.164 length (7–15 digits), rejecting an
+   interior `+`.
+9. **New `Unreachable` status.** Telling an offline student they're signed out invites a
+   pointless re-login (and a `FLOOD_WAIT`) over missing wifi. `unreachable` is distinct from
+   `disconnected` all the way through to the page banner.
+
+**Frontend architecture fixes.** Two Phase-3 additions had quietly broken the Phase-1
+principle that the shell never imports a plugin:
+- **`statusDot.tsx` imported Telegram's `authStore` directly** — with a docstring claiming it
+  "NEVER imports a plugin directly". It also exported a `pluginStatus()` that called
+  `useAuth.getState()` from a plain function (no subscription; dead code). Replaced with a
+  `useStatus?: () => PluginStatus` **hook** contribution on the manifest: the plugin owns its
+  subscription, the shell just calls it. `validateManifest` now fails a `status-dot` with no
+  `useStatus`, since a dot that can never report reads as broken rather than as unknown.
+- **The dot was gray until you opened the page it describes.** `hydrate()` ran from
+  `TelegramPage`'s mount only. Added an `init` contribution + `usePluginBoot()` in `AppShell`
+  (beside `hydratePerf`), which walks the registry and swallows per-plugin failures so a plugin
+  that can't reach its backend can't take boot down. `TelegramPage` no longer hydrates on mount
+  — that round trip only re-learned what the nav dot already showed.
+- `validateManifest` also enforces the **manifest↔command-prefix contract** (§6.7):
+  `commandPrefix("telegram") === "tg_"` is explicit, not derived, since deriving it would
+  reject the real names.
+- `ConnectFlow`'s step is **derived from the store** (`needs_password` / `pendingPhone`) rather
+  than local state, so the backend-discovered 2FA hand-off advances the flow and a remount
+  mid-login lands on the right step instead of resetting to Phone.
+- `TelegramSettings` is `React.lazy` + `Suspense`: the manifest is pulled into the main bundle
+  by the Sidebar, so a top-level import would drag the form into the initial chunk to render a
+  panel most launches never open. Verified: its own 3.15 kB chunk.
+
+
+
+### 15.4 Still owed
+- **LIVE SMOKE TEST (`npm run tauri dev`) — nothing below has run against real Telegram.**
+  Everything is compile-, test- and build-verified only. Verify in order: (a) Settings → Plugins
+  shows the credentials form, and a bad `api_hash` is rejected next to the field; (b) save real
+  my.telegram.org keys, connect with a phone number, confirm the code step names the number;
+  (c) mistype the code once — it must report a bad code and let you retype WITHOUT sending a new
+  code (this is the token-retention fix, and the highest-value thing to confirm); (d) 2FA path if
+  the account has it, including a wrong password then the right one; (e) **restart the app — the
+  nav dot must be lime before you open the plugin page** (session restore + boot `init`, the two
+  headline fixes); (f) Disconnect, then confirm `tg.session` and its `-wal`/`-shm` are gone from
+  `app_data_dir` and the dot is gray; (g) unplug the network while connected → status should read
+  "unreachable", NOT "not connected".
+- **Phase 4+ is unstarted:** `link.rs` / `tg_import_link` / `tg_channel_media`, the `materials`
+  `source` + `tg_*` columns migration, scanner skip, `reader.rs`/`server.rs` streaming, and the
+  `sourceAdapters` manifest contribution (declared in the types, not yet implemented by Telegram).
+- **`FLOOD_WAIT` is reported but not enforced.** The message names the wait; nothing prevents the
+  user from immediately retrying and extending it. A client-side cooldown belongs with Phase 7
+  hardening.
+- Telegram's own ACL/capability gating is still declarative only (`capabilities` is documentation,
+  not enforcement) — as designed for v1, but it means "enabling" a plugin grants nothing revocable.

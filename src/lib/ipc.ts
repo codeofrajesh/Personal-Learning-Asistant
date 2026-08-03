@@ -73,6 +73,18 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
   return invoke<T>(command, args);
 }
 
+/**
+ * Public typed invoke for plugin IPC wrappers (e.g. the Telegram `tg_*` commands).
+ * Same behavior as the internal `call`, exposed so plugins don't re-implement the
+ * Tauri guard.
+ */
+export async function invokeCommand<T>(
+  command: string,
+  args?: Record<string, unknown>
+): Promise<T> {
+  return call<T>(command, args);
+}
+
 export const ipc = {
   /**
    * Roundtrip smoke test: React → Tauri → Rust → SQLite (write) → (read) → back.

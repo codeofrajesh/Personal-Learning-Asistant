@@ -24,6 +24,7 @@ import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { usePerf } from "../../lib/perfStore";
 import { useTaskReminders } from "../useTaskReminders";
 import { useBlockReminders } from "../../lib/scheduleReminders";
+import { usePluginBoot } from "../../lib/plugins/boot";
 
 export default function AppShell() {
   const [collapsed, setCollapsed] = useState(false);
@@ -48,6 +49,11 @@ export default function AppShell() {
   // you're already looking at your schedule isn't a reminder.
   useTaskReminders();
   useBlockReminders();
+
+  // Run each plugin's `init` contribution once per launch. This is what makes a plugin's
+  // nav chrome (e.g. Telegram's connected dot) accurate before its page is ever opened;
+  // the shell stays plugin-agnostic because it only walks the registry.
+  usePluginBoot();
 
   // On the player route, force the sidebar into minimized (icon-only) mode for the
   // immersive 3-column layout. The user can still toggle it; this just sets the

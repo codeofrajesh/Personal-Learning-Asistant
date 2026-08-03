@@ -1,34 +1,40 @@
 /**
  * Telegram plugin page — `/plugins/telegram`.
  *
- * Phase 2: honest empty state with a **disabled** Connect button.
- * The auth flow (request code → code input → 2FA → "Connected as @user") is Phase 3.
- * This page loads only when visited (code-split per the app's Section 15 rule).
+ * Phase 3: real auth via `authStore` + `ConnectFlow`. The page shows a connect
+ * hero when disconnected, the account card when connected, and the feature
+ * exposes (Channels / Import link) which land in Phase 4/5.
+ * Loads only when visited (code-split per the app's Section 15 rule).
  */
 
-import { useState } from "react";
 import { Link } from "react-router-dom";
-import { SendHorizontal, MessageSquare, Link as LinkIcon, UserPlus, HelpCircle } from "lucide-react";
+import {
+  SendHorizontal,
+  MessageSquare,
+  Link as LinkIcon,
+  LogOut,
+  HelpCircle,
+  KeyRound,
+  WifiOff,
+} from "lucide-react";
 import Breadcrumb from "../../components/layout/Breadcrumb";
-import type { PluginStatus } from "../../lib/plugins/statusDot";
+import ConnectFlow from "./ConnectFlow";
+import { useAuth } from "./authStore";
 import { cn } from "../../lib/utils";
 
 export default function TelegramPage() {
-  // Placeholder for Phase 3 authStore status — for now it's always "disconnected".
-  // Phase 3 will replace this with `useAuthStore((s) => s.status)` (which returns the
-  // union, so the disconnected/connected comparisons below will resolve normally).
-  // The cast widens the literal so the comparisons don't narrow-trip TypeScript.
-  const status = "disconnected" as PluginStatus;
+  const status = useAuth((s) => s.status);
+  const user = useAuth((s) => s.user);
+  const hasCredentials = useAuth((s) => s.hasCredentials);
+  const signOut = useAuth((s) => s.signOut);
 
-  // Demo local state for the Connect button click (Phase 3: replaced by authStore actions).
-  const [connecting, setConnecting] = useState(false);
+  // No hydrate-on-mount: the manifest's `init` contribution already ran it at boot, so the
+  // state is settled before this page is reachable. Re-running here would spend a network
+  // round trip to learn what the nav dot is already showing.
 
-  // Guard against double-click while the (future) flow is running.
-  const onConnect = () => {
-    setConnecting(true);
-    // Phase 3: await authStore.requestCode(phone) + code input + sign in
-    setTimeout(() => setConnecting(false), 300);
-  };
+  const connected = status === "connected";
+  const displayName =
+    user?.first_name || (user?.username ? `@${user.username}` : null) || "your account";
 
   return (
     <div className="min-h-full px-6 pb-10">
@@ -49,49 +55,91 @@ export default function TelegramPage() {
           </div>
         </header>
 
-        {/* Status strip */}
+        {/* Status strip. Each state names a different next action, so they can't collapse
+            into one "not connected" line: a missing api_hash, a dropped network and a
+            genuine sign-out need different things from the user. */}
         <div className="mb-8 flex items-center gap-2 text-sm">
           <span
             aria-hidden
             className={cn(
               "h-2 w-2 rounded-full",
-              status === "connected" ? "bg-lime shadow-glow-lime" : "bg-white/15"
+              connected
+                ? "bg-lime shadow-glow-lime"
+                : status === "unreachable"
+                  ? "bg-orange"
+                  : "bg-white/15"
             )}
           />
           <span className="text-content-secondary">
-            {status === "connected" ? "Connected — media is ready to import." : "Not connected."}
+            {connected
+              ? "Connected — media is ready to import."
+              : status === "unreachable"
+                ? "Signed in, but Telegram is unreachable. Check your connection."
+                : status === "unknown"
+                  ? "Checking connection…"
+                  : !hasCredentials
+                    ? "Set up your API credentials to get started."
+                    : "Not connected."}
           </span>
         </div>
 
-        {/* Empty state: banner card + two "coming in a later phase" feature exposes */}
-        <div className="glass rounded-card p-card shadow-card">
-          <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center">
-            <div className="min-w-0 flex-1">
-              <h2 className="text-base font-semibold text-content-primary">Connect your account</h2>
-              <p className="mt-1 text-sm text-content-muted">
-                Sign in with your own Telegram account to browse channels and stream media
-                straight into PLE. Nothing is uploaded — the app reads from channels you can
-                already access.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={onConnect}
-              disabled={status === "connected"}
-              title={status === "connected" ? "Already connected" : "Connection is a later phase"}
-              className={cn(
-                "inline-flex shrink-0 items-center gap-2 rounded-btn border px-4 py-2.5 text-sm font-semibold shadow-glow-lime transition-transform hover:scale-[1.02]",
-                status === "connected"
-                  ? "cursor-not-allowed border-lime/40 bg-lime/10 text-lime opacity-60"
-                  : "border-lime/40 bg-lime/10 text-lime"
-              )}
-            >
-              <UserPlus size={16} strokeWidth={2} aria-hidden />
-              {connecting ? "Waiting…" : "Connect"}
-              {status !== "connected" && <span className="text-[0.65rem] font-normal text-content-faint">soon</span>}
-            </button>
+        {status === "unreachable" && (
+          <div className="mb-6 flex items-start gap-2.5 rounded-btn border border-orange/30 bg-orange/10 p-3">
+            <WifiOff size={15} strokeWidth={2} className="mt-0.5 shrink-0 text-orange" aria-hidden />
+            <p className="text-sm text-content-secondary">
+              Your session is saved — there's no need to sign in again. This will reconnect on
+              its own once Telegram is reachable.
+            </p>
           </div>
-        </div>
+        )}
+
+        {connected ? (
+          <div className="glass rounded-card p-card shadow-card">
+            <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center">
+              <div className="min-w-0 flex-1">
+                <h2 className="text-base font-semibold text-content-primary">
+                  Connected as {displayName}
+                </h2>
+                <p className="mt-1 text-sm text-content-muted">
+                  {user?.username ? `@${user.username}` : user?.phone ?? ""}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void signOut()}
+                className="inline-flex shrink-0 items-center gap-2 rounded-btn border border-white/10 px-4 py-2.5 text-sm font-medium text-content-secondary transition-colors hover:border-orange/40 hover:bg-orange/10 hover:text-orange"
+              >
+                <LogOut size={16} strokeWidth={2} aria-hidden />
+                Disconnect
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="glass rounded-card p-card shadow-card">
+            <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center">
+              <div className="min-w-0 flex-1">
+                <h2 className="text-base font-semibold text-content-primary">Connect your account</h2>
+                <p className="mt-1 text-sm text-content-muted">
+                  Sign in with your own Telegram account to browse channels and stream media
+                  straight into PLE. Nothing is uploaded — the app reads from channels you can
+                  already access.
+                </p>
+              </div>
+              {!hasCredentials && (
+                <Link
+                  to="/settings#plugins"
+                  className="inline-flex shrink-0 items-center gap-2 rounded-btn border border-white/10 px-4 py-2.5 text-sm font-medium text-content-secondary transition-colors hover:bg-white/[0.05] hover:text-content-primary"
+                >
+                  <KeyRound size={15} strokeWidth={2} aria-hidden />
+                  Add credentials
+                </Link>
+              )}
+            </div>
+            <div className="mt-5">
+              <ConnectFlow />
+            </div>
+          </div>
+        )}
 
         {/* Feature exposes (placeholder grid for Phase 4/5 content) */}
         <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
