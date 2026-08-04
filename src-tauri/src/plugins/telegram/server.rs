@@ -24,8 +24,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use http_body_util::Full;
-use hyper::body::Bytes;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Empty, StreamBody};
+use hyper::body::{Bytes, Frame};
 use hyper::header::{
     ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
 };
@@ -130,6 +131,59 @@ pub fn parse_range(
         }
     };
     Ok(Some(range))
+}
+
+/// The response body type.
+///
+/// `StreamBody` rather than `Full`, because the difference is felt directly by the player.
+/// Buffering the whole slice meant the client received NOTHING until the last byte arrived —
+/// on a slow link an 8 MB slice is several seconds of silence, long enough for mpv to consider
+/// the connection stalled. Streaming yields each 512 KB chunk the moment it lands, so playback
+/// starts on the first chunk and continues while the rest is still in flight.
+type StreamedBody = UnsyncBoxBody<Bytes, std::io::Error>;
+
+/// An empty body of the streamed type — for HEAD, 404, 416 and friends.
+fn empty_body() -> StreamedBody {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+/// Build a body that fetches and yields one chunk at a time.
+///
+/// Chunk boundaries are the natural unit: `read_range` already assembles from whole 512 KB
+/// chunks, so streaming them costs nothing extra and gives the player steady progress.
+fn stream_range(reader: Arc<TgReader>, start: u64, len: u64) -> StreamedBody {
+    // Step by chunk, but honour the caller's exact start/end so the bytes on the wire match
+    // the Content-Range header exactly — an off-by-one here is a corrupt stream.
+    let stream = futures_util::stream::unfold(
+        (reader, start, len),
+        |(reader, offset, remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            // One chunk per poll, clipped to what the range still needs.
+            let want = remaining.min(CHUNK_SIZE);
+            match reader.read_range(offset, want).await {
+                Ok(bytes) if bytes.is_empty() => None, // EOF
+                Ok(bytes) => {
+                    let read = bytes.len() as u64;
+                    let frame = Frame::data(Bytes::from(bytes));
+                    Some((Ok(frame), (reader, offset + read, remaining - read)))
+                }
+                Err(e) => {
+                    // The client sees a truncated body and can retry the range; the
+                    // alternative (hanging) is what the timeout work exists to prevent.
+                    log::warn!("telegram: stream aborted at offset {offset}: {e}");
+                    Some((
+                        Err(std::io::Error::other(e.to_string())),
+                        (reader, offset, 0),
+                    ))
+                }
+            }
+        },
+    );
+    StreamBody::new(stream).boxed_unsync()
 }
 
 /// Streaming server state, held in Tauri's managed state.
@@ -249,7 +303,7 @@ fn random_token() -> String {
 async fn handle(
     ctx: Arc<ServeCtx>,
     req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+) -> Result<Response<StreamedBody>, std::convert::Infallible> {
     Ok(match route(ctx, req).await {
         Ok(response) => response,
         Err(status) => empty(status),
@@ -259,7 +313,7 @@ async fn handle(
 async fn route(
     ctx: Arc<ServeCtx>,
     req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>, StatusCode> {
+) -> Result<Response<StreamedBody>, StatusCode> {
     // Only reads. A stream endpoint has no reason to accept anything else.
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
@@ -334,7 +388,7 @@ async fn route(
     if is_head {
         return builder
             .status(status)
-            .body(Full::new(Bytes::new()))
+            .body(empty_body())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -346,27 +400,24 @@ async fn route(
         length.min(OPEN_RANGE_SERVE)
     };
 
-    let bytes = reader.read_range(start, want).await.map_err(|e| {
-        log::warn!("telegram: chunk read failed: {e}");
-        StatusCode::BAD_GATEWAY
-    })?;
-
-    // Re-derive the length from what was actually read: a short read at EOF with an
-    // over-large Content-Length would leave the client waiting for bytes that never arrive.
-    let actual = bytes.len() as u64;
-    if actual != length {
-        builder = builder.header(CONTENT_LENGTH, actual);
+    // `Content-Length` must match what the body actually delivers, and the body is produced
+    // lazily now — so the length is committed here and `stream_range` is bounded to exactly
+    // that many bytes. (The previous buffered version could correct the header after a short
+    // read at EOF; a stream cannot, so the range was already clamped to the file size by
+    // `parse_range` and `read_range` stops at EOF.)
+    if want != length {
+        builder = builder.header(CONTENT_LENGTH, want);
         if range.is_some() {
             builder = builder.header(
                 CONTENT_RANGE,
-                format!("bytes {}-{}/{}", start, start + actual.saturating_sub(1), size),
+                format!("bytes {}-{}/{}", start, start + want.saturating_sub(1), size),
             );
         }
     }
 
     builder
         .status(status)
-        .body(Full::new(Bytes::from(bytes)))
+        .body(stream_range(reader, start, want))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -436,10 +487,10 @@ async fn reader_for(ctx: &ServeCtx, chat_id: i64, message_id: i32) -> AppResult<
     Ok(reader)
 }
 
-fn empty(status: StatusCode) -> Response<Full<Bytes>> {
+fn empty(status: StatusCode) -> Response<StreamedBody> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::new()))
+        .body(empty_body())
         .expect("static response builds")
 }
 

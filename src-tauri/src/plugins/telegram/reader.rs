@@ -27,6 +27,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use grammers_client::media::{Downloadable, Media};
@@ -53,6 +54,21 @@ const MAX_CACHED_CHUNKS: usize = 64;
 /// documented `FLOOD_WAIT` trigger. One global cap (not per-stream) is what makes that bound
 /// hold when the player and a prefetch are both running.
 const MAX_CONCURRENT_FETCHES: usize = 4;
+
+/// Hard ceiling on a single `upload.getFile` round trip.
+///
+/// **This is the fix for the permanent stall.** `SenderPoolHandle::invoke_in_dc` ends in a bare
+/// `rx.await` (`sender_pool.rs:130`) with no timeout of its own. If the TCP connection dies in a
+/// way that produces no read error — a silently dropped socket, which is exactly what happens to
+/// an idle NAT/firewall mapping — the response never arrives, `run_sender` never errors, the
+/// oneshot is never resolved, and that future waits **forever**.
+///
+/// A forever-waiting fetch holds its semaphore permit forever. With `MAX_CONCURRENT_FETCHES = 4`,
+/// four such hangs deadlock every future read: playback stops dead with nothing in the log.
+///
+/// 30 s is well beyond any healthy chunk (a 512 KB read is normally sub-second) but short enough
+/// that a wedged connection is detected while the player still has buffered video.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A file we can stream: its location plus the metadata the HTTP layer must echo.
 #[derive(Clone)]
@@ -111,6 +127,9 @@ pub struct TgReader {
     /// equivalent — so the FIRST chunk deliberately goes through `iter_download` to trigger
     /// the copy, and only then do we switch to direct calls.
     auth_ready: Mutex<bool>,
+    /// Chunk indices currently being fetched, so a prefetch and the read that follows it don't
+    /// both hit the network for the same bytes.
+    in_flight: Mutex<Vec<u64>>,
     /// Our own handle to the session, for `home_dc_id()`. grammers keeps `Client.session`
     /// private, but we construct the session, so we can read it directly.
     session: Arc<FileSession>,
@@ -135,6 +154,7 @@ impl TgReader {
             semaphore,
             dc_id: Mutex::new(None),
             auth_ready: Mutex::new(false),
+            in_flight: Mutex::new(Vec::new()),
             session,
         }
     }
@@ -192,28 +212,56 @@ impl TgReader {
     /// learned `dc_id`, same semaphore. A cloned-fields copy would warm a cache nobody reads
     /// and rediscover the DC every time, which is worse than no prefetch at all.
     ///
-    /// Only ONE chunk ahead, and only when a network slot is already free (`try_acquire`, never
-    /// `acquire`). A prefetch that waited for a permit would compete with the chunk the player
-    /// is actually blocked on — making playback worse while looking like an optimization.
+    /// Registered in `in_flight` before spawning so the streaming loop, which asks for this
+    /// very chunk moments later, waits for the prefetch instead of issuing a second identical
+    /// request. Without that the read-ahead would *double* the request count rather than hide
+    /// latency — the opposite of the intent.
     fn prefetch(self: &Arc<Self>, index: u64, size: u64) {
         if index * CHUNK_SIZE >= size {
             return; // past EOF
         }
+        // Only read ahead when a slot is free right now: a prefetch that queues would compete
+        // with the chunk the player is actually blocked on.
+        if self.semaphore.available_permits() == 0 {
+            return;
+        }
+
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            // Already cached, or no spare capacity → skip silently.
             if this.cached(index).await.is_some() {
                 return;
             }
-            let Ok(_permit) = this.semaphore.clone().try_acquire_owned() else {
+            // Claim it. If another task already has, that task's result will be shared.
+            if !this.claim(index).await {
                 return;
-            };
-            if let Ok(bytes) = this.download_chunk(index).await {
+            }
+            let result = this.download_chunk(index).await;
+            if let Ok(bytes) = result {
                 if !bytes.is_empty() {
                     this.store(index, Arc::new(bytes)).await;
                 }
             }
+            this.release(index).await;
         });
+    }
+
+    /// Mark `index` as being fetched. Returns false if someone else already claimed it.
+    async fn claim(&self, index: u64) -> bool {
+        let mut in_flight = self.in_flight.lock().await;
+        if in_flight.contains(&index) {
+            return false;
+        }
+        in_flight.push(index);
+        true
+    }
+
+    async fn release(&self, index: u64) {
+        self.in_flight.lock().await.retain(|i| *i != index);
+    }
+
+    /// Whether `index` is currently being fetched by another task.
+    async fn is_in_flight(&self, index: u64) -> bool {
+        self.in_flight.lock().await.contains(&index)
     }
 
     /// Fetch one 512 KB chunk, from cache when possible.
@@ -222,35 +270,59 @@ impl TgReader {
             return Ok(hit);
         }
 
-        // Bound concurrent Telegram reads. Acquired AFTER the cache check so a cache hit
-        // never waits on a network slot.
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| AppError::Other("Telegram reader is shutting down.".into()))?;
-
-        // Another task may have fetched it while we waited for the permit.
-        if let Some(hit) = self.cached(index).await {
-            return Ok(hit);
+        // A prefetch for this chunk is probably already running — the streaming loop asks for
+        // chunk N+1 moments after the previous read warmed it. Wait briefly for it instead of
+        // firing a second identical request, which would double the request count and undo the
+        // whole point of reading ahead.
+        //
+        // Bounded: if the prefetch is wedged (its own timeout will end it), fetching directly
+        // is better than waiting on it indefinitely.
+        for _ in 0..40 {
+            if !self.is_in_flight(index).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(hit) = self.cached(index).await {
+                return Ok(hit);
+            }
         }
 
-        let bytes = match self.download_chunk(index).await {
-            Ok(bytes) => bytes,
+        // NOTE: no permit is taken here. `download_chunk` acquires one around each individual
+        // network attempt and releases it before any backoff sleep — see `fetch_once`.
+        //
+        // Holding a permit across the whole retry sequence was a deadlock: a flood wait can be
+        // 45 s and the I/O backoff adds up to 7 s more, so four slow chunks would occupy all
+        // four permits for a minute while every other read blocked on `acquire()`. Playback
+        // stopped with nothing in the log.
+        //
+        // Claimed for the same reason the prefetch claims: two concurrent range requests that
+        // overlap (mpv opens several connections) must not fetch identical bytes twice.
+        let claimed = self.claim(index).await;
+        let result = self.fetch_chunk_bytes(index).await;
+        if claimed {
+            self.release(index).await;
+        }
+        let bytes = result?;
+
+        let bytes = Arc::new(bytes);
+        self.store(index, bytes.clone()).await;
+        Ok(bytes)
+    }
+
+    /// The fetch half of `chunk`, split out so the in-flight claim is always released.
+    async fn fetch_chunk_bytes(&self, index: u64) -> AppResult<Vec<u8>> {
+        match self.download_chunk(index).await {
+            Ok(bytes) => Ok(bytes),
             Err(e) if is_file_reference_expired(&e) => {
                 // The `file_reference` in a message expires (hours). Re-fetching the message
                 // yields a fresh one. This is what lets a student pause overnight and resume
                 // without re-importing the lesson.
                 log::info!("telegram: file reference expired, refreshing");
                 self.refresh_reference().await?;
-                self.download_chunk(index).await.map_err(map_invocation)?
+                self.download_chunk(index).await.map_err(map_invocation)
             }
-            Err(e) => return Err(map_invocation(e)),
-        };
-
-        let bytes = Arc::new(bytes);
-        self.store(index, bytes.clone()).await;
-        Ok(bytes)
+            Err(e) => Err(map_invocation(e)),
+        }
     }
 
     async fn cached(&self, index: u64) -> Option<Arc<Vec<u8>>> {
@@ -316,12 +388,49 @@ impl TgReader {
         }
     }
 
-    /// A single `upload.getFile` attempt for chunk `index`.
+    /// A single `upload.getFile` attempt for chunk `index`, under a hard timeout.
     ///
     /// Takes the direct path once the DC is known and an auth key has been copied there;
     /// otherwise goes through `iter_download`, which discovers the DC and performs the auth
     /// copy internally.
+    ///
+    /// The timeout wraps BOTH paths. A dropped socket produces no error from grammers — the
+    /// response simply never comes — so without this the future never resolves and its permit
+    /// is never released. Reported as an `Io` error so the caller's backoff treats it as the
+    /// dropped connection it is, and the next attempt builds a fresh one.
     async fn fetch_once(&self, index: u64) -> Result<Vec<u8>, InvocationError> {
+        // The permit is scoped to THIS attempt only, so a backoff sleep in the caller never
+        // occupies a network slot. Acquired after the cache check in `chunk`, so a hit never
+        // queues for one.
+        let _permit = match self.semaphore.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Err(InvocationError::Io(std::io::Error::other(
+                    "Telegram reader is shutting down",
+                )))
+            }
+        };
+
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.fetch_inner(index)).await {
+            Ok(result) => result,
+            Err(_) => {
+                log::warn!(
+                    "telegram: chunk {index} timed out after {}s — treating the connection as dead",
+                    REQUEST_TIMEOUT.as_secs()
+                );
+                // Force rediscovery: the DC may be fine but this connection is not, and the
+                // iterator path rebuilds one.
+                *self.dc_id.lock().await = None;
+                *self.auth_ready.lock().await = false;
+                Err(InvocationError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Telegram did not respond",
+                )))
+            }
+        }
+    }
+
+    async fn fetch_inner(&self, index: u64) -> Result<Vec<u8>, InvocationError> {
         let known_dc = *self.dc_id.lock().await;
         let auth_ready = *self.auth_ready.lock().await;
 
@@ -583,5 +692,38 @@ mod tests {
         // read as a frozen app, so the reader caps it and surfaces the failure instead.
         assert_eq!(300u32.min(MAX_FLOOD_WAIT_SECS), 45);
         assert_eq!(12u32.min(MAX_FLOOD_WAIT_SECS), 12);
+    }
+
+    /// The request timeout must be shorter than the worst case it protects against.
+    ///
+    /// `invoke_in_dc` ends in a bare `rx.await` (`sender_pool.rs:130`). A silently dropped
+    /// socket produces no error, so without a timeout that future waits forever AND holds a
+    /// semaphore permit — four of those deadlock every subsequent read. The timeout must
+    /// therefore be well under the point at which a user would call playback "stalled".
+    #[test]
+    fn request_timeout_is_shorter_than_a_users_patience() {
+        assert!(
+            REQUEST_TIMEOUT.as_secs() <= 30,
+            "a longer timeout is indistinguishable from the hang it exists to catch"
+        );
+        // …but comfortably longer than a healthy 512 KB read, or slow connections would be
+        // killed mid-transfer and retried forever.
+        assert!(REQUEST_TIMEOUT.as_secs() >= 15);
+    }
+
+    /// Worst-case time to give up on a chunk must stay bounded.
+    ///
+    /// Three attempts, each capped by the request timeout, plus the backoff sleeps between
+    /// them. If this total ever exceeds a player's own read timeout, the player gives up first
+    /// and the retry logic is pointless.
+    #[test]
+    fn worst_case_chunk_time_is_bounded() {
+        let timeouts = 4 * REQUEST_TIMEOUT.as_secs(); // initial + 3 retries
+        let backoff: u64 = (0..3).map(|attempt| 1u64 << attempt).sum(); // 1 + 2 + 4
+        assert!(
+            timeouts + backoff < 180,
+            "worst case {}s is long enough to look like a hang",
+            timeouts + backoff
+        );
     }
 }

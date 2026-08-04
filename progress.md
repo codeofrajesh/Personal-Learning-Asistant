@@ -1661,7 +1661,54 @@ Verified: `cargo test --lib` **199 passed** (+3: direct-vs-iterator offset parit
 backoff, flood cap), clippy still 18, `tsc --noEmit` + `npm run build` clean. Still no player
 component modified.
 
-### 15.9 Still owed
+### 15.9 The ~1-minute stall — an un-timed-out await, and a permit deadlock
+
+The `dc_id` fix (§15.8) removed the 10-second stall, and playback then failed at "1 minute and
+some seconds". That timing is the evidence: `grammers-mtsender` uses
+**`PING_DELAY = 60s`** and **`NO_PING_DISCONNECT = 75s`** (`sender.rs:49,58`) — the keepalive
+interval and the server-side disconnect window. A failure clustered just past 60 s points at the
+connection lifecycle, not at throughput.
+
+**Root cause (the one that makes the stall permanent).** `SenderPoolHandle::invoke_in_dc` ends in
+a bare `rx.await` with **no timeout** (`sender_pool.rs:130`). A socket that dies without
+producing a read error — a silently dropped NAT/firewall mapping, exactly what happens to an idle
+connection — leaves `run_sender` never erroring, the oneshot never resolved, and that future
+waiting **forever**. And because `chunk()` held a semaphore permit across the whole fetch, a
+hung fetch held its permit forever too: with `MAX_CONCURRENT_FETCHES = 4`, four hangs deadlock
+every subsequent read. Playback stops dead with nothing in the log, which is precisely the
+reported symptom.
+
+Three fixes:
+1. **`REQUEST_TIMEOUT = 30s` around every Telegram call.** A timeout is reported as an `Io`
+   error so the existing backoff treats it as the dropped connection it is, and the cached
+   `dc_id`/`auth_ready` are cleared so the next attempt rebuilds the connection through the
+   iterator path.
+2. **Permits no longer span retries.** The permit is scoped to a single network attempt inside
+   `fetch_once`, so backoff sleeps (up to 7 s of I/O backoff, or a 45 s flood wait) never occupy
+   a network slot. Previously four slow chunks could block every other read for a minute.
+3. **Streamed response body** (`UnsyncBoxBody` + `StreamBody`) instead of buffering the whole
+   8 MB slice. The buffered version sent nothing until the last byte arrived — on a slow link
+   that is seconds of silence, long enough for a player to treat the connection as stalled.
+   Chunks now reach the player as they land. (`UnsyncBoxBody`, not `BoxBody`: the stream holds
+   non-`Sync` futures, and hyper only requires `Send`.)
+
+**Gemini's analysis was directionally right and its streaming fix is the one adopted here**, but
+its two diagnoses were incomplete: the 8 MB buffering explains a *delay*, not a permanent freeze,
+and it missed the permit deadlock entirely — which is what turns a recoverable timeout into a
+dead player. Its proposed 10 s timeout was also too aggressive: a healthy 512 KB read on a slow
+link can exceed it, so it would kill working connections. 30 s is beyond any healthy read and
+still well inside a user's patience.
+
+**A prefetch/stream duplicate-fetch bug was found while doing this.** With a streamed body,
+`read_range` warms chunk N+1 and the stream's next step then requests exactly that chunk — both
+hitting the network. The read-ahead was *doubling* requests instead of hiding latency. An
+`in_flight` claim set now makes the second caller wait for the first (bounded, so a wedged
+prefetch can't block a real read).
+
+Verified: `cargo test --lib` **201 passed** (+2: timeout bounds, worst-case chunk time), clippy
+still 18, `tsc --noEmit` + `npm run build` clean. Still no player component modified.
+
+### 15.10 Still owed
 - **LIVE SMOKE TEST (`npm run tauri dev`) — nothing below has run against real Telegram.**
   Everything is compile-, test- and build-verified only. Verify in order: (a) Settings → Plugins
   shows the credentials form, and a bad `api_hash` is rejected next to the field; (b) save real
