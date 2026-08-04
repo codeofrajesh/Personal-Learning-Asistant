@@ -40,17 +40,6 @@ use tokio::sync::Mutex;
 use crate::plugins::telegram::reader::{new_semaphore, resolve_file, TgReader, CHUNK_SIZE};
 use crate::utils::errors::{AppError, AppResult};
 
-/// How much to serve for an open-ended range (`bytes=0-`).
-///
-/// Deliberately NOT the whole file: a player opening a 2 GB lecture would otherwise wait for
-/// the entire download before the first frame.
-///
-/// 8 MB rather than 1 MB, because the size directly sets how often the player must come back.
-/// mpv fills a large read-ahead cache, so a 1 MB slice made it re-request every 1 MB — dozens
-/// of HTTP round trips (and, before the `dc_id` fix, dozens of wasted `FILE_MIGRATE`
-/// redirects) in the first few seconds of playback. That request amplification is what walks
-/// an account into `FLOOD_WAIT`. 8 MB is 16 chunks: still a fast first frame, far fewer trips.
-const OPEN_RANGE_SERVE: u64 = CHUNK_SIZE * 16;
 
 /// One reader per `(chat_id, message_id)`, so seeking within a lesson reuses its chunk cache.
 type ReaderMap = Arc<Mutex<HashMap<(i64, i32), Arc<TgReader>>>>;
@@ -106,13 +95,13 @@ pub fn parse_range(
                 end: size - 1,
             }
         }
-        // `bytes=N-` — from N to the end. Served in bounded slices (see OPEN_RANGE_SERVE).
+        // `bytes=N-` — from N to the end.
         (first, "") => {
             let start: u64 = first.parse().map_err(|_| RangeNotSatisfiable)?;
             if start >= size {
                 return Err(RangeNotSatisfiable);
             }
-            let end = (start + OPEN_RANGE_SERVE - 1).min(size - 1);
+            let end = size - 1;
             ByteRange { start, end }
         }
         // `bytes=N-M` — explicit, inclusive on both ends.
@@ -392,13 +381,7 @@ async fn route(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // For a whole-file GET, still serve a bounded slice: a client that ignores ranges would
-    // otherwise pull gigabytes into memory before the first frame.
-    let want = if range.is_some() {
-        length
-    } else {
-        length.min(OPEN_RANGE_SERVE)
-    };
+    let want = length;
 
     // `Content-Length` must match what the body actually delivers, and the body is produced
     // lazily now — so the length is committed here and `stream_range` is bounded to exactly
@@ -514,19 +497,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_ended_range_is_bounded_not_whole_file() {
-        // Serving to EOF here would make a 2 GB lecture buffer entirely before playing.
-        // The file must be larger than one slice, or this would be testing EOF clamping
-        // instead (which `open_ended_range_clamps_at_eof` covers).
-        let big = OPEN_RANGE_SERVE * 4;
-        let r = parse_range(Some("bytes=0-"), big).unwrap().unwrap();
-        assert_eq!(r.start, 0);
-        assert_eq!(r.end, OPEN_RANGE_SERVE - 1);
-        // Whatever the slice size, it must stay a whole number of chunks so every network
-        // read remains Telegram-aligned.
-        assert_eq!(OPEN_RANGE_SERVE % CHUNK_SIZE, 0);
-    }
 
     #[test]
     fn open_ended_range_clamps_at_eof() {
