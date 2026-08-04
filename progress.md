@@ -1362,14 +1362,16 @@ structure changed in any of the three players; the mpv effect graph lost one eff
 
 ---
 
-## 15. Plugin System & Telegram Integration (Phases 1–3)
+## 15. Plugin System & Telegram Integration (Phases 1–6)
 
 Source of truth: `telegram.md` (architecture) + `implementation_plan.md` (Phases 1–2 detail).
 Turns Telegram into a **first-class plugin** rather than a hard-coded page: a contribution-point
 registry (VSCode-style) owns nav, routes, settings sections, boot hooks and status badges, so
-future integrations register a manifest instead of editing the shell. Phases 1–3 are DONE;
-`cargo test --lib` **148 passed** (was 137), clippy still 18 pre-existing warnings,
-`tsc --noEmit` + `npm run build` clean.
+future integrations register a manifest instead of editing the shell. **Phases 1–6 are DONE**
+(shell → skeleton → auth → import → streaming → player wiring); 7 is partly covered (error
+taxonomy, token auth, file-reference refresh) and 8 is explicitly stretch. `cargo test --lib`
+**196 passed** (was 137), clippy still 18 pre-existing warnings, `tsc --noEmit` +
+`npm run build` clean. Nothing past auth has been exercised against a live connection — §15.8.
 
 ### 15.1 Phase 1 — the contribution-point shell (`src/lib/plugins/`)
 - `types.ts` — `PluginManifest` + contribution types (`nav`, `routes`, `settingsSections`,
@@ -1515,7 +1517,151 @@ Verified: `cargo tree` shows **zero** `libsql` (only rusqlite's `libsqlite3-sys`
 SQLite in the binary); `cargo test --lib` **152 passed** (+4 session round-trip tests); clippy
 back to the 18-warning baseline with zero telegram warnings.
 
-### 15.5 Still owed
+### 15.5 Phases 4–6 — import, streaming, and player wiring
+
+**Phase 4 (import).** `link.rs` (pure `t.me` parser) + `import.rs` (`tg_import_link`,
+`tg_channel_media`) + `LinkImport.tsx`. Schema **v11** adds `materials.source`
+(`'local'|'telegram'`) + `tg_chat_id` / `tg_message_id`; existing rows migrate to `'local'`,
+never NULL, because the scanner, metadata engine and player all branch on it. `file_path`
+holds a synthetic `tg://<chat>/<msg>` key (the column is NOT NULL UNIQUE and predates
+streaming), and a partial UNIQUE index on `(tg_chat_id, tg_message_id)` makes re-importing a
+link UPDATE the existing lesson rather than duplicating it, so progress and notes stay
+attached. Two silent-corruption bugs were found while integrating: `mark_subject_missing_except`
+would flip every Telegram lesson to `missing` on any filesystem rescan (a `tg://` path is never
+in the scanner's `seen` set), and the metadata engine would spawn ffprobe against `tg://` paths
+three times per lesson. Both are now scoped to `source = 'local'`.
+
+**Private-channel peer resolution — the retry that could not work.** A `/c/` link carries no
+access hash, so the only available ref is `PeerId::to_ambient_ref()`, which is
+`PeerAuth::default()` — literally `PeerAuth(0)`. `get_messages_by_id` serializes
+`channel: peer.into()` with **no session lookup**, so priming the peer cache and re-issuing the
+same ambient request rebuilds byte-identical wire data and fails identically. The fix resolves
+through `Session::peer_ref(id)` (the actual cache lookup) and sends a ref carrying a real hash;
+`TgState` keeps its own `Arc<FileSession>` because grammers holds `Client.session` private.
+Invite links (`t.me/+hash`) are a first-class target via `messages.checkChatInvite` — a
+read-only lookup that does NOT join — because a username-less private channel the user *owns*
+has no other pasteable handle.
+
+### 15.6 Phase 5 — the streaming engine
+
+**`reader.rs` — and why `telegram.md` §5.3 is inverted for grammers 0.10.** The plan says to
+avoid `iter_download` (it `panic!`s on `File::CdnRedirect`) in favour of raw
+`invoke_in_dc(upload::GetFile)`. Verified against the sources, that recommendation is backwards:
+media routinely lives on a **non-home DC**, where `upload.getFile` returns
+`AUTH_KEY_UNREGISTERED` and must be repaired by an auth-key export/import. `DownloadIter` does
+exactly that (`files.rs:128`), but the function it calls — `copy_auth_to_dc` — is **`pub(crate)`**
+(`net.rs:168`) with no public equivalent, and `invoke_in_dc` only applies the retry policy. So
+the "safe" raw path fails permanently on precisely the private-channel media this feature
+exists to serve. Meanwhile the panic is conditional: `iter_download` sets `cdn_supported: false`,
+and CDN offload targets *popular public* files. The rare failure beats the common one — and it
+is contained: every chunk fetch runs inside `catch_unwind`, so a CDN redirect degrades to a
+failed stream instead of unwinding through the HTTP handler.
+- 512 KB chunks (Telegram's `MAX_CHUNK_SIZE`), offsets always `index * CHUNK_SIZE` so the
+  4 KB-alignment rule holds by construction. 64-chunk (32 MB) LRU per open lesson, so a short
+  seek backwards is free. Global semaphore of 4 concurrent fetches — Telegram's own clients cap
+  parallel file ops around 4-8 and exceeding it is a documented `FLOOD_WAIT` trigger.
+- `FILE_REFERENCE_*` expiry re-fetches the message for a fresh reference and retries once. This
+  is what lets a student pause overnight and resume without re-importing.
+
+**`server.rs` — hyper on `127.0.0.1`.** hyper + `http-body-util` were already transitive deps of
+Tauri, so this added no new third-party code (axum, which the plan names, would have). Ephemeral
+port, per-run 256-bit token in the path (`/tg/<token>/<chat>/<msg>`); a stale URL from a previous
+run cannot be replayed, and a token mismatch 404s rather than 403s so it is indistinguishable
+from a bad path. **Range correctness is the whole safety story here** — mpv seeks by issuing a
+fresh ranged GET, and `<video>` won't expose a seek bar unless the first response advertises
+`Accept-Ranges`. 11 unit tests pin the forms real clients send: inclusive `bytes=N-M`, suffix
+`bytes=-N` (mp4 clients use it to find a trailing moov atom), clamping past EOF, `416` with
+`bytes */size`, HEAD parity, and short-read re-derivation of `Content-Length` (an over-large
+length leaves the client waiting for bytes that never arrive). Open-ended ranges serve a bounded
+slice, so a 2 GB lecture starts immediately instead of buffering whole.
+
+### 15.7 Phase 6 — player wiring (deliberately the smallest possible diff)
+
+The §12.3 black-frame and §14.13 resume-race regressions both came from **remounting**
+`MpvVideoPlayer`, so the integration was designed to make that structurally impossible:
+resolution happens in **`open_material` (Rust)**, which rewrites `file_path` into the stream URL
+before the DTO ever reaches the frontend.
+
+**No player component was modified — `git status src/components/player/` is empty.** Component
+identity, props, keys, conditional subtrees and the mpv effect graph are all untouched; the
+players receive a different *string*, nothing else. An async resolve step inside `PlayerPage`
+would have reintroduced exactly the remount risk that caused §12.3.
+- mpv needed **zero** changes: it passes `path` straight to `loadfile`, which plays HTTP
+  natively, and never called `convertFileSrc`.
+- The three HTML5-side viewers (`VideoPlayer`, `AudioPlayer`, `PdfViewer`, `ImageViewer`) all
+  funnel through `assetUrl()`, so one guard there — return an `http(s)://` URL untouched instead
+  of mangling it into `asset://` — covers all of them.
+- **CSP:** `media-src` allowed `http://localhost:*` but NOT `http://127.0.0.1:*`, which are
+  different origins to a browser. mpv bypasses CSP entirely, so without this fix video would
+  have worked while the HTML5 fallback and PDF viewer failed *silently*. Added to `media-src`,
+  `connect-src`, `img-src`, `frame-src` and `object-src`.
+- "Open in system player" is hidden for streamed lessons — handing a loopback URL to the OS
+  opens a browser, not a player.
+- Watch progress, notes, bookmarks, the Study Meter and schedule attribution all key on
+  `materials.id` and were already source-agnostic; none of them needed touching.
+
+Verified: `cargo test --lib` **196 passed** (was 176), clippy still **18** (unchanged baseline,
+zero warnings in the new modules), `tsc --noEmit` + `npm run build` clean.
+
+### 15.8 The mid-playback stall — DC round-trip amplification
+
+First live playback froze after ~10 seconds. Diagnosis (verified against grammers 0.10 sources,
+not inferred):
+
+`DownloadIter::next` starts **every** iterator from `session.home_dc_id()` (`files.rs:105`), and
+on `FILE_MIGRATE_X` it updates only a local variable (`files.rs:135`) — `set_home_dc_id` is
+called *exclusively* from the login path (`auth.rs:200,280`), never from a download. Since
+`download_chunk` built a fresh iterator per chunk, **every chunk paid a wasted round trip**: ask
+the home DC, get redirected, ask the real DC. Media commonly lives off-DC, so this was the
+normal case, not an edge one.
+
+Three fixes, in order of effect:
+1. **Cache the resolved `dc_id`** and call `upload.getFile` directly on it. `invoke_in_dc`
+   reuses one live connection per DC (`sender_pool.rs:239-247`), so the fast path is free.
+   The first chunk still goes through `iter_download` — deliberately, because it performs the
+   `copy_auth_to_dc` export/import that a raw call cannot (`copy_auth_to_dc` is `pub(crate)`,
+   `net.rs:168`). `FILE_MIGRATE` or `AUTH_KEY_UNREGISTERED` on the direct path invalidates the
+   cached value and falls back to the iterator, so a wrong guess self-corrects at the cost of
+   one round trip.
+2. **`OPEN_RANGE_SERVE` 1 MB → 8 MB.** This constant sets how often the player must come back
+   for more. mpv fills a large read-ahead cache, so a 1 MB slice meant dozens of HTTP requests
+   (each formerly carrying a wasted redirect) in the first seconds of playback. That
+   amplification is what walked the account into `FLOOD_WAIT`.
+3. **One-chunk sequential read-ahead**, using `try_acquire` — never `acquire`. A prefetch that
+   waited for a permit would compete with the chunk the player is actually blocked on, making
+   playback worse while looking like an optimization.
+
+**Gemini's proposed fix was rejected**, though its core mechanism was right. It suggested caching
+a live `DownloadIter` and reusing it across sequential reads. That type owns its own `offset` and
+advances on `next()`, but ranges arrive from the player in arbitrary order and **concurrently** —
+two tasks sharing one iterator would interleave and receive each other's chunks. Silent video
+corruption is far worse than a stall. Caching an `i32` DC id is immutable data and safe under any
+concurrency. Its claim of "hundreds of errors per second" was also wrong: the global semaphore
+caps concurrent fetches at 4. And the stall is not a silently-dropped connection — `AutoSleep`
+*sleeps* on `FLOOD_WAIT` ≤60 s (`retry_policy.rs:69`), which is precisely what a freeze looks
+like.
+
+**Error handling for real browsing behaviour**, added alongside:
+- **Retry on transient I/O** (1s/2s/4s), not just on flood. Telegram drops idle connections and
+  home wifi blips during a 40-minute lecture; without this, one dropped socket ended playback.
+- **`FLOOD_WAIT` retried up to 3× with the interval Telegram asks for, capped at 45 s** —
+  grammers' own policy gives up after one (`fail_count == 1`), which is exactly when a streaming
+  workload hits its second flood.
+- **Disconnected account is reported honestly.** `open_material` now checks the session before
+  handing back a URL; otherwise a signed-out account produced a valid-looking URL whose every
+  request 404s, and the player showed an unexplained failure.
+- **`reader_for` race fixed.** mpv opens several connections at once, so two concurrent requests
+  for the same lesson both missed the cache, both spent a `resolve_file` round trip, and one
+  reader (with its warmed cache and learned DC) was discarded — doubling requests exactly when
+  playback starts. The lock is now held across creation.
+- **Reader map bounded to 16.** Each holds up to 32 MB of chunks; unbounded growth would
+  accumulate hundreds of megabytes on the 4 GB machines §12 targets.
+
+Verified: `cargo test --lib` **199 passed** (+3: direct-vs-iterator offset parity, bounded
+backoff, flood cap), clippy still 18, `tsc --noEmit` + `npm run build` clean. Still no player
+component modified.
+
+### 15.9 Still owed
 - **LIVE SMOKE TEST (`npm run tauri dev`) — nothing below has run against real Telegram.**
   Everything is compile-, test- and build-verified only. Verify in order: (a) Settings → Plugins
   shows the credentials form, and a bad `api_hash` is rejected next to the field; (b) save real
@@ -1527,11 +1673,41 @@ back to the 18-warning baseline with zero telegram warnings.
   headline fixes); (f) Disconnect, then confirm `tg.session.json` is gone from `app_data_dir`
   and the dot is gray; (g) unplug the network while connected → status should read
   "unreachable", NOT "not connected".
-- **Phase 4+ is unstarted:** `link.rs` / `tg_import_link` / `tg_channel_media`, the `materials`
-  `source` + `tg_*` columns migration, scanner skip, `reader.rs`/`server.rs` streaming, and the
-  `sourceAdapters` manifest contribution (declared in the types, not yet implemented by Telegram).
+- **LIVE SMOKE TEST for Phases 4–6 — the player-regression checks are the important ones.**
+  The whole streaming path is compile-, test- and build-verified only; no byte has moved over a
+  real MTProto connection. Verify in order:
+  1. **Import** a message link from a private channel → the lesson appears in the chosen folder.
+  2. **Re-import the same link** → "Updated … already in your library", and NO duplicate row.
+  3. **Browse channel** with an invite link (`t.me/+…`) on a channel with no username.
+  4. **Play a streamed video** — first frame should appear within a couple of seconds (the
+     open-ended range serves 1 MB, not the whole file).
+  5. **Seek** in that video, forwards and backwards. This is the range-handling proof: a
+     `Content-Range` off by one byte shows up here as a black frame or a dead seek bar.
+  6. **REGRESSION WATCH — toggle fullscreen mid-playback.** §12.3's bug was a black frame from
+     an mpv remount. No player component changed, so this *should* be untouched — confirm it.
+  7. **REGRESSION WATCH — resume.** Watch ~30%, leave, reopen: it must open AT that position
+     with no flash of 0:00 (§14.13's `start=` on `loadfile`).
+  8. **REGRESSION WATCH — play/pause + progress.** Confirm the button state tracks reality and
+     that watch time accrues (Study Meter / activity chart), since `useMediaProgress` and the
+     mpv `time-pos` observer were deliberately not touched.
+  9. **A streamed PDF** — PDF.js range-fetches page by page; this exercises the same server
+     from a different client. Watch for the CSP fix having worked (a `127.0.0.1` block would
+     fail *silently*).
+  10. **Local files must be unaffected** — open a normal local video and PDF and confirm nothing
+      regressed for them. `assetUrl()` is on their path too.
+  11. Restart the app and play a streamed lesson again (fresh token + fresh server bind).
 - **`FLOOD_WAIT` is reported but not enforced.** The message names the wait; nothing prevents the
   user from immediately retrying and extending it. A client-side cooldown belongs with Phase 7
   hardening.
+- **CDN redirect is contained, not handled.** `catch_unwind` turns grammers' panic into a failed
+  stream with an honest message. If it ever fires in practice, the real fix is the
+  `upload.getCdnFile` flow (new DC connection, RSA key verification against
+  `help.getCdnConfig`, per-chunk SHA-256 verification, `reuploadCdnFile` on
+  `cdnFileReuploadNeeded`) — a substantial piece of work, deliberately deferred until there is
+  evidence it's needed for private-channel media.
+- **No prefetch.** Chunks are fetched on demand, so a seek into cold territory waits one round
+  trip. `telegram.md` §5.5 calls for read-ahead; worth adding only if playback actually stutters.
+- **Split/4 GB files (`.001`, `.002`) remain out of scope** (telegram.md issue #10), as does
+  subtitle extraction (Phase 8, explicitly stretch).
 - Telegram's own ACL/capability gating is still declarative only (`capabilities` is documentation,
   not enforcement) — as designed for v1, but it means "enabling" a plugin grants nothing revocable.

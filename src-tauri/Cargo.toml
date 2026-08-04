@@ -45,6 +45,19 @@ tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 grammers-client = "0.10"
 grammers-tl-types = "0.10"
+# `FutureExt::catch_unwind` — contains grammers' CDN-redirect panic inside the chunk fetch so
+# it degrades to a failed stream instead of unwinding through the HTTP handler. Already in the
+# tree transitively via Tauri; named here because we use it directly.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# HTTP/1.1 server for the local streaming endpoint. hyper + http-body-util are already
+# transitive deps of Tauri, so this adds no new third-party code to the supply chain (axum,
+# which telegram.md names, would have).
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# CSPRNG for the stream server's per-run access token. Already transitive; named here
+# because a predictable token would let any local process enumerate the endpoint.
+getrandom = "0.3"
 # `default-features = false` drops the `sqlite-storage` feature, and with it `libsql`.
 #
 # This is NOT a size optimization — it is required for the app to run. libsql bundles its own

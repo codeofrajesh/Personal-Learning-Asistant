@@ -31,13 +31,63 @@ pub struct PlayerView {
 /// sibling materials in the same chapter for the sidebar. Also stamps
 /// `last_opened_at = now` (inside `material_for_player`) so Continue-Learning recency
 /// updates. `NotFound` if the id doesn't exist.
+///
+/// **Source resolution (v11).** For a `source = 'telegram'` row, `file_path` holds a synthetic
+/// `tg://<chat>/<msg>` key rather than a real path. It is rewritten here into a
+/// `http://127.0.0.1:<port>/tg/<token>/<chat>/<msg>` stream URL *before* the DTO leaves the
+/// backend.
+///
+/// Resolving here rather than in the frontend is a deliberate safety decision. Every player
+/// already consumes `material.file_path`, so this changes only the *string* they receive — no
+/// component identity, prop shape, conditional subtree, key or effect dependency changes.
+/// That matters because remounting `MpvVideoPlayer` is exactly what caused the §12.3
+/// black-frame regression, and an async resolve step inside `PlayerPage` would have
+/// reintroduced that risk. Local materials pass through untouched.
 #[tauri::command]
-pub fn open_material(db: State<'_, Db>, material_id: i64) -> AppResult<PlayerView> {
-    db.with(|conn| {
+pub async fn open_material(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    server: State<'_, crate::plugins::telegram::server::TgServer>,
+    material_id: i64,
+) -> AppResult<PlayerView> {
+    let mut view = db.with(|conn| {
         let material = queries::material_for_player(conn, material_id)?;
         let siblings = queries::list_materials(conn, material.chapter_id)?;
         Ok(PlayerView { material, siblings })
-    })
+    })?;
+
+    if view.material.source == "telegram" {
+        let (Some(chat), Some(message)) = (view.material.tg_chat_id, view.material.tg_message_id)
+        else {
+            return Err(crate::utils::errors::AppError::NotFound(
+                "This Telegram lesson is missing its message reference. Re-import it.".into(),
+            ));
+        };
+
+        // Check the session BEFORE handing back a URL. Without this, a signed-out account
+        // yields a perfectly valid-looking URL whose every request 404s, and the player shows
+        // an unexplained load failure — the student has no way to know the real cause is that
+        // Telegram disconnected. `PlayerPage` renders this message directly.
+        let connected = {
+            use tauri::Manager;
+            app.state::<crate::plugins::telegram::session::TgState>()
+                .get_client()
+                .await
+                .is_some()
+        };
+        if !connected {
+            return Err(crate::utils::errors::AppError::Other(
+                "This lesson streams from Telegram, which isn't connected. Open Plugins → Telegram to reconnect.".into(),
+            ));
+        }
+
+        // Binds a loopback socket on first use, then returns the same base for the app's
+        // lifetime — so a URL held by a mounted player can never go stale.
+        let base = server.ensure_started(app).await?;
+        view.material.file_path = format!("{base}/{chat}/{message}");
+    }
+
+    Ok(view)
 }
 
 /// Persist watch progress (called on pause / seek / finish + a periodic safety flush).

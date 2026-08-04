@@ -1451,6 +1451,14 @@ pub struct PlayerMaterial {
     pub position_secs: f64,
     pub is_completed: bool,
     pub is_bookmarked: bool,
+    /// Where the bytes live: `'local'` (a real file at `file_path`) or `'telegram'` (v11).
+    ///
+    /// `open_material` uses this to rewrite `file_path` into a playable stream URL before the
+    /// DTO ever reaches the frontend, so every player stays source-agnostic.
+    pub source: String,
+    /// Telegram identity, present only when `source = 'telegram'`.
+    pub tg_chat_id: Option<i64>,
+    pub tg_message_id: Option<i64>,
 }
 
 /// Fetch everything a player needs to open + resume a material. Also stamps
@@ -1464,7 +1472,8 @@ pub fn material_for_player(conn: &Connection, material_id: i64) -> AppResult<Pla
                 a.chapter_id, a.chapter_name, a.subject_id, a.subject_name,
                 a.goal_id, a.goal_name,
                 COALESCE(wp.position_secs, 0.0),
-                m.is_completed, m.is_bookmarked
+                m.is_completed, m.is_bookmarked,
+                m.source, m.tg_chat_id, m.tg_message_id
              FROM materials m
              JOIN mat_anc a ON a.mid = m.id
              LEFT JOIN watch_progress wp ON wp.material_id = m.id
@@ -1492,6 +1501,9 @@ pub fn material_for_player(conn: &Connection, material_id: i64) -> AppResult<Pla
                     position_secs: r.get(13)?,
                     is_completed: r.get::<_, i64>(14)? != 0,
                     is_bookmarked: r.get::<_, i64>(15)? != 0,
+                    source: r.get(16)?,
+                    tg_chat_id: r.get(17)?,
+                    tg_message_id: r.get(18)?,
                 })
             },
         )

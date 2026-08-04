@@ -383,6 +383,16 @@ export interface PlayerMaterial {
   position_secs: number;
   is_completed: boolean;
   is_bookmarked: boolean;
+  /**
+   * Where the bytes live: `"local"` or `"telegram"` (v11).
+   *
+   * `file_path` is ALREADY resolved by `open_material` — a Telegram row arrives as an
+   * `http://127.0.0.1:…` stream URL, not the stored `tg://` key. This field is for UI hints
+   * (e.g. a "streamed" badge), never for deciding how to load the media.
+   */
+  source: string;
+  tg_chat_id: number | null;
+  tg_message_id: number | null;
 }
 
 /** One player load: the material + its sibling materials for the chapter sidebar. */

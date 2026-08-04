@@ -625,6 +625,13 @@ export const ipc = {
  */
 export function assetUrl(path: string): string {
   if (!isTauri()) return "";
+  // Already a URL the WebView can fetch directly. A plugin-sourced material (Telegram, v11)
+  // arrives from `open_material` pre-resolved as `http://127.0.0.1:<port>/tg/…`;
+  // `convertFileSrc` would treat that as a filesystem path and mangle it into an unusable
+  // `asset://` URL, which surfaces as a silent "media not supported". Every viewer
+  // (VideoPlayer / AudioPlayer / PdfViewer / ImageViewer) funnels through here, so this one
+  // guard covers all of them while leaving local paths untouched.
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
   return convertFileSrc(path);
 }
 

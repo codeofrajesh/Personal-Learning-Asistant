@@ -325,10 +325,14 @@ export default function PlayerPage() {
                     title="M">
                     {completed ? "✓ Completed" : "Mark complete"}
                   </button>
-                  <button type="button" onClick={() => void ipc.openInSystemPlayer(material.file_path)}
-                    className="rounded-btn border border-white/10 px-3 py-1.5 text-xs font-medium text-content-secondary transition-colors hover:bg-white/[0.05]">
-                    ⤴ Open in system player
-                  </button>
+                  {/* Streamed lessons have no file on disk — `file_path` is a loopback URL,
+                      so handing it to the OS would open a browser, not a player. */}
+                  {material.source !== "telegram" && (
+                    <button type="button" onClick={() => void ipc.openInSystemPlayer(material.file_path)}
+                      className="rounded-btn border border-white/10 px-3 py-1.5 text-xs font-medium text-content-secondary transition-colors hover:bg-white/[0.05]">
+                      ⤴ Open in system player
+                    </button>
+                  )}
                 </div>
                 <p className="mt-4 text-sm leading-relaxed text-content-secondary">
                   {material.goal_name} · {material.subject_name} · {material.chapter_name}

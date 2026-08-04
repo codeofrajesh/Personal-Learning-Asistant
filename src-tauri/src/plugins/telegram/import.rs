@@ -404,7 +404,7 @@ async fn prime_peer_cache(client: &Client) {
 /// the session for the hash and send a `PeerRef` that actually carries it.
 ///
 /// Order matters: check the cache first (free), and only walk the dialog list if that misses.
-async fn resolve_peer_ref(
+pub async fn resolve_peer_ref(
     client: &Client,
     session: &FileSession,
     peer: PeerRef,
