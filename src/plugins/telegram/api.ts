@@ -72,6 +72,27 @@ export interface TgImportResult {
   node_id: number;
 }
 
+/** One material from the Telegram import history (`tg_import_history`). */
+export interface TgImportedMaterial {
+  material_id: number;
+  node_id: number;
+  /** "Goal / Subject / Chapter" ancestry path, root-first. */
+  node_path: string;
+  file_name: string;
+  file_type: string;
+  file_extension: string;
+  duration_secs: number | null;
+  file_size_bytes: number;
+  /** 0-100 watch completion from `watch_progress`. */
+  progress_pct: number;
+  is_completed: boolean;
+  is_bookmarked: boolean;
+  /** ISO `last_opened_at`, or null if never opened. */
+  last_opened_at: string | null;
+  tg_chat_id: number | null;
+  tg_message_id: number | null;
+}
+
 /** The `tg_*` command surface. */
 export const tg = {
   /** Read the saved api_id + whether an api_hash is stored. */
@@ -126,6 +147,14 @@ export const tg = {
    */
   async channelMedia(url: string, limit?: number): Promise<TgMediaItem[]> {
     return invokeCommand("tg_channel_media", { url, limit: limit ?? null });
+  },
+
+  /**
+   * List materials previously imported from Telegram, newest-first.
+   * Read-only; safe to call frequently for filter/sort.
+   */
+  async importHistory(limit?: number): Promise<TgImportedMaterial[]> {
+    return invokeCommand("tg_import_history", { limit: limit ?? null });
   },
 };
 

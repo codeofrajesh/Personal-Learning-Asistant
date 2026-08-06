@@ -27,6 +27,7 @@ use crate::plugins::telegram::link::{
 };
 use crate::plugins::telegram::session::{FileSession, TgState};
 use crate::utils::errors::{AppError, AppResult};
+use rusqlite::Connection;
 
 /// One importable media message.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -604,10 +605,126 @@ pub async fn tg_channel_media(
     Ok(items)
 }
 
+/// One row of the "Since you imported from Telegram" library view.
+///
+/// Read-only by construction: this is a plain `materials` read — no session, no network,
+/// no writes. The folder ancestry is flattened (root-first) so the UI can render a
+/// Goal ▸ Subject ▸ Chapter breadcrumb from a single round trip.
+#[derive(Debug, serde::Serialize)]
+pub struct TgImportedMaterial {
+    pub material_id: i64,
+    pub node_id: i64,
+    /// "Goal / Subject / Chapter" ancestry, root-first.
+    pub node_path: String,
+    pub file_name: String,
+    pub file_type: String,
+    pub file_extension: String,
+    pub duration_secs: Option<f64>,
+    pub file_size_bytes: i64,
+    /// 0-100 watch completion from `watch_progress` (0 for a never-opened file).
+    pub progress_pct: f64,
+    pub is_completed: bool,
+    pub is_bookmarked: bool,
+    /// ISO `last_opened_at`, or null if the file was never opened in the player.
+    pub last_opened_at: Option<String>,
+    pub tg_chat_id: Option<i64>,
+    pub tg_message_id: Option<i32>,
+}
+
+/// Root-first slash path for a node (its name plus every ancestor).
+fn ancestry_path(conn: &Connection, node_id: i64) -> AppResult<String> {
+    let names = node_ancestor_names(conn, node_id)?;
+    let path = names.join(" / ");
+    Ok(if path.is_empty() {
+        "Library".to_string()
+    } else {
+        path
+    })
+}
+
+/// Collect a node's own name + all ancestor names, root-first (or an empty vec when the
+/// node doesn't exist).
+fn node_ancestor_names(conn: &Connection, node_id: i64) -> AppResult<Vec<String>> {
+    let mut names = Vec::new();
+    let mut current: Option<i64> = Some(node_id);
+    let mut guard = 0u32;
+    while let Some(id) = current {
+        guard += 1;
+        if guard > 1000 {
+            break; // cycle guard — the graph is a tree, but never trust that blindly
+        }
+        let row = conn.query_row(
+            "SELECT id, parent_id, name FROM nodes WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, String>(2)?)),
+        )?;
+        let (_, parent, name) = row;
+        names.push(name);
+        current = parent;
+    }
+    names.reverse();
+    Ok(names)
+}
+
+/// List the materials previously imported from Telegram, newest-first.
+///
+/// Richens each row with its watch progress (so a student can resume exactly where they
+/// left off) and its folder ancestry (so the list can say where each lesson lives).
+/// `limit` clamps the list; the UI drives sorting/filtering client-side, so the backend
+/// only does the WHERE + the bounded fetch.
+#[tauri::command]
+pub fn tg_import_history(
+    db: State<'_, Db>,
+    limit: Option<u32>,
+) -> AppResult<Vec<TgImportedMaterial>> {
+    let limit = limit.unwrap_or(200).clamp(1, 1000) as usize;
+
+    db.with(move |conn| {
+        let sql = r#"
+            SELECT m.id, m.node_id, m.file_name, m.file_type, m.file_extension,
+                   m.duration_secs, m.file_size_bytes,
+                   COALESCE(wp.completion_pct, 0.0)                 AS progress_pct,
+                   COALESCE(wp.completed, 0)                        AS is_completed,
+                   COALESCE(m.is_bookmarked, 0)                     AS is_bookmarked,
+                   m.last_opened_at,
+                   m.tg_chat_id, m.tg_message_id
+            FROM materials m
+            LEFT JOIN watch_progress wp ON wp.material_id = m.id
+            WHERE m.source = 'telegram'
+            ORDER BY COALESCE(m.last_opened_at, m.created_at) DESC
+            LIMIT ?1
+        "#;
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok(TgImportedMaterial {
+                material_id: r.get(0)?,
+                node_id: r.get(1)?,
+                node_path: String::new(), // filled below
+                file_name: r.get(2)?,
+                file_type: r.get(3)?,
+                file_extension: r.get(4)?,
+                duration_secs: r.get(5)?,
+                file_size_bytes: r.get(6)?,
+                progress_pct: r.get(7)?,
+                is_completed: r.get(8)?,
+                is_bookmarked: r.get(9)?,
+                last_opened_at: r.get(10)?,
+                tg_chat_id: r.get(11)?,
+                tg_message_id: r.get(12)?,
+            })
+        })?;
+        let mut items = Vec::with_capacity(limit.min(64));
+        for row in rows {
+            let mut item = row?;
+            item.node_path = ancestry_path(conn, item.node_id)?;
+            items.push(item);
+        }
+        Ok(items)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn classifies_by_extension_first() {
         // The extension is what the player's routing already understands, and Telegram sets
