@@ -27,13 +27,14 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use grammers_client::media::{Downloadable, Media};
 use grammers_client::session::types::PeerRef;
 use grammers_client::session::Session;
 use grammers_client::{tl, Client, InvocationError};
+use tauri::Emitter;
 use tokio::sync::Mutex;
 
 use crate::plugins::telegram::auth::map_invocation;
@@ -133,10 +134,37 @@ pub struct TgReader {
     /// Our own handle to the session, for `home_dc_id()`. grammers keeps `Client.session`
     /// private, but we construct the session, so we can read it directly.
     session: Arc<FileSession>,
+    /// Emitter handle, for `tg://stream-fatal` health events when retries are exhausted.
+    app: tauri::AppHandle,
+    /// Accrued FloodWait seconds across all chunks of this file (anti-ban budget).
+    flood_wait_accumulator: Mutex<u32>,
+    /// Last time a FloodWait was honored, to enforce the session-level cooldown.
+    last_flood_wait_at: Mutex<Option<Instant>>,
 }
 
 /// Telegram's `FILE_MIGRATE_X` status code — the file lives on a different datacenter.
 const FILE_MIGRATE_CODE: i32 = 303;
+
+/// Hard ceiling on total FloodWait seconds per file — prevents one sticky file from
+/// burning the session's entire rate limit budget.
+const MAX_TOTAL_FLOOD_WAIT_PER_FILE: u32 = 120;
+
+/// Session-level cooldown after ANY FloodWait — spaces out retries across files to
+/// avoid triggering MTProto spam/DDoS flags.
+const FLOOD_WAIT_SESSION_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Event emitted to the frontend when a stream fails fatally (retries exhausted).
+/// Frontend listens on `tg://stream-fatal` and matches by chat_id/message_id.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamFatalEvent {
+    FloodWaitExhausted { chat_id: i64, message_id: i32, total_waited_secs: u32 },
+    IoExhausted { chat_id: i64, message_id: i32, attempts: u32 },
+    AuthExpiredUnrecoverable { chat_id: i64, message_id: i32 },
+    NotFound { chat_id: i64, message_id: i32 },
+    DcMigrationFailed { chat_id: i64, message_id: i32 },
+    ConnectionTimeout { chat_id: i64, message_id: i32 },
+}
 
 impl TgReader {
     pub fn new(
@@ -145,6 +173,7 @@ impl TgReader {
         file: TgFile,
         semaphore: Arc<tokio::sync::Semaphore>,
         session: Arc<FileSession>,
+        app: tauri::AppHandle,
     ) -> Self {
         Self {
             client,
@@ -156,6 +185,9 @@ impl TgReader {
             auth_ready: Mutex::new(false),
             in_flight: Mutex::new(Vec::new()),
             session,
+            app,
+            flood_wait_accumulator: Mutex::new(0),
+            last_flood_wait_at: Mutex::new(None),
         }
     }
 
@@ -165,6 +197,56 @@ impl TgReader {
 
     pub async fn mime(&self) -> String {
         self.file.lock().await.mime.clone()
+    }
+
+    /// Emit a fatal health event for this stream. Best-effort: never fails the caller.
+    /// The frontend listens on `tg://stream-fatal` and, when the IDs match the video it is
+    /// playing, transitions the Smart Watchdog straight to its fatal state.
+    fn emit_fatal(&self, event: StreamFatalEvent) {
+        // Snapshot the identity once; the event is built in the caller with these values so
+        // keying the listener match on them is safe even if the file is swapped underneath.
+        let _ = self.app.emit("tg://stream-fatal", &event);
+    }
+
+    /// Convert an exhausted `InvocationError` into the matching fatal event and emit it.
+    /// Only called when the retry budget is spent (see `download_chunk`).
+    async fn emit_fatal_for(&self, err: &InvocationError, attempts: u32) {
+        let identity = {
+            let file = self.file.lock().await;
+            (file.chat_id, file.message_id)
+        };
+        let (chat_id, message_id) = identity;
+        let event = match err {
+            InvocationError::Rpc(rpc) if rpc.code == 420 => StreamFatalEvent::FloodWaitExhausted {
+                chat_id,
+                message_id,
+                total_waited_secs: *self.flood_wait_accumulator.lock().await,
+            },
+            InvocationError::Rpc(rpc) if rpc.name.starts_with("FILE_REFERENCE") => {
+                StreamFatalEvent::AuthExpiredUnrecoverable { chat_id, message_id }
+            }
+            InvocationError::Rpc(rpc) if rpc.code == 404 => StreamFatalEvent::NotFound {
+                chat_id,
+                message_id,
+            },
+            InvocationError::Rpc(rpc) if rpc.code == FILE_MIGRATE_CODE => {
+                StreamFatalEvent::DcMigrationFailed { chat_id, message_id }
+            }
+            InvocationError::Io(_) => StreamFatalEvent::IoExhausted {
+                chat_id,
+                message_id,
+                attempts,
+            },
+            // A non-categorized failure (unexpected RPC / unknown) still surfaces so the
+            // player learns the stream died rather than hanging on a frozen timer.
+            _ => StreamFatalEvent::IoExhausted {
+                chat_id,
+                message_id,
+                attempts,
+            },
+        };
+        log::warn!("telegram: stream-fatal: {event:?}");
+        self.emit_fatal(event);
     }
 
     /// Read `len` bytes starting at `offset`, clamped to the end of the file.
@@ -355,6 +437,12 @@ impl TgReader {
     /// **Transient I/O.** Telegram drops idle connections routinely, and a home wifi blip is a
     /// normal event during a 40-minute lecture. Without a retry here, one dropped socket ends
     /// playback and the student has to reopen the lesson.
+    ///
+    /// **Smart Watchdog (2026).** When the retry budget is exhausted this emits a
+    /// `tg://stream-fatal` event instead of returning silently, so the frontend can show the
+    /// student a real error instead of a player that appears frozen. Anti-ban: FloodWait
+    /// sleeps accrue to a per-file budget, and a session cooldown is enforced between them so
+    /// retries can't look like an MTProto spam/DDoS burst.
     async fn download_chunk(&self, index: u64) -> Result<Vec<u8>, InvocationError> {
         const MAX_RETRIES: u32 = 3;
         /// Longer than this and the student is better served by an honest error than by a
@@ -365,6 +453,7 @@ impl TgReader {
         loop {
             let result = self.fetch_once(index).await;
 
+            let is_flood = matches!(&result, Err(InvocationError::Rpc(rpc)) if rpc.code == 420);
             let wait_secs = match &result {
                 Err(InvocationError::Rpc(rpc)) if rpc.code == 420 => {
                     Some(rpc.value.unwrap_or(1).min(MAX_FLOOD_WAIT_SECS))
@@ -374,6 +463,26 @@ impl TgReader {
                 _ => None,
             };
 
+            // Anti-ban: a FloodWait that would blow the per-file budget is a hard stop, not
+            // one more retry — the frontend must be told rather than left waiting forever.
+            if is_flood {
+                let mut acc = self.flood_wait_accumulator.lock().await;
+                let wait = wait_secs.unwrap_or(MAX_FLOOD_WAIT_SECS);
+                if attempt < MAX_RETRIES && *acc + wait > MAX_TOTAL_FLOOD_WAIT_PER_FILE {
+                    log::warn!(
+                        "telegram: flood-wait budget exhausted for this file ({}s accrued); giving up",
+                        *acc
+                    );
+                    let err = match result {
+                        Err(e) => e,
+                        Ok(_) => unreachable!("is_flood implies Err"),
+                    };
+                    self.emit_fatal_error(&err, attempt + 1).await;
+                    return Err(err);
+                }
+                *acc += wait;
+            }
+
             match wait_secs {
                 Some(wait) if attempt < MAX_RETRIES => {
                     attempt += 1;
@@ -381,11 +490,40 @@ impl TgReader {
                         "telegram: chunk {index} failed ({}), retrying in {wait}s ({attempt}/{MAX_RETRIES})",
                         result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
                     );
+
+                    // Anti-ban: enforce the session-level cooldown between floods so retries
+                    // across files are spaced out instead of bursting.
+                    if is_flood {
+                        let mut last = self.last_flood_wait_at.lock().await;
+                        if let Some(prev) = *last {
+                            let since = prev.elapsed();
+                            if since < FLOOD_WAIT_SESSION_COOLDOWN {
+                                tokio::time::sleep(FLOOD_WAIT_SESSION_COOLDOWN - since).await;
+                            }
+                        }
+                        *last = Some(Instant::now());
+                    }
+
                     tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
                 }
-                _ => return result,
+                _ => {
+                    // Retries exhausted (or a non-retryable error). Tell the frontend its
+                    // stream just died so it can fail honestly instead of guessing on a timer.
+                    let err = match result {
+                        Err(e) => e,
+                        Ok(bytes) => return Ok(bytes),
+                    };
+                    self.emit_fatal_error(&err, attempt).await;
+                    return Err(err);
+                }
             }
         }
+    }
+
+    /// Emit the fatal event matching `err`. Kept as a thin async wrapper so the retry
+    /// loop's borrow of `result` stays clean.
+    async fn emit_fatal_error(&self, err: &InvocationError, attempts: u32) {
+        self.emit_fatal_for(err, attempts).await;
     }
 
     /// A single `upload.getFile` attempt for chunk `index`, under a hard timeout.

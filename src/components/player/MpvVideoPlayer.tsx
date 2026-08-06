@@ -17,7 +17,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { AlertCircle, PictureInPicture2 } from "lucide-react";
+import { AlertCircle, PictureInPicture2, WifiOff, RefreshCw } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
   command,
@@ -56,6 +56,104 @@ import {
   ExternalLinkIcon,
 } from "./PremiumIcons";
 
+/** Backend fatal event shape — must match `StreamFatalEvent` in reader.rs. */
+export interface TgStreamFatal {
+  type: "flood_wait_exhausted" | "io_exhausted" | "auth_expired_unrecoverable" | "not_found" | "dc_migration_failed" | "connection_timeout";
+  chat_id: number;
+  message_id: number;
+  // Variant-specific fields (optional to keep the union flat for TS).
+  total_waited_secs?: number;
+  attempts?: number;
+}
+
+/** Configurable timeouts — exported for testability, not for tuning in prod. */
+const ENGINE_STALL_SECS = 8;      // No position advance, NOT buffering → engine crash
+const NETWORK_TIMEOUT_SECS = 60;  // paused-for-cache with no cached data → network timeout
+
+/** Shared error overlay chrome (used by both engine + network fatal states). */
+function WatchdogOverlay({
+  icon,
+  title,
+  message,
+  actionLabel,
+  onAction,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  message: string;
+  actionLabel: string;
+  onAction: () => void;
+}) {
+  return (
+    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 p-6 text-center text-white backdrop-blur-md">
+      <div className="mb-4 rounded-full bg-orange-500/20 p-4">{icon}</div>
+      <p className="mb-2 text-xl font-medium tracking-tight">{title}</p>
+      <p className="mb-6 max-w-md text-sm text-neutral-400">{message}</p>
+      <button
+        type="button"
+        onClick={onAction}
+        className="rounded-full bg-white/10 px-6 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
+      >
+        {actionLabel}
+      </button>
+    </div>
+  );
+}
+
+/** Overlay for a backend `tg://stream-fatal` event — distinct copy per failure mode. */
+function BackendFatalOverlay({ event, onRetry }: { event: TgStreamFatal; onRetry: () => void }) {
+  const { type } = event;
+  let title = "Stream Failed";
+  let message = "The Telegram stream stopped unexpectedly.";
+  let showRetry = true;
+
+  switch (type) {
+    case "flood_wait_exhausted":
+      title = "Telegram Rate Limited";
+      message = `Telegram asked us to slow down and the wait exceeded our budget (${event.total_waited_secs ?? 0}s). Please wait a few minutes and try again.`;
+      break;
+    case "io_exhausted":
+      title = "Connection Failed";
+      message = `Lost the connection to Telegram after ${event.attempts ?? 3} tries. This can be a temporary network blip.`;
+      break;
+    case "auth_expired_unrecoverable":
+      title = "Session Expired";
+      message = "Your Telegram session expired and could not be refreshed. Re-import this lesson to continue.";
+      break;
+    case "not_found":
+      title = "File Unavailable";
+      message = "This Telegram message was deleted or is no longer accessible. Re-import or remove it from your Library.";
+      showRetry = false;
+      break;
+    case "dc_migration_failed":
+      title = "Storage Moved";
+      message = "Telegram relocated this file and auto-rediscovery failed. Please retry, or re-import the lesson.";
+      break;
+    default: // connection_timeout
+      title = "Connection Timed Out";
+      message = "Telegram did not respond in time. Check your connection and try again.";
+  }
+
+  return (
+    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 p-6 text-center text-white backdrop-blur-md">
+      <div className="mb-4 rounded-full bg-orange-500/20 p-4">
+        <WifiOff className="h-8 w-8 text-orange-500" />
+      </div>
+      <p className="mb-2 text-xl font-medium tracking-tight">{title}</p>
+      <p className="mb-6 max-w-md text-sm text-neutral-400">{message}</p>
+      {showRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="inline-flex items-center gap-2 rounded-full bg-white/10 px-6 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
+        >
+          <RefreshCw className="h-4 w-4" /> Retry
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Quick-pick speeds. Granular values come from `[`/`]` — see `lib/playbackRate`. */
 const SPEEDS = SPEED_PRESETS;
 
@@ -82,6 +180,17 @@ const OBSERVED_PROPERTIES = [
   ["volume", "int64"],
   ["speed", "double"],
   ["eof-reached", "flag"],
+  // ── Smart Watchdog (2026) — buffering detection ──
+  // MPV sets `paused-for-cache = true` when it pauses BECAUSE the network cache is empty —
+  // the core signal that separates "engine crashed / stalled" from "video is buffering".
+  // A stalled engine keeps playing-paused with the cache full; a starving stream sets this.
+  ["paused-for-cache", "flag", "none"],
+  // Seconds of playable content buffered ahead. ~0 while waiting on a slow Telegram stream;
+  // a healthy value while the engine is merely stalled after OS sleep. Lets the watchdog
+  // distinguish "waiting for bytes" from "engine died" even when paused-for-cache is stale.
+  ["demuxer-cache-duration", "double", "none"],
+  // Full cache metadata ({fw, bw, file-cache-bytes…}). Reserved for future buffering UX.
+  ["demuxer-cache-state", "node", "none"],
 ] as const satisfies MpvObservableProperty[];
 
 interface Props {
@@ -95,9 +204,14 @@ interface Props {
   onFail?: () => void;
   /** Custom navigation handler for PiP button, to avoid getting stuck in player history. */
   onPip?: () => void;
+  /** Telegram chat id when this is a streamed lesson (else null). Lets the Smart Watchdog
+   *  match backend `tg://stream-fatal` events for THIS file only. */
+  telegramChatId?: number | null;
+  /** Telegram message id — pairs with `telegramChatId` for fatal-event matching. */
+  telegramMessageId?: number | null;
 }
 
-export default function MpvVideoPlayer({ path, materialId, startPosition, fileName, onFail, onPip }: Props) {
+export default function MpvVideoPlayer({ path, materialId, startPosition, fileName, onFail, onPip, telegramChatId, telegramMessageId }: Props) {
   const navigate = useNavigate();
   const setMiniActive = useMiniPlayer((s) => s.setActive);
   // The transparent "anchor" div — mpv renders to the OS window behind the webview,
@@ -164,50 +278,137 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // ── Watchdog Timer (Bug 2 fix for OS sleep/resume) ──────────────────────────
-  const [engineStalled, setEngineStalled] = useState(false);
-  const watchdogBaselineRef = useRef<{ wall: number, pos: number, duration: number } | null>(null);
+  // ── Smart Watchdog (2026) — engine crash vs. network buffering ─────────────
+  //
+  // The old watchdog checked only "did `time-pos` move in 8s". That is blind to the network:
+  // a slow Telegram stream fills up quietly, `/politely` pauses for cache, and the playhead
+  // stops — exactly what the timer mistook for an engine crash after OS sleep. So this one
+  // listens to MPV's OWN buffering signal (`paused-for-cache`) and the engine's cached
+  // duration, and only runs the 8s engine-crash timer when the engine is NOT buffering.
+  //
+  //   playing    --(paused-for-cache=true)--> buffering     --(60s no data)--> network_timeout
+  //   buffering  --(paused-for-cache=false)--> playing      (timer cancelled)
+  //   playing    --(8s no progress, NOT buffering)--> engine_crash
+  //   [any]      --(tg://stream-fatal matching this file)--> backend_fatal
+  //
+  // Buffering may legitimately last longer than 8s (slow connection); that must NEVER fire
+  // the crash path. But it must not hang forever either — hence the separate 60s cap. The
+  // backend also pushes `tg://stream-fatal` the moment IT gives up (FloodWait / IO budgets
+  // exhausted), so genuine failures skip the timers entirely.
+  type WatchdogState =
+    | { kind: "idle" }
+    | { kind: "playing"; baseline: { wall: number; pos: number } }
+    | { kind: "buffering"; since: number }
+    | { kind: "engine_crash" }
+    | { kind: "network_timeout" }
+    | { kind: "backend_fatal"; event: TgStreamFatal };
+  const [watchdog, setWatchdogState] = useState<WatchdogState>({ kind: "idle" });
+  const watchdogRef = useRef<WatchdogState>({ kind: "idle" });
+  // Refs mirroring the mpv buffering signals (written by the observer; read on the 1s tick).
+  const pausedForCacheRef = useRef(false);
+  const demuxCacheDurationRef = useRef(0);
+  // True the instant a fatal state is entered, so the interval breaks out of the tick loop.
+  const watchdogFatalRef = useRef(false);
 
+  // Single write-point for the watchdog: keeps the ref (read by the 1s tick) and the React
+  // state (rendered) in lockstep, and flips the fatal flag so the tick stops polling.
+  const setWatchDog = (next: WatchdogState) => {
+    watchdogRef.current = next;
+    setWatchdogState(next);
+    watchdogFatalRef.current =
+      next.kind === "engine_crash" || next.kind === "network_timeout" || next.kind === "backend_fatal";
+  };
+
+  // One interval drives both timers. Health = the position moves while (not buffering) OR the
+  // buffer refills while buffering. On pause/drag/seek the machine returns to idle.
   useEffect(() => {
     if (!ready || !path) return;
     const interval = window.setInterval(() => {
-      if (disposedRef.current) return;
-      
-      // If we haven't loaded yet or it's genuinely paused/dragging, reset watchdog
-      if (isPausedRef.current || draggingRef.current) {
-        watchdogBaselineRef.current = null;
-        return;
-      }
+      if (disposedRef.current || watchdogFatalRef.current) return;
 
       const now = performance.now();
       const pos = timePosRef.current;
-      const dur = durationRef.current;
+      const buffering = pausedForCacheRef.current;
 
-      const baseline = watchdogBaselineRef.current;
+      // Genuinely paused / user dragging: not engine failure, not buffering — idle.
+      if (isPausedRef.current || draggingRef.current) {
+        const cur = watchdogRef.current;
+        if (cur.kind === "playing" || cur.kind === "buffering") setWatchDog({ kind: "idle" });
+        return;
+      }
+
+      // ── Buffering branch ─────────────────────────────────────────────────
+      if (buffering) {
+        const cur = watchdogRef.current;
+        if (cur.kind !== "buffering") {
+          // Left playing → entered buffering. Start the network clock. The engine-crash
+          // baseline is implicitly abandoned (we only act on "playing"). 
+          setWatchDog({ kind: "buffering", since: now });
+          return;
+        }
+        if (demuxCacheDurationRef.current > 0) {
+          // Some playable content is cached again. mpv will flip paused-for-cache off once it
+          // has enough; a slow-but-alive stream must not be falsely timed out, so restart the
+          // buffering clock rather than counting against the cap.
+          setWatchDog({ kind: "buffering", since: now });
+          return;
+        }
+        const bufferedFor = (now - cur.since) / 1000;
+        if (bufferedFor >= NETWORK_TIMEOUT_SECS) {
+          // eslint-disable-next-line no-console
+          console.error("[MpvVideoPlayer] Smart Watchdog: buffered without data for", bufferedFor, "s");
+          setWatchDog({ kind: "network_timeout" });
+        }
+        return;
+      }
+
+      // ── Not buffering ──
+      const cur = watchdogRef.current;
+      const baseline = cur.kind === "playing" ? cur.baseline : null;
       if (!baseline) {
-        watchdogBaselineRef.current = { wall: now, pos, duration: dur };
+        setWatchDog({ kind: "playing", baseline: { wall: now, pos } });
         return;
       }
 
       const elapsedWall = (now - baseline.wall) / 1000;
-      
-      // Local files should never buffer for 8 seconds. If position hasn't moved 
-      // or duration is still 0, the engine (hwdec/audio) crashed after OS sleep.
-      if (elapsedWall >= 8.0) {
-        if (dur === 0 || pos === baseline.pos) {
-          // eslint-disable-next-line no-console
-          console.error("[MpvVideoPlayer] Watchdog detected engine stall! elapsed:", elapsedWall, "pos:", pos, "dur:", dur);
-          setEngineStalled(true);
-          window.clearInterval(interval);
-        } else {
-          // Healthy, update baseline
-          watchdogBaselineRef.current = { wall: now, pos, duration: dur };
-        }
+      if (elapsedWall < ENGINE_STALL_SECS) return;
+
+      if (pos === baseline.pos) {
+        // Position hasn't moved and MPV says it isn't buffering → the engine (hwdec/audio)
+        // truly stalled (e.g. after OS sleep). paused-for-cache already ruled out a network
+        // stall, so this is the real crash path.
+        // eslint-disable-next-line no-console
+        console.error("[MpvVideoPlayer] Smart Watchdog: engine stall after", elapsedWall, "s; pos:", pos);
+        setWatchDog({ kind: "engine_crash" });
+      } else {
+        // Healthy — position moved. Roll the baseline forward.
+        setWatchDog({ kind: "playing", baseline: { wall: now, pos } });
       }
     }, 1000);
 
     return () => window.clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, path]);
+
+  // Backend-driven fatal: `tg://stream-fatal` from reader.rs. Matches by chat+message id so
+  // events for OTHER lessons still playing in a background engine are ignored.
+  const isTelegramStream = telegramChatId != null && telegramMessageId != null;
+  useEffect(() => {
+    if (!isTauri() || !isTelegramStream) return;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/event").then(({ listen }) => {
+      listen<TgStreamFatal>("tg://stream-fatal", (event) => {
+        if (disposedRef.current || watchdogFatalRef.current) return;
+        const p = event.payload;
+        if (p.chat_id !== telegramChatId || p.message_id !== telegramMessageId) return;
+        // eslint-disable-next-line no-console
+        console.error("[MpvVideoPlayer] backend stream-fatal:", p);
+        setWatchDog({ kind: "backend_fatal", event: p });
+      }).then((u) => { unlisten = u; });
+    });
+    return () => { unlisten?.(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isTelegramStream, telegramChatId, telegramMessageId]);
 
   const callOnFail = useCallback(
     (reason: string) => {
@@ -427,6 +628,23 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
                 drainSession();
               }
               break;
+            case "paused-for-cache": {
+              // MPV sets this to true when playback pauses BECAUSE the network cache is empty.
+              // This is the authoritative signal separating "engine stall" from "buffering".
+              pausedForCacheRef.current = !!data;
+              break;
+            }
+            case "demuxer-cache-duration": {
+              // Seconds of playable content currently buffered ahead. ~0 while waiting on a slow
+              // stream; a healthy value while the engine is merely stalled after OS sleep.
+              // The watchdog tick reads this to distinguish "waiting for bytes" from dead engine.
+              demuxCacheDurationRef.current = (data as number | null) ?? 0;
+              break;
+            }
+            case "demuxer-cache-state": {
+              // Full cache metadata ({fw, bw, file-cache-bytes…}). Reserved for future buffering UX.
+              break;
+            }
           }
         };
 
@@ -984,30 +1202,31 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
 
   return (
     <div ref={videoAnchorRef} id="video-anchor" className="relative h-full w-full bg-transparent outline-none" tabIndex={0}>
-      {/* Watchdog Engine Stalled Overlay */}
-      {engineStalled && (
-        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 p-6 text-center text-white backdrop-blur-md">
-          <div className="mb-4 rounded-full bg-orange-500/20 p-4">
-            <AlertCircle className="h-8 w-8 text-orange-500" />
-          </div>
-          <p className="mb-2 text-xl font-medium tracking-tight">Video Engine Stalled</p>
-          <p className="mb-6 max-w-md text-sm text-neutral-400">
-            The system resumed from sleep and the media engine lost its hardware connection.
-          </p>
-          <button
-            onClick={() => {
-              saveProgress(true);
-              drainSession();
-              void relaunch();
-            }}
-            className="rounded-full bg-white/10 px-6 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
-          >
-            Restart Player
-          </button>
-        </div>
+      {/* ── Smart Watchdog Error Overlays ─────────────────────────────────── */}
+      {watchdog.kind === "engine_crash" && (
+        <WatchdogOverlay
+          icon={<AlertCircle className="h-8 w-8 text-orange-500" />}
+          title="Video Engine Stalled"
+          message="The media engine lost its hardware connection (usually after sleep/hibernate)."
+          actionLabel="Restart Player"
+          onAction={() => { saveProgress(true); drainSession(); void relaunch(); }}
+        />
+      )}
+      {watchdog.kind === "network_timeout" && (
+        <WatchdogOverlay
+          icon={<WifiOff className="h-8 w-8 text-orange-500" />}
+          title="Stream Timed Out"
+          message="The video buffered for 60 seconds without receiving any data. Your connection may be too slow."
+          actionLabel="Retry"
+          onAction={() => { setWatchDog({ kind: "idle" }); /* forces re-eval on next tick */ }}
+        />
+      )}
+      {watchdog.kind === "backend_fatal" && (
+        <BackendFatalOverlay event={watchdog.event} onRetry={() => setWatchDog({ kind: "idle" })} />
       )}
 
-      {!ready && !engineStalled && (
+      {/* ── Loading ── */}
+      {!ready && watchdog.kind === "idle" && (
         <div className="grid h-full place-items-center text-sm text-content-muted">Starting native player…</div>
       )}
 

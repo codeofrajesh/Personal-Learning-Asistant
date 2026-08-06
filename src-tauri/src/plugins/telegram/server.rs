@@ -449,6 +449,7 @@ async fn reader_for(ctx: &ServeCtx, chat_id: i64, message_id: i32) -> AppResult<
         file,
         ctx.semaphore.clone(),
         session,
+        ctx.app.clone(),
     ));
 
     // Bound the map. Each reader holds up to 32 MB of cached chunks, so an afternoon of

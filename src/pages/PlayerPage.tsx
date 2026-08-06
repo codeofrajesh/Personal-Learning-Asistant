@@ -219,6 +219,8 @@ export default function PlayerPage() {
               fileName={material.file_name}
               onFail={onMpvFail}
               onPip={() => navigate(playerParent, { state: { source } })}
+              telegramChatId={material.source === "telegram" ? material.tg_chat_id : null}
+              telegramMessageId={material.source === "telegram" ? material.tg_message_id : null}
             />
           </Suspense>
         ) : (
