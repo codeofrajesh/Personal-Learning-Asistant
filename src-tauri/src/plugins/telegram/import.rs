@@ -523,6 +523,106 @@ pub async fn tg_import_link(
     })
 }
 
+/// Import multiple `t.me` links from the same channel in bulk.
+///
+/// Chunks the ids to respect Telegram's limits (typically 100 per call for `get_messages`),
+/// and uses a single SQLite transaction to ensure atomic and fast inserts.
+#[tauri::command]
+pub async fn tg_import_batch(
+    app: AppHandle,
+    db: State<'_, Db>,
+    state: State<'_, TgState>,
+    url: String, // channel url or any message url from that channel
+    message_ids: Vec<i32>,
+    node_id: i64,
+) -> AppResult<Vec<TgImportResult>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let link = parse_channel_link(&url)?;
+    let client = state.ensure_client(&app, &db).await?;
+
+    // Validate the destination first.
+    let node_exists: bool = db.with(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM nodes WHERE id = ?1",
+                [node_id],
+                |_| Ok(()),
+            )
+            .is_ok())
+    })?;
+    if !node_exists {
+        return Err(AppError::NotFound(
+            "That destination folder no longer exists.".into(),
+        ));
+    }
+
+    let peer = resolve_target(&client, &link).await?;
+    let session = state.get_session().await.ok_or_else(|| {
+        AppError::Other("Telegram session is not initialized.".into())
+    })?;
+    let peer_ref = resolve_peer_ref(&client, &session, peer).await?;
+    let chat_id = peer_ref.id.bare_id().ok_or_else(|| {
+        AppError::Invalid("That link doesn't point at a channel.".into())
+    })?;
+
+    let mut all_fetched_messages = Vec::new();
+
+    // Fetch messages in chunks of 100 to avoid limits or payload size bounds.
+    for chunk in message_ids.chunks(100) {
+        let messages = client
+            .get_messages_by_id(peer_ref.clone(), chunk)
+            .await
+            .map_err(unreachable_peer_or)?;
+        
+        all_fetched_messages.extend(messages.into_iter().flatten());
+    }
+
+    // Prepare items to be imported.
+    let mut importable_items = Vec::new();
+    for message in all_fetched_messages {
+        if let Some(item) = media_item(&message, chat_id, false) {
+            importable_items.push(item);
+        }
+    }
+
+    if importable_items.is_empty() {
+        return Err(AppError::Invalid(
+            "None of the selected messages contained downloadable media.".into(),
+        ));
+    }
+
+    // Execute bulk upsert in a single database transaction.
+    let results: AppResult<Vec<TgImportResult>> = db.with_mut(move |conn| {
+        let tx = conn.transaction()?;
+        let mut batch_results = Vec::with_capacity(importable_items.len());
+
+        for item in &importable_items {
+            let (material_id, created) = upsert_material(&tx, node_id, item)?;
+            
+            let file_name: String = tx.query_row(
+                "SELECT file_name FROM materials WHERE id = ?1",
+                [material_id],
+                |r| r.get(0),
+            )?;
+
+            batch_results.push(TgImportResult {
+                material_id,
+                file_name,
+                created,
+                node_id,
+            });
+        }
+        
+        tx.commit()?;
+        Ok(batch_results)
+    });
+
+    results
+}
+
 /// List recent media messages in a channel, for the browse view.
 #[tauri::command]
 pub async fn tg_channel_media(

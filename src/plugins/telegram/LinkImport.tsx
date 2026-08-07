@@ -117,7 +117,9 @@ export default function LinkImport({ onImported }: LinkImportProps) {
     setItems(null);
     setSelectedItems(new Set());
     try {
-      setItems(await tg.channelMedia(url));
+      const fetched = await tg.channelMedia(url);
+      // Sort ascending (oldest first) so that Lesson 1, 2, 3 appear in order top-to-bottom
+      setItems(fetched.sort((a, b) => a.message_id - b.message_id));
     } catch (e) {
       setError(messageOf(e));
     } finally {
@@ -162,33 +164,29 @@ export default function LinkImport({ onImported }: LinkImportProps) {
     setError(null);
     const toImport = Array.from(selectedItems);
     
-    // Process sequentially to avoid rate-limits or backend overload
-    for (const msgId of toImport) {
-      const item = items?.find((i) => i.message_id === msgId);
-      if (!item || item.already_imported) continue;
+    try {
+      setBusy(true);
+      toImport.forEach(msgId => setImporting((prev) => new Set(prev).add(msgId)));
 
-      setImporting((prev) => new Set(prev).add(msgId));
-      try {
-        await tg.importLink(`https://t.me/c/${item.chat_id}/${msgId}`, nodeId);
-        setItems((prev) =>
-          prev?.map((i) => (i.message_id === msgId ? { ...i, already_imported: true } : i)) ?? null
-        );
-        setSelectedItems((prev) => {
-          const next = new Set(prev);
-          next.delete(msgId);
-          return next;
-        });
-        onImported?.();
-      } catch (e) {
-        setError(messageOf(e));
-        // Continue loop to allow other items to succeed
-      } finally {
+      // Call the bulk fetch backend command to do this safely in a single transaction
+      await tg.importBatch(url, toImport, nodeId);
+      
+      setItems((prev) =>
+        prev?.map((i) => (toImport.includes(i.message_id) ? { ...i, already_imported: true } : i)) ?? null
+      );
+      setSelectedItems(new Set());
+      onImported?.();
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      toImport.forEach(msgId => {
         setImporting((prev) => {
           const next = new Set(prev);
           next.delete(msgId);
           return next;
         });
-      }
+      });
+      setBusy(false);
     }
   };
 

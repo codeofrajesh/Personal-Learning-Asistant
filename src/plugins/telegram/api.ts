@@ -140,6 +140,11 @@ export const tg = {
     return invokeCommand("tg_import_link", { url, nodeId });
   },
 
+  /** Import multiple messages from a channel at once into `nodeId`. */
+  async importBatch(url: string, messageIds: number[], nodeId: number): Promise<TgImportResult[]> {
+    return invokeCommand("tg_import_batch", { url, messageIds, nodeId });
+  },
+
   /**
    * List recent media in a channel. `url` accepts any message link from the channel, a
    * channel link, or a bare `@username` — finding a numeric channel id is not something a

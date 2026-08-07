@@ -180,6 +180,7 @@ pub fn run() {
             plugins::telegram::auth::tg_get_me,
             // Telegram import (Phase 4)
             plugins::telegram::import::tg_import_link,
+            plugins::telegram::import::tg_import_batch,
             plugins::telegram::import::tg_channel_media,
             plugins::telegram::import::tg_import_history,
             // Telegram streaming (Phase 5)
