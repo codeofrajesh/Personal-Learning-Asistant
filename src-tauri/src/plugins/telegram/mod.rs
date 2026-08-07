@@ -26,6 +26,21 @@ pub async fn tg_stream_base(
     server.ensure_started(app).await
 }
 
+/// Reset the error state for a Telegram stream so the player can retry it.
+///
+/// Called by the frontend when the user clicks "Retry" on a fatal/network error. Clears the
+/// reader's per-file retry state (FloodWait budget, learned DC, auth flag, in-flight claims)
+/// while keeping its chunk cache, so the retry re-fetches from Telegram without re-resolving
+/// already-downloaded data. Returns true if the stream was found and reset.
+#[tauri::command]
+pub async fn tg_retry_stream(
+    server: tauri::State<'_, TgServer>,
+    chat_id: i64,
+    message_id: i32,
+) -> crate::utils::errors::AppResult<bool> {
+    Ok(server.retry_stream(chat_id, message_id).await)
+}
+
 /// Register the Telegram plugin's managed state. Does NOT connect to Telegram yet —
 /// the client is created lazily on the first auth command, and the stream server binds
 /// nothing until the first lesson is played.

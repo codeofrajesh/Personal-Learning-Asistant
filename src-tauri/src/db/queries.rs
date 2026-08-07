@@ -789,6 +789,7 @@ pub struct MaterialRow {
     /// `active` or `missing` (file no longer on disk — the watcher marks it, never
     /// hard-deletes; Section 3).
     pub status: String,
+    pub source: String,
 }
 
 /// Fetch a goal's header fields. `NotFound` if the id doesn't exist.
@@ -987,7 +988,7 @@ pub fn list_materials(conn: &Connection, chapter_id: i64) -> AppResult<Vec<Mater
             m.id, m.file_name, m.file_type, m.file_extension, m.file_size_bytes,
             m.duration_secs, m.thumbnail_path,
             COALESCE(CAST(wp.completion_pct AS INTEGER), 0),
-            m.is_bookmarked, m.is_completed, m.status
+            m.is_bookmarked, m.is_completed, m.status, m.source
          FROM materials m
          LEFT JOIN watch_progress wp ON wp.material_id = m.id
          WHERE m.node_id = ?1 AND m.status IN ('active', 'missing')
@@ -1006,6 +1007,7 @@ pub fn list_materials(conn: &Connection, chapter_id: i64) -> AppResult<Vec<Mater
             is_bookmarked: r.get::<_, i64>(8)? != 0,
             is_completed: r.get::<_, i64>(9)? != 0,
             status: r.get(10)?,
+            source: r.get(11)?,
         })
     })?;
     let mut out = Vec::new();

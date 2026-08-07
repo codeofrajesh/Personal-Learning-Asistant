@@ -18,7 +18,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { AlertCircle, PictureInPicture2, WifiOff, RefreshCw } from "lucide-react";
-import { relaunch } from "@tauri-apps/plugin-process";
 import {
   command,
   init,
@@ -31,7 +30,7 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { gsap } from "gsap";
 import { useGSAP } from "@gsap/react";
-import { ipc, isTauri } from "../../lib/ipc";
+import { ipc, isTauri, invokeCommand } from "../../lib/ipc";
 import { subscribeFullscreen } from "../../lib/fullscreen";
 import {
   SPEED_PRESETS,
@@ -66,6 +65,26 @@ export interface TgStreamFatal {
   attempts?: number;
 }
 
+/** Call the backend to reset error state for a Telegram stream (chat_id + message_id). */
+async function retryTelegramStream(chat_id: number, message_id: number): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await invokeCommand("tg_retry_stream", { chat_id, message_id });
+  } catch (e) {
+    // Non-fatal: log and continue — the player will fall back to its own retry timer if needed.
+    console.error("[MpvVideoPlayer] tg_retry_stream failed:", e);
+  }
+}
+
+/**
+ * Fatal events that reprresent a permanent/Terminal condition for this stream — no amount of
+ * retrying on the same file will help, so they should surface immediately rather than be held
+ * waiting out a 60s buffering window.
+ */
+function isTerminalFatal(type: TgStreamFatal["type"]): boolean {
+  return type === "not_found" || type === "auth_expired_unrecoverable";
+}
+
 /** Configurable timeouts — exported for testability, not for tuning in prod. */
 const ENGINE_STALL_SECS = 8;      // No position advance, NOT buffering → engine crash
 const NETWORK_TIMEOUT_SECS = 60;  // paused-for-cache with no cached data → network timeout
@@ -96,6 +115,27 @@ function WatchdogOverlay({
       >
         {actionLabel}
       </button>
+    </div>
+  );
+}
+
+/** Buffering spinner overlay — shown while paused-for-cache with no cached data.
+ *  A self-contained SMIL spinner (native `<animateTransform>`), so it spins smoothly
+ *  regardless of whether Tailwind's `animate-spin` utility (or any @keyframes)
+ *  actually ships in the build. No CSS, no external animation classes, no Lucide
+ *  icon — it cannot lose its rotation. */
+function BufferingOverlay() {
+  return (
+    <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black/70 p-6 text-center text-white backdrop-blur-sm">
+      <div className="mb-3">
+        <svg className="h-8 w-8 text-lime" viewBox="0 0 48 48" aria-hidden="true">
+          <circle cx="24" cy="24" r="18" fill="none" stroke="currentColor" strokeOpacity="0.2" strokeWidth="4" />
+          <path d="M 24 6 A 18 18 0 0 1 41.3 17" fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round">
+            <animateTransform attributeName="transform" type="rotate" from="0 24 24" to="360 24 24" dur="0.8s" repeatCount="indefinite" />
+          </path>
+        </svg>
+      </div>
+      <p className="text-sm text-neutral-300">Buffering…</p>
     </div>
   );
 }
@@ -167,8 +207,9 @@ const globalMpvState = {
   pause: true,
   "time-pos": 0,
   duration: 0,
-  volume: 100,
+  volume: Number(localStorage.getItem("mpv-volume") ?? "100"),
   speed: 1,
+  mute: localStorage.getItem("mpv-mute") === "true",
 };
 
 let globalLoadedPath: string | null = null;
@@ -178,6 +219,7 @@ const OBSERVED_PROPERTIES = [
   ["time-pos", "double", "none"],
   ["duration", "double", "none"],
   ["volume", "int64"],
+  ["mute", "flag"],
   ["speed", "double"],
   ["eof-reached", "flag"],
   // ── Smart Watchdog (2026) — buffering detection ──
@@ -219,10 +261,12 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   const videoAnchorRef = useRef<HTMLDivElement>(null);
   const seekFillRef = useRef<HTMLDivElement>(null);
   const seekTrackRef = useRef<HTMLDivElement>(null);
+  const bufferFillRef = useRef<HTMLDivElement>(null);
   const currentLabelRef = useRef<HTMLSpanElement>(null);
   const durationLabelRef = useRef<HTMLSpanElement>(null);
   const timePosRef = useRef(0);
   const durationRef = useRef(0);
+  const showRemainingTimeRef = useRef(localStorage.getItem("mpv-time-mode") === "remaining");
   const lastTimePosRef = useRef(0);
   const watchedSecondsRef = useRef(0);
   // Wall-clock baseline (performance.now) of the last processed `time-pos` event. Watch-time is
@@ -268,6 +312,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   // always been written straight to a DOM ref from the property observer, per the §15 perf rule.
   // Keeping the state would mean a re-render on every file load for a value nothing renders.
   const [volume, setVolume] = useState(globalMpvState.volume);
+  const [isMuted, setIsMuted] = useState(globalMpvState.mute);
   const [rate, setRate] = useState(globalMpvState.speed);
   // Ref mirror of `rate`, for the same reason `isPlayingRef` exists: the keyboard listener is bound
   // once with empty deps, so a closure over the state would be frozen at its initial value and
@@ -307,33 +352,141 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   // Refs mirroring the mpv buffering signals (written by the observer; read on the 1s tick).
   const pausedForCacheRef = useRef(false);
   const demuxCacheDurationRef = useRef(0);
+  // Seconds of forward-buffered content (from demuxer-cache-state.fw), for the buffer bar.
+  const demuxCacheForwardRef = useRef(0);
   // True the instant a fatal state is entered, so the interval breaks out of the tick loop.
   const watchdogFatalRef = useRef(false);
+  // A fatal event that arrived while the engine still had cached content to play. We hold it
+  // (rather than committing an overlay immediately) so the video keeps playing out its buffer —
+  // Issue 1 fix — and only surface it once the cache is genuinely exhausted.
+  const pendingFatalRef = useRef<TgStreamFatal | null>(null);
+  // True from the moment an explicit Retry is issued until either data arrives or the 60s
+  // network clock expires. While set, a fresh backend fatal is HELD (still pending) but NOT
+  // surfaced — the user asked for a full 60s retry window, so a backend "gave up" during that
+  // window should not yank them straight back to an error overlay (Issue 4).
+  const retryInProgressRef = useRef(false);
 
   // Single write-point for the watchdog: keeps the ref (read by the 1s tick) and the React
   // state (rendered) in lockstep, and flips the fatal flag so the tick stops polling.
-  const setWatchDog = (next: WatchdogState) => {
+  const setWatchDog = useCallback((next: WatchdogState) => {
     watchdogRef.current = next;
     setWatchdogState(next);
     watchdogFatalRef.current =
       next.kind === "engine_crash" || next.kind === "network_timeout" || next.kind === "backend_fatal";
-  };
+  }, []);
+
+  // Check if the stream has genuinely exhausted its cache: paused-for-cache AND zero buffered duration.
+  // This is the guard for Issue 1: suppress all fatal overlays while cached video still plays.
+  const cacheExhausted = useCallback((): boolean => {
+    // If the backend drops the stream, libmpv hits an unexpected EOF and pauses 
+    // WITHOUT setting paused-for-cache. So we just check if there is basically no cache left.
+    return demuxCacheDurationRef.current <= 0.2;
+  }, []);
+
+  // Update the YouTube-style buffer bar (Issue 2).
+  // Buffer = (current_position + forward_buffered_seconds) / total_duration.
+  // Updates on every `time-pos` (playhead moves) AND `demuxer-cache-state` (fw changes).
+  const updateBufferBar = useCallback(() => {
+    if (!bufferFillRef.current || durationRef.current <= 0) return;
+    const pos = timePosRef.current;
+    const fwSecs = demuxCacheDurationRef.current;
+    const pct = Math.min(100, ((pos + fwSecs) / durationRef.current) * 100);
+    bufferFillRef.current.style.width = `${pct}%`;
+  }, []);
 
   // One interval drives both timers. Health = the position moves while (not buffering) OR the
   // buffer refills while buffering. On pause/drag/seek the machine returns to idle.
   useEffect(() => {
     if (!ready || !path) return;
+    let lastTick = performance.now();
     const interval = window.setInterval(() => {
       if (disposedRef.current || watchdogFatalRef.current) return;
 
       const now = performance.now();
+      const deltaTick = now - lastTick;
+      lastTick = now;
+
       const pos = timePosRef.current;
+
+      // ── OS SLEEP / SUSPEND DETECTION ──
+      // If the tick took an unusually long time (e.g. laptop closed), the wall clock advanced
+      // artificially without giving the player/network a chance to actually work. We simply 
+      // roll the baseline forward to prevent instant timeouts.
+      if (deltaTick > 3000) {
+        const cur = watchdogRef.current;
+        if (cur.kind === "playing" && cur.baseline) {
+          setWatchDog({ kind: "playing", baseline: { wall: now, pos } });
+        } else if (cur.kind === "buffering") {
+          setWatchDog({ kind: "buffering", since: now });
+        }
+        return;
+      }
       const buffering = pausedForCacheRef.current;
+      const atEof = pos > 0 && durationRef.current > 0 && (durationRef.current - pos) < 1;
+
+      // ── OFFLINE CHECK ──
+      // If the OS reports no internet connection, and the cache is exhausted, we don't
+      // need to wait for the backend to timeout. It's a guaranteed failure.
+      if (!navigator.onLine && cacheExhausted() && !atEof) {
+        setWatchDog({ 
+          kind: "backend_fatal", 
+          event: { type: "io_exhausted", attempts: 1, chat_id: 0, message_id: 0 } 
+        });
+        return;
+      }
+
+      // ── RETRY HOLD (Issue 4) ──────────────────────────────────────────────
+      // If the user explicitly clicked Retry, we must KEEP the buffering state
+      // and the 60s network clock running — even if mpv hasn't flipped
+      // paused-for-cache back to true yet. This prevents the tick from
+      // immediately popping out to "idle" or "playing" before data arrives.
+      if (retryInProgressRef.current) {
+        const cur = watchdogRef.current;
+        
+        // If the engine has successfully fetched new data, the retry was a success!
+        // We drop the forced hold and let the normal tick manage state.
+        if (demuxCacheDurationRef.current > 0.1) {
+          retryInProgressRef.current = false;
+        } else {
+          if (cur.kind !== "buffering") {
+            // Force into buffering with a fresh clock so the full 60s window applies.
+            setWatchDog({ kind: "buffering", since: now });
+          } else {
+            // Already buffering — just check the 60s cap.
+            const bufferedFor = (now - cur.since) / 1000;
+            if (bufferedFor >= NETWORK_TIMEOUT_SECS) {
+              console.error("[MpvVideoPlayer] Smart Watchdog: retry buffered without data for", bufferedFor, "s");
+              retryInProgressRef.current = false;
+              setWatchDog({ kind: "network_timeout" });
+            }
+          }
+          return;
+        }
+      }
+
+      // ── PENDING FATAL CHECK (Issue 1) ─────────────────────────────────────
+      // A backend `tg://stream-fatal` may arrive while cached video still plays.
+      // We hold it in `pendingFatalRef` and ONLY surface it once the cache is
+      // genuinely exhausted (paused-for-cache=true AND demuxer-cache-duration=0).
+      // This check runs FIRST, in ANY state (playing, buffering, idle), so a
+      // fatal that arrived during playback is never silently dropped.
+      // Guard: do not surface if at clean EOF (video naturally ended).
+      const pending = pendingFatalRef.current;
+      if (pending && cacheExhausted() && !atEof) {
+        pendingFatalRef.current = null;
+        console.error("[MpvVideoPlayer] Cache exhausted — surfacing backend fatal:", pending);
+        setWatchDog({ kind: "backend_fatal", event: pending });
+        return;
+      }
 
       // Genuinely paused / user dragging: not engine failure, not buffering — idle.
-      if (isPausedRef.current || draggingRef.current) {
+      // (If we are paused-for-cache or retrying, the engine might be "paused", but it's not a user idle state).
+      if ((isPausedRef.current && !buffering && !retryInProgressRef.current) || draggingRef.current) {
         const cur = watchdogRef.current;
         if (cur.kind === "playing" || cur.kind === "buffering") setWatchDog({ kind: "idle" });
+        // Do NOT clear pendingFatalRef here — the user explicitly paused, but a
+        // fatal for this file may still be pending and should surface when they
+        // resume and the cache drains (Issue 1).
         return;
       }
 
@@ -353,6 +506,9 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
           setWatchDog({ kind: "buffering", since: now });
           return;
         }
+        // Cache exhausted while buffering (paused-for-cache=true AND demuxer-cache-duration=0).
+        // If there's a pending backend fatal, surface it NOW (Issue 1) instead of waiting
+        // for the 60s network timeout — the backend has already told us it's dead.
         const bufferedFor = (now - cur.since) / 1000;
         if (bufferedFor >= NETWORK_TIMEOUT_SECS) {
           // eslint-disable-next-line no-console
@@ -371,10 +527,13 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       }
 
       const elapsedWall = (now - baseline.wall) / 1000;
-      if (elapsedWall < ENGINE_STALL_SECS) return;
+      // If we are at 0:00 (just starting), give the network more grace period (e.g., 30s)
+      // to establish the connection before calling it a hard engine crash.
+      const timeoutLimit = pos === 0 ? 30 : ENGINE_STALL_SECS;
+      if (elapsedWall < timeoutLimit) return;
 
       if (pos === baseline.pos) {
-        // Position hasn't moved and MPV says it isn't buffering → the engine (hwdec/audio)
+        // Position hasn't moved and MPV says it isn't buffering — the engine (hwdec/audio)
         // truly stalled (e.g. after OS sleep). paused-for-cache already ruled out a network
         // stall, so this is the real crash path.
         // eslint-disable-next-line no-console
@@ -383,12 +542,18 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       } else {
         // Healthy — position moved. Roll the baseline forward.
         setWatchDog({ kind: "playing", baseline: { wall: now, pos } });
+        // Playback is flowing again after a buffering window — a retry window, if one was
+        // active, has served its purpose, so clear it. A PENDING fatal is deliberately NOT
+        // touched here: the backend never rescues a stream on its own (only an explicit
+        // `tg_reTry_stream` resets it), so a recorded "give up" stays truthful until the cache
+        // finishes draining — Issue 1 — at which point the buffering branch surfaces it.
+        retryInProgressRef.current = false;
       }
     }, 1000);
 
     return () => window.clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, path]);
+  }, [ready, path, setWatchDog, cacheExhausted]);
 
   // Backend-driven fatal: `tg://stream-fatal` from reader.rs. Matches by chat+message id so
   // events for OTHER lessons still playing in a background engine are ignored.
@@ -403,7 +568,20 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
         if (p.chat_id !== telegramChatId || p.message_id !== telegramMessageId) return;
         // eslint-disable-next-line no-console
         console.error("[MpvVideoPlayer] backend stream-fatal:", p);
-        setWatchDog({ kind: "backend_fatal", event: p });
+        // Terminal failures (not_found / auth) are hopeless on retry — show immediately.
+        if (isTerminalFatal(p.type)) {
+          pendingFatalRef.current = null;
+          setWatchDog({ kind: "backend_fatal", event: p });
+          return;
+        }
+        // Recoverable failures (io / timeout / flood / dc): hold them.
+        // (a) If there is still cached content, keep playing it out (Issue 1) and surface
+        //     only when the buffer runs dry.
+        // (b) If the user initiated a retry window, respect the full 60s attempt (Issue 4).
+        // Either way we commit to `pendingFatalRef` and let the watchdog tick decide when (if
+        // ever) to surface it — so a fresh fatal never yanks the player into an overlay the
+        // moment the backend gives up while the user is asking for a retry.
+        pendingFatalRef.current = p;
       }).then((u) => { unlisten = u; });
     });
     return () => { unlisten?.(); };
@@ -420,6 +598,50 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     },
     [onFail],
   );
+
+  // Issue 4 fix — a real retry, not just "reset the overlay".
+  //
+  // When the user clicks "Retry" on a Network Timeout or Backend Fatal overlay:
+  //   1. Ask the backend to reset the reader's per-file error state (new `tg_retry_stream`
+  //      command) so it will attempt fresh chunk fetches.
+  //   2. Clear any stale fatal + reset the watchdog to the "buffering" state — showing the
+  //      spinner instantly and starting the 60s network clock.
+  //   3. Tell mpv to resume playing (set pause=false), so once bytes arrive it plays on.
+  //
+  // The 60s cap already lives in the buffering branch of the watchdog tick, so if the retry
+  // gets no data it lands in `network_timeout` again and the overlay reappears.
+  const handleRetry = useCallback(() => {
+    // eslint-disable-next-line no-console
+    console.log("[MpvVideoPlayer] retry requested");
+    pendingFatalRef.current = null;
+    retryInProgressRef.current = true;
+    const wasTelegram = telegramChatId != null && telegramMessageId != null;
+    if (wasTelegram && isTauri()) {
+      void retryTelegramStream(telegramChatId!, telegramMessageId!);
+    }
+    // Dismiss the fatal flag + overlay NOW (so the buffering state can take over), then
+    // re-enter `buffering` synchronously. The tick will keep it honest from here.
+    setWatchDog({ kind: "buffering", since: performance.now() });
+    
+    // Force libmpv to re-open the HTTP connection.
+    // If the file never loaded successfully initially (duration is 0), `seek` will fail 
+    // silently, so we MUST use `loadfile`. Otherwise, `seek` to clear the EOF flag.
+    if (durationRef.current > 0) {
+      void command("seek", [timePosRef.current, "absolute"]).catch(() => {});
+    } else {
+      const resumeAt = startPositionRef.current;
+      const shouldResume = Number.isFinite(resumeAt) && resumeAt > 1;
+      if (shouldResume) {
+        void command("loadfile", [path, "replace", -1, `start=${resumeAt.toFixed(3)}`]).catch(() => {});
+      } else {
+        void command("loadfile", [path]).catch(() => {});
+      }
+    }
+    
+    // If mpv is (still) paused waiting for data, ask it to resume so playback continues once
+    // chunks arrive. Safe: if the engine already self-resumed this is a no-op.
+    void setProperty("pause", false).catch(() => {});
+  }, [telegramChatId, telegramMessageId, setWatchDog, setProperty]);
 
   // Last position (secs) actually persisted to the DB — used to coalesce writes so we
   // don't hammer a cheap SSD with near-identical rows on rapid pause/seek/flush.
@@ -596,7 +818,18 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               if (!draggingRef.current && seekFillRef.current && d > 0) {
                 seekFillRef.current.style.width = `${(t / d) * 100}%`;
               }
-              if (currentLabelRef.current) currentLabelRef.current.textContent = formatDuration(t);
+              // The playhead advanced → the buffered portion of the bar must advance too
+              // (buffer = pos + fw). Refresh on every position event so the buffer bar tracks
+              // the moving playhead, not just cache updates (Issue 2).
+              if (!draggingRef.current) updateBufferBar();
+              if (currentLabelRef.current) {
+                const d = durationRef.current;
+                if (showRemainingTimeRef.current && d > 0) {
+                  currentLabelRef.current.textContent = "-" + formatDuration(Math.max(0, d - t));
+                } else {
+                  currentLabelRef.current.textContent = formatDuration(t);
+                }
+              }
               break;
             }
             case "duration": {
@@ -605,10 +838,17 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               // Ref + DOM write only, no React state: nothing renders `duration` as state, and the
               // label is a direct textContent write per the §15 perf rule.
               if (durationLabelRef.current) durationLabelRef.current.textContent = formatDuration(d);
+              // Duration changed → refresh the buffer percentage (fw / total may have changed)
+              updateBufferBar();
               break;
             }
             case "volume":
+              localStorage.setItem("mpv-volume", String(data));
               setVolume(data as number);
+              break;
+            case "mute":
+              localStorage.setItem("mpv-mute", String(data));
+              setIsMuted(!!data);
               break;
             case "speed": {
               // Quantized on the way in as well as out: mpv echoes back the double it holds, and a
@@ -639,10 +879,12 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               // stream; a healthy value while the engine is merely stalled after OS sleep.
               // The watchdog tick reads this to distinguish "waiting for bytes" from dead engine.
               demuxCacheDurationRef.current = (data as number | null) ?? 0;
+              updateBufferBar();
               break;
             }
             case "demuxer-cache-state": {
-              // Full cache metadata ({fw, bw, file-cache-bytes…}). Reserved for future buffering UX.
+              // We ignore demuxer-cache-state now because demuxer-cache-duration is much more
+              // reliable for drawing the buffer bar.
               break;
             }
           }
@@ -722,7 +964,13 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       if (seekFillRef.current && d > 0) {
         seekFillRef.current.style.width = `${(t / d) * 100}%`;
       }
-      if (currentLabelRef.current) currentLabelRef.current.textContent = formatDuration(t);
+      if (currentLabelRef.current) {
+        if (showRemainingTimeRef.current && d > 0) {
+          currentLabelRef.current.textContent = "-" + formatDuration(Math.max(0, d - t));
+        } else {
+          currentLabelRef.current.textContent = formatDuration(t);
+        }
+      }
       if (durationLabelRef.current) durationLabelRef.current.textContent = formatDuration(d);
       
       return;
@@ -977,6 +1225,22 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     }
   }, []);
 
+  // ── Callbacks ──────────────────────────────────────────────────────────────
+  const toggleRemainingTime = useCallback(() => {
+    const next = !showRemainingTimeRef.current;
+    showRemainingTimeRef.current = next;
+    localStorage.setItem("mpv-time-mode", next ? "remaining" : "elapsed");
+    if (currentLabelRef.current) {
+      const t = timePosRef.current;
+      const d = durationRef.current;
+      if (next && d > 0) {
+        currentLabelRef.current.textContent = "-" + formatDuration(Math.max(0, d - t));
+      } else {
+        currentLabelRef.current.textContent = formatDuration(t);
+      }
+    }
+  }, []);
+
   // Mirror fullscreen via the shared, debounced source (one app-wide window listener) rather
   // than this component's own onResized→isFullscreen poll — that per-tick IPC across three
   // components was the fullscreen-lag storm. On each change, refresh the cached window
@@ -1015,6 +1279,13 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     // a discontinuity, so the first post-seek `time-pos` event seeds fresh rather than billing
     // the seek + settle gap as watched time.
     lastWallTsRef.current = 0;
+    
+    // Invalidate the frontend's cache memory immediately on seek. If the user seeks while offline, 
+    // the backend will fail instantly, and we need the watchdog to know the cache is empty (Bug 2 fix).
+    demuxCacheDurationRef.current = 0;
+    demuxCacheForwardRef.current = 0;
+    updateBufferBar();
+    
     void command("seek", [target, "absolute"]).catch(() => {});
     if (seekFillRef.current && d > 0) seekFillRef.current.style.width = `${(target / d) * 100}%`;
     saveProgress(true);
@@ -1047,6 +1318,9 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     const v = Number(e.target.value);
     setVolume(v);
     void setProperty("volume", v).catch(() => {});
+    if (isMuted && v > 0) {
+      void setProperty("mute", false).catch(() => {});
+    }
   };
   /**
    * Set an absolute speed (preset menu, or the target of a nudge).
@@ -1202,27 +1476,32 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
 
   return (
     <div ref={videoAnchorRef} id="video-anchor" className="relative h-full w-full bg-transparent outline-none" tabIndex={0}>
-      {/* ── Smart Watchdog Error Overlays ─────────────────────────────────── */}
+      {/* ── Smart Watchdog Overlays ─────────────────────────────────────────── */}
+      {/* Engine crash is not network-related — show immediately (Issue 1 guard not needed). */}
       {watchdog.kind === "engine_crash" && (
         <WatchdogOverlay
           icon={<AlertCircle className="h-8 w-8 text-orange-500" />}
           title="Video Engine Stalled"
           message="The media engine lost its hardware connection (usually after sleep/hibernate)."
           actionLabel="Restart Player"
-          onAction={() => { saveProgress(true); drainSession(); void relaunch(); }}
+          onAction={() => { saveProgress(true); drainSession(); window.location.reload(); }}
         />
       )}
-      {watchdog.kind === "network_timeout" && (
+      {/* Buffering spinner — Issue 3. Shown while paused-for-cache with no data. */}
+      {watchdog.kind === "buffering" && <BufferingOverlay />}
+      {/* Network/Backend fatal overlays — Issue 1 fix: ONLY show when cache is exhausted, OR
+          when the failure is terminal (404 / auth — hopeless on retry, so surface instantly). */}
+      {watchdog.kind === "network_timeout" && cacheExhausted() && (
         <WatchdogOverlay
           icon={<WifiOff className="h-8 w-8 text-orange-500" />}
           title="Stream Timed Out"
           message="The video buffered for 60 seconds without receiving any data. Your connection may be too slow."
           actionLabel="Retry"
-          onAction={() => { setWatchDog({ kind: "idle" }); /* forces re-eval on next tick */ }}
+          onAction={handleRetry}
         />
       )}
-      {watchdog.kind === "backend_fatal" && (
-        <BackendFatalOverlay event={watchdog.event} onRetry={() => setWatchDog({ kind: "idle" })} />
+      {watchdog.kind === "backend_fatal" && (cacheExhausted() || isTerminalFatal(watchdog.event.type)) && (
+        <BackendFatalOverlay event={watchdog.event} onRetry={handleRetry} />
       )}
 
       {/* ── Loading ── */}
@@ -1255,6 +1534,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
             aria-valuemax={100}
             aria-valuenow={0}
           >
+            {/* Buffered (downloaded) bar — Issue 2. Rendered UNDER the playhead fill,
+                ahead of it, YouTube-style. Updated via DOM ref from demuxer-cache-state.fw. */}
+            <div ref={bufferFillRef} className="absolute left-0 top-0 h-full rounded-full bg-white/25" style={{ width: "0%" }} />
+            {/* Playhead fill — sits on top of the buffer bar. */}
             <div ref={seekFillRef} className="absolute left-0 top-0 h-full rounded-full bg-lime shadow-glow-lime transition-[width] duration-150" style={{ width: "0%" }} />
           </div>
         </div>
@@ -1297,18 +1580,18 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
           <div className="group/vol flex items-center gap-1.5">
             <button
               type="button"
-              onClick={() => void setProperty("mute", volume > 0).catch(() => {})}
+              onClick={() => void setProperty("mute", !isMuted).catch(() => {})}
               className="shrink-0 rounded-full p-2 text-content-secondary transition-colors hover:bg-white/[0.1] hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20"
               aria-label="Mute"
             >
-              {volume === 0 ? <MuteIcon /> : <VolumeIcon />}
+              {isMuted || volume === 0 ? <MuteIcon /> : <VolumeIcon />}
             </button>
             <input
               type="range"
               min={0}
               max={100}
               step={1}
-              value={volume}
+              value={isMuted ? 0 : volume}
               onChange={changeVolume}
               className="h-1 w-0 cursor-pointer appearance-none rounded-full bg-white/[0.15] opacity-0 transition-all duration-200 group-hover/vol:w-20 group-hover/vol:opacity-100"
               aria-label="Volume"
@@ -1316,9 +1599,16 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
           </div>
 
           {/* Time display */}
-          <span ref={currentLabelRef} className="shrink-0 text-xs font-medium tabular-nums text-content-secondary">0:00</span>
-          <span className="shrink-0 text-xs text-content-faint">/</span>
-          <span ref={durationLabelRef} className="shrink-0 text-xs tabular-nums text-content-muted">—</span>
+          <button
+            type="button"
+            onClick={toggleRemainingTime}
+            className="group/time -mx-1 flex items-center gap-1 rounded px-1 hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20"
+            aria-label="Toggle time display mode"
+          >
+            <span ref={currentLabelRef} className="shrink-0 text-xs font-medium tabular-nums text-content-secondary transition-colors group-hover/time:text-content-primary">0:00</span>
+            <span className="shrink-0 text-xs text-content-faint">/</span>
+            <span ref={durationLabelRef} className="shrink-0 text-xs tabular-nums text-content-muted">—</span>
+          </button>
 
           {/* Spacer */}
           <div className="flex-1" />

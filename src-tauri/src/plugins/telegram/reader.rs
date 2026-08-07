@@ -690,6 +690,28 @@ impl TgReader {
         file.media = refreshed.media;
         Ok(())
     }
+
+    /// Reset the per-file error state for a retry.
+    ///
+    /// Called when the frontend requests a retry after a fatal event. Clears:
+    /// - FloodWait accumulator (so the 120s budget starts fresh)
+    /// - Session FloodWait cooldown timestamp
+    /// - Learned DC ID (forces rediscovery in case the file migrated)
+    /// - Auth ready flag (forces re-copy of auth key)
+    /// - In-flight chunk claims (so a stuck prefetch doesn't block the retry)
+    ///
+    /// Does NOT clear: chunk cache (valid data is still valid), semaphore (global), session.
+    pub async fn reset_error_state(&self) {
+        *self.flood_wait_accumulator.lock().await = 0;
+        *self.last_flood_wait_at.lock().await = None;
+        *self.dc_id.lock().await = None;
+        *self.auth_ready.lock().await = false;
+        // Clear in-flight claims so a wedged prefetch doesn't block the retry.
+        // This is safe because: (a) we only clear indices for THIS reader, and (b)
+        // any pending fetch for a cleared index will just write to a cache nobody
+        // reads (the reader will re-claim the index on the next real request).
+        self.in_flight.lock().await.clear();
+    }
 }
 
 fn is_file_reference_expired(e: &InvocationError) -> bool {

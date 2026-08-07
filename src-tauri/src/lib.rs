@@ -184,6 +184,7 @@ pub fn run() {
             plugins::telegram::import::tg_import_history,
             // Telegram streaming (Phase 5)
             plugins::telegram::tg_stream_base,
+            plugins::telegram::tg_retry_stream,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

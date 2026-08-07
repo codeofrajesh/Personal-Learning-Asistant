@@ -305,7 +305,7 @@ export interface MaterialRow {
   is_bookmarked: boolean;
   is_completed: boolean;
   /** `active` or `missing` (file no longer on disk — watcher marks it, never deletes). */
-  status: string;
+  status: string; source: string;
 }
 
 /** Goal page payload (backend `GoalView`). */
@@ -342,7 +342,7 @@ export interface CourseLesson {
   is_bookmarked: boolean;
   is_completed: boolean;
   /** `active` or `missing` (file no longer on disk). */
-  status: string;
+  status: string; source: string;
   chapter_id: number;
   chapter_name: string;
   chapter_sort_order: number;
@@ -425,7 +425,7 @@ export interface RegisteredDir {
   id: number;
   path: string;
   is_active: boolean;
-  scan_status: string;
+  scan_status: string; source: string;
   last_scanned_at: string | null;
   root_node_id: number | null;
   root_name: string | null;

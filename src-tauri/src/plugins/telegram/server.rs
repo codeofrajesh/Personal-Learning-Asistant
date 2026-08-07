@@ -184,6 +184,9 @@ pub struct TgServer {
 struct Running {
     port: u16,
     token: String,
+    /// The shared serve context — holds the readers map + semaphore. Stored so a later
+    /// retry command can reach the same readers used by the HTTP handler.
+    ctx: Arc<ServeCtx>,
 }
 
 impl Default for TgServer {
@@ -232,6 +235,9 @@ impl TgServer {
             semaphore: new_semaphore(),
         });
 
+        // Clone before the spawn: the loop moves the Arc into itself, and the Running struct
+        // below needs its own handle to the same context.
+        let spawn_ctx = ctx.clone();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = match listener.accept().await {
@@ -241,7 +247,7 @@ impl TgServer {
                         continue;
                     }
                 };
-                let ctx = ctx.clone();
+                let ctx = spawn_ctx.clone();
                 // Per-connection task: a slow chunk fetch for one lesson must not stall
                 // another connection's headers.
                 tokio::spawn(async move {
@@ -262,8 +268,29 @@ impl TgServer {
         *guard = Some(Running {
             port,
             token: token.clone(),
+            ctx,
         });
         Ok(base_url(port, &token))
+    }
+
+    /// Reset the error state for a stream so the player can retry it.
+    ///
+    /// Looks up the reader for `(chat_id, message_id)` in the running server's context and
+    /// clears its per-file error state. A no-op (and returns `false`) when no reader exists —
+    /// e.g. the stream was never opened, or the reader was evicted.
+    pub async fn retry_stream(&self, chat_id: i64, message_id: i32) -> bool {
+        let guard = self.inner.lock().await;
+        match guard.as_ref() {
+            Some(running) => {
+                let ctx = running.ctx.clone();
+                drop(guard);
+                reset_reader_error_state(&ctx, chat_id, message_id).await
+            }
+            None => {
+                log::warn!("telegram: retry requested before the stream server started");
+                false
+            }
+        }
     }
 }
 
@@ -303,8 +330,8 @@ async fn route(
     ctx: Arc<ServeCtx>,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<StreamedBody>, StatusCode> {
-    // Only reads. A stream endpoint has no reason to accept anything else.
-    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+    // Only reads and preflights.
+    if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }
 
@@ -374,9 +401,15 @@ async fn route(
 
     // HEAD must carry identical headers with no body — this is how mpv and PDF.js probe for
     // size and range support before committing to a download.
-    if is_head {
+    // Also include CORS headers here so preflight/head requests from fetch() succeed.
+    builder = builder
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        .header("Access-Control-Allow-Headers", "Range");
+
+    if is_head || req.method() == Method::OPTIONS {
         return builder
-            .status(status)
+            .status(if is_head { status } else { StatusCode::NO_CONTENT })
             .body(empty_body())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -469,6 +502,26 @@ async fn reader_for(ctx: &ServeCtx, chat_id: i64, message_id: i32) -> AppResult<
 
     readers.insert((chat_id, message_id), reader.clone());
     Ok(reader)
+}
+
+/// Reset the error state for a specific stream (chat_id, message_id).
+///
+/// Called by the frontend when the user clicks "Retry" after a fatal error.
+/// Returns true if the reader existed and was reset; false if no reader for that key.
+async fn reset_reader_error_state(
+    ctx: &ServeCtx,
+    chat_id: i64,
+    message_id: i32,
+) -> bool {
+    let readers = ctx.readers.lock().await;
+    if let Some(reader) = readers.get(&(chat_id, message_id)) {
+        reader.reset_error_state().await;
+        log::info!("telegram: reset error state for stream {chat_id}/{message_id}");
+        true
+    } else {
+        log::warn!("telegram: retry requested for unknown stream {chat_id}/{message_id}");
+        false
+    }
 }
 
 fn empty(status: StatusCode) -> Response<StreamedBody> {

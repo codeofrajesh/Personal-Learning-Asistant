@@ -22,9 +22,10 @@
  * cards + file rows re-stagger on each drill.
  */
 
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { gsap } from "gsap";
+import { motion, AnimatePresence } from "framer-motion";
 import { Play, Plus, Bookmark, Check, ChevronRight, FileVideo, FileText, FileAudio, FileImage, File as FileLucide, Pin, Activity, Sparkles, LibraryBig } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
@@ -91,6 +92,10 @@ export default function CoursesPage() {
   const [boot, setBoot] = useState<Boot>({ kind: "loading" });
   const [children, setChildren] = useState<NodeCard[] | null>(null);
   const [materials, setMaterials] = useState<MaterialRowData[] | null>(null);
+  const [activeTab, setActiveTab] = useState<"all" | "lectures" | "notes">("all");
+  const [activeFilter, setActiveFilter] = useState<"all" | "cloud" | "offline">("all");
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
+
   const [crumbs, setCrumbs] = useState<NodeCrumb[]>([]);
   const [hub, setHub] = useState<HubData | null>(null);
   // Ids optimistically pinned/unpinned this session (overrides node.is_pinned in cards
@@ -99,6 +104,24 @@ export default function CoursesPage() {
   const openAddFolder = useMaterialManager((s) => s.openAddFolder);
   const importNonce = useMaterialManager((s) => s.importNonce);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  // Filter logic
+  const filteredMaterials = useMemo(() => {
+    if (!materials) return [];
+    return materials.filter(m => {
+      // 1. Tab filtering
+      const videoExtensions = ["mkv", "mp4", "mov", "avi", "webm", "flv", "m4v", "wmv", "mpg", "mpeg", "3gp", "ts"];
+      const isVideo = m.file_type === "VIDEO" || videoExtensions.includes(m.file_extension?.toLowerCase() || "");
+      if (activeTab === "lectures" && !isVideo) return false;
+      if (activeTab === "notes" && isVideo) return false;
+
+      // 2. Cloud/Offline filtering
+      if (activeFilter === "cloud" && m.source !== "telegram") return false;
+      if (activeFilter === "offline" && m.source === "telegram") return false;
+
+      return true;
+    });
+  }, [materials, activeTab, activeFilter]);
 
   const errMsg = (err: unknown) =>
     err instanceof NotInTauriError
@@ -487,23 +510,111 @@ export default function CoursesPage() {
           </section>
         )}
 
-        {!isRoot && boot.kind === "ready" && fileCount > 0 && (
+        {!isRoot && boot.kind === "ready" && (materials?.length ? materials.length > 0 : false) && (
           <section>
-            <h2 className="font-display mb-4 text-sm font-semibold uppercase tracking-wide text-content-secondary">
-              Files <span className="ml-1 text-xs font-normal text-content-faint">{fileCount}</span>
-            </h2>
-            <div className="flex flex-col gap-2.5">
-              {materials!.map((m, i) => (
-                <div key={m.id} className="cv-row">
-                  <LessonRow
-                    lesson={m}
-                    idxLabel={String(i + 1).padStart(2, "0")}
-                    missing={m.status === "missing"}
-                    onOpen={() => navigate(`/library/material/${m.id}`, withSource("courses"))}
-                    onToggleBookmark={() => void toggleBookmark(m.id)}
-                  />
-                </div>
-              ))}
+            {/* Header / Control Bar */}
+            <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              
+              {/* Animated Tab Bar */}
+              <div className="relative flex w-full sm:w-auto items-center p-1 bg-white/5 border border-white/10 rounded-full backdrop-blur-md shadow-[0_0_15px_rgba(0,0,0,0.2)]">
+                {(["all", "lectures", "notes"] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    onClick={() => setActiveTab(tab)}
+                    className={`relative flex-1 sm:flex-none px-6 py-2 text-sm font-medium tracking-wide capitalize transition-colors duration-200 z-10 outline-none ${
+                      activeTab === tab ? "text-white" : "text-content-muted hover:text-content-secondary"
+                    }`}
+                  >
+                    {activeTab === tab && (
+                      <motion.div
+                        layoutId="activeTabIndicator"
+                        className="absolute inset-0 bg-gradient-to-br from-blue-600/90 to-blue-400/90 rounded-full shadow-[inset_0_1px_0_rgba(255,255,255,0.3),_0_0_15px_rgba(59,130,246,0.5)] border border-blue-400/30"
+                        initial={false}
+                        transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                      />
+                    )}
+                    <span className="relative z-10 flex items-center justify-center gap-2 drop-shadow-sm">
+                      {tab === "all" ? (
+                        <LibraryBig className="w-4 h-4 drop-shadow-md" />
+                      ) : tab === "lectures" ? (
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="drop-shadow-md"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                      ) : (
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="drop-shadow-md"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+                      )}
+                      {tab}
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+              {/* Filter Dropdown */}
+              <div className="relative z-20">
+                <button
+                  onClick={() => setIsFilterOpen(!isFilterOpen)}
+                  className={`flex items-center gap-2 px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 ${
+                    activeFilter !== "all" 
+                      ? "bg-gradient-to-r from-emerald-500/20 to-teal-500/20 text-emerald-400 border border-emerald-500/30 shadow-[0_0_15px_rgba(16,185,129,0.15)] hover:from-emerald-500/30 hover:to-teal-500/30" 
+                      : "bg-gradient-to-r from-white/10 to-white/5 hover:from-white/15 hover:to-white/10 text-white border border-white/10 shadow-[0_0_10px_rgba(0,0,0,0.2)]"
+                  }`}
+                >
+                  <Activity className="w-4 h-4" />
+                  {activeFilter === "all" ? "All Sources" : activeFilter === "cloud" ? "Cloud Only" : "Offline Only"}
+                  <ChevronRight className={`w-4 h-4 transition-transform duration-200 ${isFilterOpen ? "rotate-90" : ""}`} />
+                </button>
+
+                <AnimatePresence>
+                  {isFilterOpen && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -10, scale: 0.95 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: -10, scale: 0.95 }}
+                      transition={{ duration: 0.15, ease: "easeOut" }}
+                      className="absolute right-0 mt-2 w-48 bg-[#1a1b1e]/95 backdrop-blur-xl border border-white/10 rounded-xl shadow-[0_10px_40px_rgba(0,0,0,0.5)] overflow-hidden z-50"
+                    >
+                      {(["all", "cloud", "offline"] as const).map((filter) => (
+                        <button
+                          key={filter}
+                          onClick={() => {
+                            setActiveFilter(filter);
+                            setIsFilterOpen(false);
+                          }}
+                          className={`w-full text-left px-4 py-3 text-sm flex items-center justify-between transition-colors outline-none focus-visible:bg-white/10 ${
+                            activeFilter === filter ? "bg-white/10 text-white" : "text-content-muted hover:bg-white/5 hover:text-content-secondary"
+                          }`}
+                        >
+                          <span className="capitalize">{filter === "all" ? "All Sources" : filter}</span>
+                          {activeFilter === filter && <Check className="w-4 h-4 text-emerald-400" />}
+                        </button>
+                      ))}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2.5 min-h-[200px]">
+              {filteredMaterials.length > 0 ? (
+                filteredMaterials.map((m, i) => (
+                  <div key={m.id} className="cv-row">
+                    <LessonRow
+                      lesson={m}
+                      idxLabel={String(i + 1).padStart(2, "0")}
+                      missing={m.status === "missing"}
+                      onOpen={() => navigate(`/library/material/${m.id}`, withSource("courses"))}
+                      onToggleBookmark={() => void toggleBookmark(m.id)}
+                    />
+                  </div>
+                ))
+              ) : (
+                <motion.div 
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="glass flex h-32 flex-col items-center justify-center gap-2 rounded-xl border border-white/5 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]"
+                >
+                  <p className="text-sm font-medium text-content-secondary">No {activeTab} found for this filter.</p>
+                  <p className="text-xs text-content-faint">Try changing your source filter.</p>
+                </motion.div>
+              )}
             </div>
           </section>
         )}
