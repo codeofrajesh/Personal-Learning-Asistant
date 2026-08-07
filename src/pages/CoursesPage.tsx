@@ -582,8 +582,10 @@ export default function CoursesPage() {
                             activeFilter === filter ? "bg-white/10 text-white" : "text-content-muted hover:bg-white/5 hover:text-content-secondary"
                           }`}
                         >
-                          <span className="capitalize">{filter === "all" ? "All Sources" : filter}</span>
-                          {activeFilter === filter && <Check className="w-4 h-4 text-emerald-400" />}
+                          <span className={activeFilter === filter ? "capitalize font-['Outfit'] font-bold tracking-wide text-emerald-300 drop-shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "capitalize font-['Outfit'] font-medium tracking-wide"}>
+                            {filter === "all" ? "All Sources" : filter}
+                          </span>
+                          {activeFilter === filter && <Check className="w-4 h-4 text-emerald-300 drop-shadow-[0_0_8px_rgba(52,211,153,0.8)]" />}
                         </button>
                       ))}
                     </motion.div>

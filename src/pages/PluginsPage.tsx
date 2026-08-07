@@ -22,6 +22,7 @@ import { motionAllowed } from "../lib/perfStore";
 import { pinnablePlugins } from "../lib/plugins/registry";
 import { usePins } from "../lib/plugins/pinStore";
 import { cn } from "../lib/utils";
+import { motion } from "framer-motion";
 import Breadcrumb from "../components/layout/Breadcrumb";
 
 /** Skeleton mirror of a plugin card (shape-matched, no data). */
@@ -95,59 +96,102 @@ export default function PluginsPage() {
                   const Icon = p.icon;
                   const pinned = pins[p.id] ?? p.nav?.defaultPinned ?? false;
                   const primary = p.routes[0]?.path;
+                  const isTelegram = p.id === "telegram";
+                  const borderColor = isTelegram ? "border-[#2AABEE]/20" : "border-lime/20";
+                  const bgGlow = isTelegram ? "group-hover/card:shadow-[0_20px_40px_rgba(42,171,238,0.15)]" : "group-hover/card:shadow-[0_20px_40px_rgba(163,230,53,0.15)]";
+
                   return (
-                    <div
-                      key={p.id}
-                      className="plugin-card group glass rounded-card shadow-card transition-all duration-200 hover:-translate-y-0.5 hover:shadow-card-hover"
-                    >
-                      <div className="flex items-start gap-3">
-                        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-btn border border-white/[0.06] bg-white/[0.05]">
-                          <Icon className="h-6 w-6 text-lime" />
-                        </span>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <h2 className="truncate text-sm font-semibold text-content-primary">
-                              {p.name}
-                            </h2>
-                            {pinned && (
-                              <span className="shrink-0 rounded-full bg-lime/10 px-1.5 py-0.5 text-[0.6rem] font-medium text-lime">
-                                Pinned
-                              </span>
-                            )}
+                    <div key={p.id} className="relative group/card perspective-1000">
+                      {/* Ambient background glow on hover */}
+                      <div
+                        className={cn(
+                          "absolute -inset-0.5 rounded-[1.5rem] opacity-0 blur-xl transition-all duration-700 group-hover/card:opacity-100",
+                          isTelegram ? "bg-gradient-to-br from-[#2AABEE]/40 to-transparent" : "bg-gradient-to-br from-lime/40 to-transparent"
+                        )}
+                      />
+                      
+                      <div
+                        className={cn(
+                          "plugin-card relative glass rounded-[1.25rem] p-5 border bg-gradient-to-b from-white/[0.04] to-transparent shadow-[0_8px_30px_rgb(0,0,0,0.12)] shadow-[inset_0_1px_0_rgba(255,255,255,0.1)] transition-all duration-300 group-hover/card:-translate-y-1 group-hover/card:bg-white/[0.06]",
+                          borderColor,
+                          bgGlow
+                        )}
+                      >
+                        <div className="flex items-start gap-4">
+                          <div className="relative shrink-0">
+                            <div
+                              className={cn(
+                                "absolute -inset-1 rounded-full opacity-0 blur-md transition-opacity duration-500 group-hover/card:opacity-100",
+                                isTelegram ? "bg-[#2AABEE]/50" : "bg-lime/50"
+                              )}
+                            />
+                            <span className="relative grid h-12 w-12 place-items-center rounded-2xl border border-white/10 bg-black/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]">
+                              <Icon className="h-7 w-7" />
+                              <span className="absolute inset-0 rounded-2xl ring-1 ring-inset ring-white/[0.05]" />
+                            </span>
                           </div>
-                          <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-content-muted">
-                            {p.description}
-                          </p>
+                          
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <h2 className="truncate text-base font-bold tracking-tight text-white drop-shadow-md">
+                                {p.name}
+                              </h2>
+                              {pinned && (
+                                <span
+                                  className={cn(
+                                    "shrink-0 rounded-full px-2 py-0.5 text-[0.65rem] font-bold uppercase tracking-wide shadow-sm",
+                                    isTelegram ? "bg-[#2AABEE]/10 border border-[#2AABEE]/20 text-[#2AABEE]" : "bg-lime/10 border border-lime/20 text-lime"
+                                  )}
+                                >
+                                  Pinned
+                                </span>
+                              )}
+                            </div>
+                            <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-content-muted transition-colors group-hover/card:text-content-secondary">
+                              {p.description}
+                            </p>
+                          </div>
                         </div>
-                      </div>
 
                       <div className="mt-4 flex items-center gap-2">
                         {/* Toggle: "Pin to nav" (wired to pinStore). */}
-                        <button
+                        <motion.button
+                          whileHover={{ scale: 1.05 }}
+                          whileTap={{ scale: 0.95 }}
                           type="button"
                           onClick={() => setPinned(p.id, !pinned)}
                           aria-pressed={pinned}
                           aria-label={pinned ? `Unpin ${p.name} from nav` : `Pin ${p.name} to nav`}
                           className={cn(
-                            "inline-flex items-center gap-1.5 rounded-btn border px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-white/[0.06]",
+                            "inline-flex items-center gap-1.5 rounded-btn border px-3 py-1.5 text-xs font-semibold transition-all relative overflow-hidden",
                             pinned
-                              ? "border-lime/40 bg-lime/10 text-lime"
-                              : "border-white/10 text-content-secondary"
+                              ? "border-lime/40 bg-lime/10 text-lime shadow-[0_0_10px_rgba(163,230,53,0.15)]"
+                              : "border-white/10 bg-white/[0.03] text-content-secondary hover:text-content-primary hover:bg-white/[0.06]"
                           )}
                         >
-                          <Pin size={13} strokeWidth={2} aria-hidden />
-                          {pinned ? "Pinned to nav" : "Pin to nav"}
-                        </button>
+                          {pinned && (
+                            <motion.div
+                              layoutId={`pin-glow-${p.id}`}
+                              className="absolute inset-0 bg-lime/10"
+                              initial={false}
+                              transition={{ type: "spring", stiffness: 300, damping: 20 }}
+                            />
+                          )}
+                          <Pin size={13} strokeWidth={2.5} aria-hidden className="relative z-10" />
+                          <span className="relative z-10">{pinned ? "Pinned" : "Pin to nav"}</span>
+                        </motion.button>
 
                         {/* Open the plugin's page. */}
                         {primary && (
-                          <Link
-                            to={primary}
-                            className="inline-flex items-center gap-1.5 rounded-btn border border-white/10 px-2.5 py-1.5 text-xs text-content-secondary transition-colors hover:bg-white/[0.05] hover:text-content-primary"
-                          >
-                            Open
-                            <ExternalLink size={12} strokeWidth={2} aria-hidden />
-                          </Link>
+                          <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+                            <Link
+                              to={primary}
+                              className="inline-flex items-center gap-1.5 rounded-btn border border-[#2AABEE]/30 bg-[#2AABEE]/10 px-4 py-1.5 text-xs font-semibold text-[#2AABEE] shadow-[0_0_10px_rgba(42,171,238,0.15)] transition-all hover:bg-[#2AABEE]/20 hover:border-[#2AABEE]/50 hover:shadow-[0_0_15px_rgba(42,171,238,0.3)]"
+                            >
+                              Open
+                              <ExternalLink size={13} strokeWidth={2.5} aria-hidden />
+                            </Link>
+                          </motion.div>
                         )}
                         <span className="ml-auto inline-flex items-center gap-1 text-[0.65rem] text-content-faint">
                           <MoreHorizontal size={13} strokeWidth={2} aria-hidden />
@@ -155,6 +199,7 @@ export default function PluginsPage() {
                         </span>
                       </div>
                     </div>
+                  </div>
                   );
                 })}
           </div>

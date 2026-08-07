@@ -8,12 +8,13 @@
  * Replaces the old ChapterSidebar in the player page.
  */
 
-import { memo, useRef, useState } from "react";
+import { memo, useRef, useState, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import type { MaterialRow } from "../../lib/types";
 import { withSource, type NavSource } from "../../lib/navigation";
 import { cn } from "../../lib/utils";
-import { ChevronDown, ChevronUp, CheckCircle, AlertTriangle, Video, PlayCircle, Circle, AudioLines } from "lucide-react";
+import { ChevronDown, ChevronUp, CheckCircle, AlertTriangle, Video, PlayCircle, Circle, AudioLines, LibraryBig, Activity, ChevronRight } from "lucide-react";
+import { motion } from "framer-motion";
 import { gsap } from "gsap";
 import { useGSAP } from "@gsap/react";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -46,6 +47,27 @@ function LessonOverviewView({ siblings, currentId, source, embedded = false }: P
   const containerRef = useRef<HTMLElement>(null);
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<number | null>(null);
+
+  const [activeTab, setActiveTab] = useState<"all" | "lectures" | "notes">("all");
+  const [activeFilter, setActiveFilter] = useState<"all" | "cloud" | "offline">("all");
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
+
+  const filteredSiblings = useMemo(() => {
+    if (!siblings) return [];
+    return siblings.filter(m => {
+      // 1. Tab filtering
+      const videoExtensions = ["mkv", "mp4", "mov", "avi", "webm", "flv", "m4v", "wmv", "mpg", "mpeg", "3gp", "ts"];
+      const isVideo = m.file_type === "VIDEO" || videoExtensions.includes(m.file_extension?.toLowerCase() || "");
+      if (activeTab === "lectures" && !isVideo) return false;
+      if (activeTab === "notes" && isVideo) return false;
+
+      // 2. Cloud/Offline filtering
+      if (activeFilter === "cloud" && m.source !== "telegram") return false;
+      if (activeFilter === "offline" && m.source === "telegram") return false;
+
+      return true;
+    });
+  }, [siblings, activeTab, activeFilter]);
 
   useGSAP(() => {
     // Stagger animation from the bottom up on mount
@@ -100,8 +122,8 @@ function LessonOverviewView({ siblings, currentId, source, embedded = false }: P
             "w-[480px] rounded-[32px] bg-[#F4F4F6] p-7 shadow-2xl mx-6 mb-6 mt-6",
       )}
     >
-      {/* Header */}
-      <div className="shrink-0 pb-6 pl-2 pt-2">
+      {/* Header & Filters */}
+      <div className="shrink-0 pb-4 pl-2 pt-2 flex flex-col gap-4">
         <h2
           className={cn(
             "text-[24px] font-medium tracking-tight",
@@ -111,12 +133,106 @@ function LessonOverviewView({ siblings, currentId, source, embedded = false }: P
         >
           Lesson Overview
         </h2>
+
+        {/* Filters Row */}
+        <div className="flex items-center gap-2 pr-2 relative z-20">
+          {/* Animated Tab Bar */}
+          <div className={cn(
+            "relative flex items-center p-0.5 rounded-full backdrop-blur-md shadow-sm border",
+            embedded ? "bg-white/5 border-white/10" : "bg-black/5 border-black/10"
+          )}>
+            {(["all", "lectures", "notes"] as const).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={cn(
+                  "relative px-3 py-1 text-[12px] font-medium tracking-wide capitalize transition-colors duration-200 z-10 outline-none",
+                  activeTab === tab 
+                    ? "text-white" 
+                    : (embedded ? "text-white/60 hover:text-white" : "text-black/60 hover:text-black")
+                )}
+              >
+                {activeTab === tab && (
+                  <motion.div
+                    layoutId="lessonOverviewActiveTab"
+                    className="absolute inset-0 bg-gradient-to-br from-blue-600/90 to-blue-400/90 rounded-full shadow-[inset_0_1px_0_rgba(255,255,255,0.3),_0_0_15px_rgba(59,130,246,0.5)] border border-blue-400/30"
+                    initial={false}
+                    transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                  />
+                )}
+                <span className="relative z-10 flex items-center justify-center gap-1.5 drop-shadow-sm">
+                  {tab === "all" ? (
+                    <LibraryBig className="w-3 h-3 drop-shadow-md" />
+                  ) : tab === "lectures" ? (
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="drop-shadow-md"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                  ) : (
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="drop-shadow-md"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+                  )}
+                  {tab}
+                </span>
+              </button>
+            ))}
+          </div>
+
+          <div className="flex-1" />
+
+          {/* Filter Dropdown */}
+          <div className="relative z-20">
+            <button
+              onClick={() => setIsFilterOpen(!isFilterOpen)}
+              className={cn(
+                "flex items-center gap-1.5 px-3 py-1 rounded-full text-[12px] font-medium transition-all duration-300 shadow-sm border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50",
+                activeFilter !== "all"
+                  ? "bg-gradient-to-r from-emerald-500/20 to-teal-500/20 text-emerald-500 border-emerald-500/30 hover:from-emerald-500/30 hover:to-teal-500/30"
+                  : (embedded ? "bg-white/5 hover:bg-white/10 text-white border-white/10" : "bg-black/5 hover:bg-black/10 text-[#1A1A24] border-black/10")
+              )}
+            >
+              <Activity className="w-3 h-3" />
+              {activeFilter === "all" ? "All Sources" : activeFilter === "cloud" ? "Cloud Only" : "Offline Only"}
+              <ChevronRight className={cn("w-3 h-3 transition-transform duration-200", isFilterOpen && "rotate-90")} />
+            </button>
+            
+            {/* Dropdown Menu */}
+            {isFilterOpen && (
+              <div className={cn(
+                "absolute right-0 top-full mt-2 w-36 origin-top-right rounded-xl border p-1 shadow-2xl backdrop-blur-xl z-[60]",
+                embedded ? "bg-[#1C1C20]/95 border-white/10" : "bg-white border-black/10"
+              )}>
+                {(["all", "cloud", "offline"] as const).map((opt) => (
+                  <button
+                    key={opt}
+                    onClick={() => {
+                      setActiveFilter(opt);
+                      setIsFilterOpen(false);
+                    }}
+                    className={cn(
+                      "flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors",
+                      activeFilter === opt 
+                        ? (embedded ? "bg-white/10 text-white" : "bg-black/5 text-black")
+                        : (embedded ? "text-content-secondary hover:bg-white/5 hover:text-content-primary" : "text-black/60 hover:bg-black/5 hover:text-black")
+                    )}
+                  >
+                    <span className={cn(
+                      "capitalize font-['Outfit'] tracking-wide",
+                      activeFilter === opt
+                        ? (embedded ? "font-bold text-emerald-300 drop-shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "font-bold text-emerald-600 drop-shadow-[0_0_8px_rgba(52,211,153,0.4)]")
+                        : "font-medium"
+                    )}>
+                      {opt === "all" ? "All Sources" : opt}
+                    </span>
+                    {activeFilter === opt && <CheckCircle className={cn("h-3.5 w-3.5", embedded ? "text-emerald-300 drop-shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "text-emerald-600 drop-shadow-[0_0_8px_rgba(52,211,153,0.4)]")} />}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Lesson list */}
       <div className="scroll-thin min-h-0 flex-1 overflow-y-auto pr-2">
         <ul className="flex flex-col gap-4 pb-4">
-          {siblings.map((m, i) => {
+          {filteredSiblings.map((m, i) => {
             // 0..100 clamped progress percentage
             const pct = Math.max(0, Math.min(100, m.progress_pct));
             

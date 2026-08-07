@@ -17,7 +17,7 @@
  */
 
 import type { PluginManifest } from "../../lib/plugins/types";
-import { SendHorizontal } from "lucide-react";
+import { TelegramIcon } from "../../components/ui/TelegramIcon";
 import { createElement, lazy, Suspense } from "react";
 import { useAuth } from "./authStore";
 
@@ -36,7 +36,7 @@ export const telegramManifest: PluginManifest = {
   name: "Telegram",
   version: "0.3.0",
   description: "Stream and import private-channel media from your Telegram account.",
-  icon: SendHorizontal,
+  icon: TelegramIcon,
   // A plugin in the sidebar is a *preference*, not a constant — Telegram starts unpinned
   // so a fresh install leaves the nav untouched; the hub + Settings let the user pin it.
   // (Open decision #2 in telegram.md: consider auto-pinning after the first Connect.)

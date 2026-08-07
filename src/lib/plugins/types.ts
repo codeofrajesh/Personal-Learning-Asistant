@@ -106,7 +106,7 @@ export function validateManifest(m: PluginManifest): string[] {
   if (!/^[a-z0-9-]+$/.test(m.id)) {
     problems.push(`${m.name}: id must be [a-z0-9-]`);
   }
-  if (m.routes.length === 0) {
+  if (m.routes.length === 0 && !m.core) {
     problems.push(`${m.id}: a plugin needs at least one route`);
   }
 
