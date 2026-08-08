@@ -281,6 +281,12 @@ export default function CoursesPage() {
               : undefined,
           duration: 4000,
         });
+        // If we were viewing the deleted folder, navigate up to its parent so we never
+        // land on a now-empty/invalid page (the card would show "folder is empty").
+        if (nodeId === target.node.id) {
+          const up = crumbs.length >= 2 ? crumbs[crumbs.length - 2].id : null;
+          navigate(up != null ? `/courses/${up}` : "/courses");
+        }
       } else {
         pushToast({
           tone: "success",
