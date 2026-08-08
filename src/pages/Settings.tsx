@@ -579,16 +579,21 @@ function SoftwareUpdate() {
     setDownloading(true);
     setError(null);
     let downloaded = 0;
+    let contentLength = 0;
     try {
       await updateInfo.downloadAndInstall((event: any) => {
         switch (event.event) {
           case 'Started':
+            contentLength = event.data.contentLength || 0;
             setProgress(0);
             break;
           case 'Progress':
             downloaded += event.data.chunkLength;
-            if (event.data.contentLength) {
-              setProgress(Math.round((downloaded / event.data.contentLength) * 100));
+            if (contentLength > 0) {
+              setProgress(Math.round((downloaded / contentLength) * 100));
+            } else {
+              // Indeterminate state fallback if length is missing
+              setProgress((prev) => Math.min(prev + 1, 99));
             }
             break;
           case 'Finished':
@@ -596,8 +601,8 @@ function SoftwareUpdate() {
             break;
         }
       });
-      const { relaunch } = await import("@tauri-apps/plugin-process");
-      await relaunch();
+      const { exit } = await import("@tauri-apps/plugin-process");
+      await exit(0);
     } catch (e) {
       setError(errMsg(e));
       setDownloading(false);

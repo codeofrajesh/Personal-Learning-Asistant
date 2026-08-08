@@ -16,6 +16,7 @@
     "dialog:allow-save",
     "libmpv:default",
     "updater:default",
-    "process:default"
+    "process:default",
+    "process:allow-exit"
   ]
 }
