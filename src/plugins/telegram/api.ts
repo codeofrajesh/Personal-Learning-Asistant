@@ -12,6 +12,7 @@
  */
 
 import { invokeCommand, isTauri } from "../../lib/ipc";
+import type { RemoveOutcome } from "../../lib/types";
 
 /**
  * Wire status from `tg_check_auth`.
@@ -160,6 +161,12 @@ export const tg = {
    */
   async importHistory(limit?: number): Promise<TgImportedMaterial[]> {
     return invokeCommand("tg_import_history", { limit: limit ?? null });
+  },
+
+  /** Delete an imported Telegram material from the library (same backend command
+   *  as a local material — study sessions detach, local file is removed, event fires). */
+  async removeMaterial(materialId: number): Promise<RemoveOutcome> {
+    return invokeCommand("remove_material", { materialId });
   },
 };
 

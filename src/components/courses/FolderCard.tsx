@@ -11,7 +11,7 @@
 
 import { memo } from "react";
 import { Link } from "react-router-dom";
-import { ChevronRight, FolderOpen } from "lucide-react";
+import { ChevronRight, FolderOpen, Trash2 } from "lucide-react";
 import type { NodeCard as NodeCardData } from "../../lib/types";
 import CoverArt from "../ui/CoverArt";
 import PinButton from "./PinButton";
@@ -20,12 +20,16 @@ function FolderCardView({
   node,
   pinned,
   onTogglePin,
+  onDelete,
 }: {
   node: NodeCardData;
   /** Current pinned state (parent-controlled for optimistic toggles). Omit to hide the pin. */
   pinned?: boolean;
   /** When provided, renders the hub Pin overlay wired to this handler. */
   onTogglePin?: () => void;
+  /** When provided, renders a hover-revealed delete button. The click is stopped from
+   *  bubbling so deleting never drills into the card's Link. */
+  onDelete?: () => void;
 }) {
   const {
     id,
@@ -39,6 +43,7 @@ function FolderCardView({
   const pct =
     material_count > 0 ? Math.round((completed_count / material_count) * 100) : 0;
   const showPin = onTogglePin != null;
+  const showDelete = onDelete != null;
 
   return (
     <Link
@@ -63,6 +68,23 @@ function FolderCardView({
             onToggle={onTogglePin}
             className="absolute right-2 top-2 z-10"
           />
+        )}
+        {showDelete && (
+          <button
+            type="button"
+            onClick={(e) => {
+              // CRITICAL: don't let the trash click drill into the card's Link.
+              e.preventDefault();
+              e.stopPropagation();
+              onDelete();
+            }}
+            aria-label={`Delete folder: ${name}`}
+            title="Delete folder"
+            className="absolute right-2 top-2 z-10 grid h-9 w-9 place-items-center rounded-btn border border-white/10 bg-black/40 text-white/60 opacity-0 backdrop-blur-sm transition-all duration-200 hover:border-orange/40 hover:bg-orange/20 hover:text-orange focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange/40 group-hover:opacity-100"
+            style={showPin ? { right: "3.25rem" } : undefined}
+          >
+            <Trash2 size={16} strokeWidth={2} aria-hidden />
+          </button>
         )}
       </div>
 

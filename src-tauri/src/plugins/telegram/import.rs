@@ -825,6 +825,8 @@ pub fn tg_import_history(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn classifies_by_extension_first() {
         // The extension is what the player's routing already understands, and Telegram sets

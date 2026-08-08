@@ -477,6 +477,16 @@ export interface NodeCrumb {
   depth: number;
 }
 
+/** What a delete removed (backend `RemoveOutcome`), for the confirm-flow toast. */
+export interface RemoveOutcome {
+  /** Nodes (folders) removed, including the target. 0 for a single-material delete. */
+  nodes_deleted: number;
+  /** Material (lesson) rows removed. */
+  materials_deleted: number;
+  /** Local files best-effort removed from disk. */
+  files_deleted: number;
+}
+
 // ── Planning / Scheduling / Intelligence (v9 — commands::plan) ──────────────
 //
 // All times here are LOCAL wall-clock, never UTC: `day` is 'YYYY-MM-DD' and times

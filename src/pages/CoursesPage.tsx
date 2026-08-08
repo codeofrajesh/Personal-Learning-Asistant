@@ -26,11 +26,12 @@ import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, useMem
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { gsap } from "gsap";
 import { motion, AnimatePresence } from "framer-motion";
-import { Play, Plus, Bookmark, Check, ChevronRight, FileVideo, FileText, FileAudio, FileImage, File as FileLucide, Pin, Activity, Sparkles, LibraryBig } from "lucide-react";
+import { Play, Plus, Bookmark, Check, ChevronRight, FileVideo, FileText, FileAudio, FileImage, File as FileLucide, Pin, Activity, Sparkles, LibraryBig, Trash2 } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
 import FolderCard from "../components/courses/FolderCard";
 import CourseHubSection from "../components/courses/CourseHubSection";
+import ConfirmDeleteModal from "../components/ui/ConfirmDeleteModal";
 
 import ProgressRing from "../components/courses/ProgressRing";
 import CoverArt from "../components/ui/CoverArt";
@@ -38,6 +39,7 @@ import { DEPTH_CAP } from "../components/wizard/FolderPreview";
 import { useMaterialManager } from "../lib/materialManagerStore";
 import { motionAllowed } from "../lib/perfStore";
 import { ipc, isTauri, NotInTauriError, onLibraryChanged } from "../lib/ipc";
+import { useToastStore } from "../lib/toastStore";
 import { cn } from "../lib/utils";
 import { withSource } from "../lib/navigation";
 import type {
@@ -45,6 +47,7 @@ import type {
   NodeCard,
   NodeCrumb,
   RecentMaterial,
+  RemoveOutcome,
 } from "../lib/types";
 
 type Boot =
@@ -61,6 +64,11 @@ interface HubData {
   recent: NodeCard[];
   continueLearning: RecentMaterial[];
 }
+
+/** What the delete-confirm modal is about to remove. */
+type DeleteTarget =
+  | { kind: "folder"; node: NodeCard }
+  | { kind: "material"; material: MaterialRowData };
 
 const TYPE_GLYPH: Record<string, string> = {
   video: "🎬",
@@ -104,6 +112,18 @@ export default function CoursesPage() {
   const openAddFolder = useMaterialManager((s) => s.openAddFolder);
   const importNonce = useMaterialManager((s) => s.importNonce);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  // ── Unified deletion (ConfirmDeleteModal) ───────────────────────────────────
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const pushToast = useToastStore((s) => s.push);
+
+  const closeDelete = useCallback(() => {
+    if (deleteBusy) return; // never close mid-flight
+    setDeleteTarget(null);
+    setDeleteError(null);
+  }, [deleteBusy]);
 
   // Filter logic
   const filteredMaterials = useMemo(() => {
@@ -236,6 +256,56 @@ export default function CoursesPage() {
           : prev,
       );
     }
+  }, []);
+
+  /** Run the delete, surface a toast with the real counts, then refetch. The backend
+   *  emits `library://changed` on success, but we refresh immediately (no race). */
+  const confirmDelete = useCallback(async () => {
+    const target = deleteTarget;
+    if (!target) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      const outcome: RemoveOutcome =
+        target.kind === "folder"
+          ? await ipc.removeNode(target.node.id)
+          : await ipc.removeMaterial(target.material.id);
+
+      if (target.kind === "folder") {
+        pushToast({
+          tone: "success",
+          title: "Folder deleted",
+          body:
+            outcome.materials_deleted > 0
+              ? `Removed ${outcome.materials_deleted} file${outcome.materials_deleted === 1 ? "" : "s"}`
+              : undefined,
+          duration: 4000,
+        });
+      } else {
+        pushToast({
+          tone: "success",
+          title: "Lesson deleted",
+          body: outcome.files_deleted > 0 ? "File removed from disk" : undefined,
+          duration: 4000,
+        });
+      }
+      setDeleteTarget(null);
+      void load();
+    } catch (err) {
+      setDeleteError(errMsg(err));
+    } finally {
+      setDeleteBusy(false);
+    }
+  }, [deleteTarget, load, pushToast]);
+
+  const openDeleteFolder = useCallback((node: NodeCard) => {
+    setDeleteError(null);
+    setDeleteTarget({ kind: "folder", node });
+  }, []);
+
+  const openDeleteMaterial = useCallback((m: MaterialRowData) => {
+    setDeleteError(null);
+    setDeleteTarget({ kind: "material", material: m });
   }, []);
 
   // Live-refresh when a watched folder changes (new imports / rescans).
@@ -453,6 +523,7 @@ export default function CoursesPage() {
                 exploreTo="/explore/pinned"
                 pinnedIds={pinnedIds}
                 onTogglePin={togglePin}
+                onDelete={openDeleteFolder}
               />
             )}
 
@@ -466,6 +537,7 @@ export default function CoursesPage() {
                 accent="#22d3ee"
                 pinnedIds={pinnedIds}
                 onTogglePin={togglePin}
+                onDelete={openDeleteFolder}
               />
             )}
 
@@ -479,6 +551,7 @@ export default function CoursesPage() {
                 accent="#f59e0b"
                 pinnedIds={pinnedIds}
                 onTogglePin={togglePin}
+                onDelete={openDeleteFolder}
               />
             )}
 
@@ -491,6 +564,7 @@ export default function CoursesPage() {
                 exploreTo="/explore/all"
                 pinnedIds={pinnedIds}
                 onTogglePin={togglePin}
+                onDelete={openDeleteFolder}
               />
             )}
           </div>
@@ -504,7 +578,11 @@ export default function CoursesPage() {
             </h2>
             <div className="grid grid-cols-2 gap-gutter lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
               {children!.map((node) => (
-                <FolderCard key={node.id} node={node} />
+                <FolderCard
+                  key={node.id}
+                  node={node}
+                  onDelete={() => openDeleteFolder(node)}
+                />
               ))}
             </div>
           </section>
@@ -604,6 +682,7 @@ export default function CoursesPage() {
                       missing={m.status === "missing"}
                       onOpen={() => navigate(`/library/material/${m.id}`, withSource("courses"))}
                       onToggleBookmark={() => void toggleBookmark(m.id)}
+                      onDelete={() => openDeleteMaterial(m)}
                     />
                   </div>
                 ))
@@ -671,6 +750,30 @@ export default function CoursesPage() {
           </div>
         )}
       </div>
+
+      {/* Unified deletion confirm — folder subtree vs single lesson */}
+      <ConfirmDeleteModal
+        open={deleteTarget != null}
+        kind={deleteTarget?.kind ?? "material"}
+        name={
+          deleteTarget?.kind === "folder"
+            ? deleteTarget.node.name
+            : deleteTarget?.kind === "material"
+              ? deleteTarget.material.file_name
+              : ""
+        }
+        detail={
+          deleteTarget?.kind === "folder"
+            ? `${deleteTarget.node.material_count} file${
+                deleteTarget.node.material_count === 1 ? "" : "s"
+              }${deleteTarget.node.child_count > 0 ? ` · ${deleteTarget.node.child_count} subfolder${deleteTarget.node.child_count === 1 ? "" : "s"}` : ""}`
+            : undefined
+        }
+        isBusy={deleteBusy}
+        error={deleteError}
+        onCancel={closeDelete}
+        onConfirm={() => void confirmDelete()}
+      />
     </div>
   );
 }
@@ -690,12 +793,14 @@ const LessonRow = memo(function LessonRow({
   missing,
   onOpen,
   onToggleBookmark,
+  onDelete,
 }: {
   lesson: MaterialRowData;
   idxLabel: string;
   missing: boolean;
   onOpen: () => void;
   onToggleBookmark: () => void;
+  onDelete?: () => void;
 }) {
   const done = lesson.is_completed;
   const dur = lesson.duration_secs;
@@ -784,6 +889,23 @@ const LessonRow = memo(function LessonRow({
           aria-hidden
         />
       </button>
+
+      {/* Delete — hover-revealed trash, so it never gets in the way of the row's
+          play/bookmark actions. Stops propagation so it never opens the lesson. */}
+      {onDelete && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          aria-label={`Delete lesson: ${lesson.file_name}`}
+          title="Delete lesson"
+          className="grid h-8 w-8 shrink-0 place-items-center rounded-btn text-white/25 opacity-0 transition-all duration-200 hover:bg-orange/15 hover:text-orange focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-orange/40 group-hover:opacity-100"
+        >
+          <Trash2 size={16} strokeWidth={2} aria-hidden />
+        </button>
+      )}
 
       {/* Status: subtle-green ✔ Done, or muted-orange Start › */}
       {done ? (

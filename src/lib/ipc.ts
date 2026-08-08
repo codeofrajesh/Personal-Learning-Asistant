@@ -41,6 +41,7 @@ import type {
   RecoveryReport,
   RegisteredDir,
   ReminderState,
+  RemoveOutcome,
   RescanCounts,
   ScanProgress,
   ScoreWindow,
@@ -184,6 +185,19 @@ export const ipc = {
   /** Pin or unpin a node (the hub "Pin" control). Mirrors `setBookmark`. */
   setNodePinned(nodeId: number, pinned: boolean): Promise<void> {
     return call<void>("set_node_pinned", { nodeId, pinned });
+  },
+
+  /** Delete a folder node and its ENTIRE subtree — all subfolders and materials inside it.
+   *  Study sessions detach, local files are removed from disk, and `library://changed`
+   *  fires so every open page refetches. */
+  removeNode(nodeId: number): Promise<RemoveOutcome> {
+    return call<RemoveOutcome>("remove_node", { nodeId });
+  },
+
+  /** Delete a single material (lesson) row. Study sessions detach, local files are
+   *  removed from disk, and `library://changed` fires. */
+  removeMaterial(materialId: number): Promise<RemoveOutcome> {
+    return call<RemoveOutcome>("remove_material", { materialId });
   },
 
   /** Player: the material to open + siblings for the chapter sidebar. */

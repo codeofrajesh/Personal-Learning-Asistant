@@ -1225,6 +1225,211 @@ pub fn node_materials(conn: &Connection, node_id: i64) -> AppResult<Vec<Material
     list_materials(conn, node_id)
 }
 
+// ── Unified deletion (remove_node / remove_material) ──────────────────────────
+//
+// Deleting in this schema is NOT a bare `DELETE`. With `PRAGMA foreign_keys = ON` (set in
+// `connection.rs`), the only reference to `materials(id)` without an ON DELETE action is
+// `study_sessions.material_id` (NO ACTION) — deleting a material that has study sessions
+// would raise "FOREIGN KEY constraint failed" and crash the command. So every delete
+// FIRST detaches those sessions (`material_id = NULL`, preserving the study-time history
+// that feeds the activity chart + streak), then removes the rows. Everything else is safe
+// by declaration: watch_progress/notes/exams/node_velocity CASCADE,
+// tasks/plan_blocks/plan_template_blocks SET NULL, and the FTS triggers clean the index.
+//
+// `remove_node` walks the ENTIRE subtree (recursive CTE — same shape the tree-browser
+// rollups use) so a folder deletion recursively removes every descendant folder + every
+// material inside them, in one transaction.
+//
+// The query functions are deliberately DB-only: the command layer performs the disk
+// cleanup (best-effort removal of local files so a later watcher rescan can't silently
+// re-import them) and the OS-watcher teardown (a deleted registered-dir root would
+// otherwise keep being watched).
+
+/// What a delete removed — returned to the frontend so the confirm flow can say exactly
+/// what happened ("Deleted folder + 12 files").
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RemoveOutcome {
+    /// Nodes (folders) removed, including the target. 0 for a single-material delete.
+    pub nodes_deleted: i64,
+    /// Material (lesson) rows removed.
+    pub materials_deleted: i64,
+    /// Local files best-effort removed from disk.
+    pub files_deleted: i64,
+}
+
+/// Internal payload the command layer needs to finish a deletion: the serialized
+/// outcome plus the disk paths + watcher ids that only the command layer may touch.
+pub struct DeletionResult {
+    pub outcome: RemoveOutcome,
+    /// Absolute paths of local (`source = 'local'`) files removed from the DB, so the
+    /// command layer can best-effort delete them from disk. Telegram rows are never here.
+    pub local_files: Vec<String>,
+    /// `registered_dirs` ids whose root node was deleted — their OS watches must be dropped.
+    pub unwatch_dir_ids: Vec<i64>,
+}
+
+/// Delete a single material (lesson) row. `NotFound` if the id doesn't exist.
+///
+/// Detaches `study_sessions`, then deletes the row (watch_progress/notes CASCADE,
+/// tasks/plan_blocks SET NULL, FTS trigger cleans the index). The local file path is
+/// captured first for the command layer's best-effort disk cleanup.
+pub fn remove_material(conn: &mut Connection, material_id: i64) -> AppResult<DeletionResult> {
+    let tx = conn.transaction()?;
+
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM materials WHERE id = ?1)",
+        [material_id],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Err(crate::utils::errors::AppError::NotFound(format!(
+            "material {material_id} not found"
+        )));
+    }
+
+    // Capture the disk path before the row goes away (Telegram rows have a `tg://` key
+    // and must never be treated as a filesystem path).
+    let local_path: Option<String> = tx
+        .query_row(
+            "SELECT file_path FROM materials WHERE id = ?1 AND source = 'local'",
+            [material_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    // The ONE FK with no ON DELETE action — null it out or the DELETE below trips
+    // `PRAGMA foreign_keys` (which the app forces ON in connection.rs).
+    tx.execute(
+        "UPDATE study_sessions SET material_id = NULL WHERE material_id = ?1",
+        [material_id],
+    )?;
+
+    tx.execute("DELETE FROM materials WHERE id = ?1", [material_id])?;
+
+    tx.commit()?;
+
+    Ok(DeletionResult {
+        outcome: RemoveOutcome {
+            nodes_deleted: 0,
+            materials_deleted: 1,
+            files_deleted: 0, // filled by the command layer after disk cleanup
+        },
+        local_files: local_path.into_iter().collect(),
+        unwatch_dir_ids: Vec::new(),
+    })
+}
+
+/// Recursive subtree CTE: the node itself + every descendant, bound to `?1`. Same shape
+/// the tree-browser rollups use, so the delete covers the exact same set a folder card
+/// claims to represent.
+const SUBTREE_CTE: &str = "WITH RECURSIVE subtree(id) AS (
+        SELECT ?1
+        UNION ALL
+        SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+    )";
+
+/// Delete a folder node and its ENTIRE subtree — every descendant subfolder and every
+/// material inside them — in one transaction. `NotFound` if the id doesn't exist.
+///
+/// Order matters, and it is the reverse of how the rows were created:
+///   1. detach `study_sessions` for every material in the subtree (FK safety);
+///   2. delete the materials (CASCADE cleans watch_progress/notes, SET NULL cleans
+///      tasks/plan_blocks, FTS triggers clean the index);
+///   3. delete the nodes (registered_dirs/exams/node_velocity CASCADE, plan_blocks /
+///      plan_template_blocks SET NULL). `parent_id` can't dangle: every ancestor of a
+///      deleted node is itself in `subtree`.
+pub fn remove_node(conn: &mut Connection, node_id: i64) -> AppResult<DeletionResult> {
+    let tx = conn.transaction()?;
+
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nodes WHERE id = ?1)",
+        [node_id],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Err(crate::utils::errors::AppError::NotFound(format!(
+            "node {node_id} not found"
+        )));
+    }
+
+    // Local disk paths in the subtree — captured before deletion for disk cleanup.
+    let local_files: Vec<String> = {
+        let mut stmt = tx.prepare(&format!(
+            "{SUBTREE_CTE}
+             SELECT file_path FROM materials
+             WHERE source = 'local' AND node_id IN (SELECT id FROM subtree)"
+        ))?;
+        let rows = stmt.query_map([node_id], |r| r.get::<_, String>(0))?;
+        let mut v = Vec::new();
+        for r in rows {
+            v.push(r?);
+        }
+        v
+    };
+
+    // Registered folders rooted inside this subtree — the command layer drops their OS
+    // watches so a deleted root can't keep being rescanned (FK-failing) on every file event.
+    let unwatch_dir_ids: Vec<i64> = {
+        let mut stmt = tx.prepare(&format!(
+            "{SUBTREE_CTE}
+             SELECT id FROM registered_dirs WHERE root_node_id IN (SELECT id FROM subtree)"
+        ))?;
+        let rows = stmt.query_map([node_id], |r| r.get::<_, i64>(0))?;
+        let mut v = Vec::new();
+        for r in rows {
+            v.push(r?);
+        }
+        v
+    };
+
+    let node_count: i64 = tx.query_row(
+        &format!("{SUBTREE_CTE} SELECT COUNT(*) FROM subtree"),
+        [node_id],
+        |r| r.get(0),
+    )?;
+
+    // 1. Detach study sessions for every material in the subtree (FK safety, see above).
+    tx.execute(
+        &format!(
+            "{SUBTREE_CTE}
+             UPDATE study_sessions SET material_id = NULL
+             WHERE material_id IN (
+                SELECT id FROM materials WHERE node_id IN (SELECT id FROM subtree)
+             )"
+        ),
+        [node_id],
+    )?;
+
+    // 2. Delete the materials.
+    let materials_deleted = tx.execute(
+        &format!(
+            "{SUBTREE_CTE}
+             DELETE FROM materials WHERE node_id IN (SELECT id FROM subtree)"
+        ),
+        [node_id],
+    )? as i64;
+
+    // 3. Delete the nodes themselves.
+    tx.execute(
+        &format!(
+            "{SUBTREE_CTE} DELETE FROM nodes WHERE id IN (SELECT id FROM subtree)"
+        ),
+        [node_id],
+    )?;
+
+    tx.commit()?;
+
+    Ok(DeletionResult {
+        outcome: RemoveOutcome {
+            nodes_deleted: node_count,
+            materials_deleted,
+            files_deleted: 0, // filled by the command layer after disk cleanup
+        },
+        local_files,
+        unwatch_dir_ids,
+    })
+}
+
 // ── Courses (LMS re-architecture) ─────────────────────────────────────────────
 //
 // `course_view` flattens every material across a subject's chapters into one
@@ -3606,5 +3811,190 @@ mod tests {
         let recent = recent_nodes(&conn).unwrap();
         assert_eq!(recent.len(), 3, "all roots appear in Recently Added");
         assert_eq!(recent[0].id, untouched, "newest root first (highest id)");
+    }
+
+    // ── Unified deletion (remove_material / remove_node) ──────────────────────
+
+    /// remove_material must succeed even when study_sessions reference the row — the
+    /// ONLY FK with no ON DELETE action. Without the detach-first step the delete would
+    /// raise "FOREIGN KEY constraint failed" (the app forces `foreign_keys = ON`).
+    #[test]
+    fn remove_material_detaches_study_sessions_and_deletes() {
+        let mut conn = test_conn();
+        let node = upsert_root_node(&conn, "Course").unwrap();
+        insert_material(&conn, node, &file("/lib/a.mp4", "a.mp4", 100)).unwrap();
+        let mat = conn.last_insert_rowid();
+        // A real study session + a task linked to the material (SET NULL must fire).
+        conn.execute(
+            "INSERT INTO study_sessions(material_id, started_at, duration_secs)
+             VALUES(?1, '2026-01-01 10:00:00', 60)",
+            [mat],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title, material_id) VALUES('review', ?1)",
+            [mat],
+        )
+        .unwrap();
+
+        let result = remove_material(&mut conn, mat).unwrap();
+        assert_eq!(result.outcome.materials_deleted, 1);
+        assert_eq!(result.outcome.nodes_deleted, 0);
+
+        let gone: i64 = conn
+            .query_row("SELECT COUNT(*) FROM materials WHERE id = ?1", [mat], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gone, 0, "the row is deleted");
+        let (n_sessions, n_dangling): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(CASE WHEN material_id IS NULL THEN 1 ELSE 0 END)
+                 FROM study_sessions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n_sessions, 1, "study history is preserved, not destroyed");
+        assert_eq!(n_dangling, 1, "its material link was detached, not left dangling");
+        // The linked task kept its row with the link dropped (ON DELETE SET NULL).
+        let task_link: Option<i64> = conn
+            .query_row("SELECT material_id FROM tasks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(task_link, None, "tasks keep the row, drop the link");
+    }
+
+    /// remove_material on a missing id is NotFound, not a silent no-op.
+    #[test]
+    fn remove_material_missing_is_not_found() {
+        let mut conn = test_conn();
+        assert!(remove_material(&mut conn, 999).is_err());
+    }
+
+    /// A Telegram-sourced material's file_path is a `tg://` key — it must never be
+    /// reported as a disk path for the command layer to delete.
+    #[test]
+    fn remove_material_never_reports_telegram_paths_as_local_files() {
+        let mut conn = test_conn();
+        let node = upsert_root_node(&conn, "Course").unwrap();
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                   source, tg_chat_id, tg_message_id)
+             VALUES(?1, 'tg://123/45', 'lesson.mp4', 'video', 'mp4', 'telegram', 123, 45)",
+            [node],
+        )
+        .unwrap();
+        let mat = conn.last_insert_rowid();
+
+        let result = remove_material(&mut conn, mat).unwrap();
+        assert_eq!(result.outcome.materials_deleted, 1);
+        assert!(
+            result.local_files.is_empty(),
+            "tg:// keys are not disk paths and must never be deleted from disk"
+        );
+    }
+
+    /// remove_node must recursively delete the whole subtree — every descendant folder
+    /// and every material at every depth — while preserving study history and detaching
+    /// every session, all in one transaction.
+    #[test]
+    fn remove_node_recursively_deletes_the_subtree() {
+        let mut conn = test_conn();
+        // Root > (Sub A, Sub B) ; Sub A > Topic with a file; Sub B has a file directly.
+        let root = upsert_root_node(&conn, "Course").unwrap();
+        let sub_a = upsert_child_node(&conn, root, "Sub A").unwrap();
+        let sub_b = upsert_child_node(&conn, root, "Sub B").unwrap();
+        let topic = upsert_child_node(&conn, sub_a, "Topic").unwrap();
+        insert_material(&conn, topic, &file("/c/topic/1.mp4", "1.mp4", 100)).unwrap();
+        let m1 = conn.last_insert_rowid();
+        insert_material(&conn, sub_b, &file("/c/subb/2.mp4", "2.mp4", 100)).unwrap();
+        let m2 = conn.last_insert_rowid();
+
+        // Study sessions on both materials + a task on one — all must detach cleanly.
+        for mid in [m1, m2] {
+            conn.execute(
+                "INSERT INTO study_sessions(material_id, started_at, duration_secs)
+                 VALUES(?1, '2026-01-01 10:00:00', 60)",
+                [mid],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tasks(title, material_id) VALUES('review', ?1)",
+            [m1],
+        )
+        .unwrap();
+
+        let result = remove_node(&mut conn, root).unwrap();
+        assert_eq!(result.outcome.nodes_deleted, 4, "root + 3 descendants");
+        assert_eq!(result.outcome.materials_deleted, 2);
+
+        let nodes_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nodes_left, 0, "the whole tree is gone");
+        let mats_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM materials", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mats_left, 0, "every material in the subtree is gone");
+        let (n_sessions, n_dangling): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(CASE WHEN material_id IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM study_sessions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n_sessions, 2, "study history survives a folder deletion");
+        assert_eq!(n_dangling, 0, "no session may reference a deleted material");
+    }
+
+    /// Deleting a subtree reports the registered-dir ids it contains so the command
+    /// layer can drop their OS watches, and never lists `tg://` keys as disk paths.
+    #[test]
+    fn remove_node_reports_registered_dirs_and_skips_telegram_files() {
+        let mut conn = test_conn();
+        let root = upsert_root_node(&conn, "Course").unwrap();
+        let sub = upsert_child_node(&conn, root, "Sub").unwrap();
+        conn.execute(
+            "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                                   source, tg_chat_id, tg_message_id)
+             VALUES(?1, 'tg://123/45', 'lesson.mp4', 'video', 'mp4', 'telegram', 123, 45)",
+            [sub],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registered_dirs(path, root_node_id, scan_status)
+             VALUES('/media/course', ?1, 'done')",
+            [root],
+        )
+        .unwrap();
+        let dir_id: i64 = conn.last_insert_rowid();
+
+        // Deleting a child does NOT report the parent-rooted registered dir.
+        let result = remove_node(&mut conn, sub).unwrap();
+        assert_eq!(result.outcome.nodes_deleted, 1);
+        assert!(
+            result.local_files.is_empty(),
+            "the subtree holds only Telegram materials — nothing to delete from disk"
+        );
+        assert!(
+            result.unwatch_dir_ids.is_empty(),
+            "the registered dir is rooted at the PARENT, not this subtree"
+        );
+
+        // Deleting the root reports it, and the row itself cascades away.
+        let result = remove_node(&mut conn, root).unwrap();
+        assert_eq!(result.outcome.nodes_deleted, 1);
+        assert_eq!(result.unwatch_dir_ids, vec![dir_id]);
+        let dirs_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM registered_dirs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dirs_left, 0, "the registered_dirs row cascades with its root node");
+    }
+
+    /// remove_node on a missing id is NotFound, not a silent no-op.
+    #[test]
+    fn remove_node_missing_is_not_found() {
+        let mut conn = test_conn();
+        assert!(remove_node(&mut conn, 999).is_err());
     }
 }

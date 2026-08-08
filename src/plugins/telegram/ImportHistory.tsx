@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Play,
@@ -12,11 +12,14 @@ import {
   CheckCircle2,
   Inbox,
   Filter,
+  Trash2,
 } from "lucide-react";
 import { tg } from "./api";
 import type { TgImportedMaterial } from "./api";
 import { cn } from "../../lib/utils";
 import { motion } from "framer-motion";
+import ConfirmDeleteModal from "../../components/ui/ConfirmDeleteModal";
+import { useToastStore } from "../../lib/toastStore";
 
 // ── Formatting helpers (pure, local) ─────────────────────────────────────────
 
@@ -102,7 +105,13 @@ const STATUS_FILTERS: { id: StatusFilter; label: string }[] = [
 
 // ── One row ─────────────────────────────────────────────────────────────────
 
-const HistoryRow = memo(function HistoryRow({ item }: { item: TgImportedMaterial }) {
+const HistoryRow = memo(function HistoryRow({
+  item,
+  onDelete,
+}: {
+  item: TgImportedMaterial;
+  onDelete?: () => void;
+}) {
   const meta = TYPE_META[item.file_type] ?? TYPE_META_FALLBACK;
   const TypeIcon = meta.icon;
   const pct = Math.max(0, Math.min(100, Math.round(item.progress_pct)));
@@ -188,6 +197,24 @@ const HistoryRow = memo(function HistoryRow({ item }: { item: TgImportedMaterial
       >
         <Play size={16} strokeWidth={2.5} className="translate-x-[1px]" />
       </span>
+
+      {/* Delete — hover-revealed trash, so it never gets in the way of play. Stops
+          propagation so it never opens the player. */}
+      {onDelete && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            onDelete();
+          }}
+          aria-label={`Delete ${item.file_name} from import history`}
+          title="Delete from library"
+          className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-white/20 opacity-0 transition-all duration-200 hover:bg-orange/15 hover:text-orange focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange/40 group-hover:opacity-100"
+        >
+          <Trash2 size={15} strokeWidth={2} aria-hidden />
+        </button>
+      )}
     </Link>
   );
 });
@@ -202,6 +229,52 @@ export default function ImportHistory({ refreshKey = 0 }: { refreshKey?: number 
   const [status, setStatus] = useState<StatusFilter>("all");
   const [sort, setSort] = useState<SortKey>("recent");
   const searchRef = useRef<HTMLInputElement>(null);
+
+  // ── Unified deletion (ConfirmDeleteModal) ───────────────────────────────────
+  const [deleteTarget, setDeleteTarget] = useState<TgImportedMaterial | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const pushToast = useToastStore((s) => s.push);
+
+  const closeDelete = useCallback(() => {
+    if (deleteBusy) return;
+    setDeleteTarget(null);
+    setDeleteError(null);
+  }, [deleteBusy]);
+
+  const confirmDelete = useCallback(async () => {
+    const target = deleteTarget;
+    if (!target) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      const outcome = await tg.removeMaterial(target.material_id);
+      setDeleteTarget(null);
+      // Remove the row locally so the list + filters reflect it instantly (the backend
+      // emits `library://changed`, but Telegram pages don't subscribe to it).
+      setItems((prev) => (prev ? prev.filter((i) => i.material_id !== target.material_id) : prev));
+      pushToast({
+        tone: "success",
+        title: "Import removed",
+        body:
+          outcome.materials_deleted > 0
+            ? `${target.file_name} was removed from your library`
+            : undefined,
+        duration: 4000,
+      });
+    } catch (e) {
+      setDeleteError(
+        typeof e === "string" ? e : e instanceof Error ? e.message : "Couldn't delete that import.",
+      );
+    } finally {
+      setDeleteBusy(false);
+    }
+  }, [deleteTarget, pushToast]);
+
+  const openDelete = useCallback((item: TgImportedMaterial) => {
+    setDeleteError(null);
+    setDeleteTarget(item);
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -403,12 +476,23 @@ export default function ImportHistory({ refreshKey = 0 }: { refreshKey?: number 
                     show: { opacity: 1, y: 0, transition: { type: "spring", stiffness: 350, damping: 25 } }
                  }}
               >
-                 <HistoryRow item={item} />
+                 <HistoryRow item={item} onDelete={() => openDelete(item)} />
               </motion.li>
             ))}
           </motion.ul>
         )}
       </div>
+
+      {/* Unified deletion confirm for imported media */}
+      <ConfirmDeleteModal
+        open={deleteTarget != null}
+        kind="material"
+        name={deleteTarget?.file_name ?? ""}
+        isBusy={deleteBusy}
+        error={deleteError}
+        onCancel={closeDelete}
+        onConfirm={() => void confirmDelete()}
+      />
     </div>
   );
 }

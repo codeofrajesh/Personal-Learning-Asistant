@@ -26,6 +26,7 @@ export default function CourseHubSection({
   accent,
   pinnedIds,
   onTogglePin,
+  onDelete,
 }: {
   title: string;
   icon: LucideIcon;
@@ -39,6 +40,8 @@ export default function CourseHubSection({
   /** Ids currently pinned (so cards reflect optimistic state from the parent). */
   pinnedIds?: Set<number>;
   onTogglePin?: (node: NodeCard) => void;
+  /** When provided, every card in the section gets a hover-revealed delete button. */
+  onDelete?: (node: NodeCard) => void;
 }) {
   const shown = nodes.slice(0, cap);
   const hasMore = nodes.length > cap;
@@ -85,6 +88,7 @@ export default function CourseHubSection({
             node={node}
             pinned={pinnedIds?.has(node.id) ?? node.is_pinned}
             onTogglePin={onTogglePin ? () => onTogglePin(node) : undefined}
+            onDelete={onDelete ? () => onDelete(node) : undefined}
           />
         ))}
       </div>

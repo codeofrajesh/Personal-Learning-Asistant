@@ -11,11 +11,55 @@
 //! Each follows the established pattern: `db: State<Db>`, work inside `db.with`,
 //! return `AppResult<T>`.
 
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
-use crate::db::queries::{self, MaterialRow, NodeCard, NodeCrumb};
+use crate::db::queries::{self, MaterialRow, NodeCard, NodeCrumb, RemoveOutcome};
 use crate::db::Db;
+use crate::scanner::watcher::WatcherManager;
 use crate::utils::errors::AppResult;
+
+/// Fired after a successful delete so every open page (Courses, Dashboard, Library,
+/// Explore) refetches — the same event the live watcher emits after a rescan.
+const LIBRARY_CHANGED_EVENT: &str = "library://changed";
+
+/// Best-effort removal of local material files from disk, then removal of the
+/// now-empty directory skeleton above them (bottom-up, stopping at the first
+/// non-empty directory or the drive root). `tg://` keys and missing/read-only
+/// files are skipped, and all IO errors are swallowed: the DB delete is the
+/// source of truth, disk cleanup is a courtesy so a later watcher rescan can't
+/// silently re-import a row the user deleted.
+fn remove_local_files(paths: &[String]) -> i64 {
+    let mut deleted_files: i64 = 0;
+
+    for p in paths {
+        let path = std::path::Path::new(p);
+        // Only real local files are touched (`tg://` keys are never disk paths).
+        if !path.is_file() || std::fs::remove_file(path).is_err() {
+            continue;
+        }
+        deleted_files += 1;
+
+        // Climb the ancestry, dropping every directory that is now empty. On Windows
+        // the drive root's `parent()` is None, so the walk naturally stops there, and
+        // `remove_dir` FAILS on a non-empty directory — so a sibling file, a
+        // Telegram-only folder, or any other real content halts the climb safely.
+        let mut dir = path.parent().map(|d| d.to_path_buf());
+        while let Some(d) = dir {
+            match std::fs::remove_dir(&d) {
+                Ok(()) => dir = d.parent().map(|p| p.to_path_buf()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Someone (an earlier file in this batch) already removed it —
+                    // keep climbing so shared parents still collapse.
+                    dir = d.parent().map(|p| p.to_path_buf());
+                }
+                // Non-empty / missing parent / permissions / drive root → stop.
+                Err(_) => break,
+            }
+        }
+    }
+
+    deleted_files
+}
 
 // ── Courses hub sections (v8) ──────────────────────────────────────────────────
 // The redesigned Courses page is a multi-section hub. Each section is a capped grid of
@@ -64,4 +108,42 @@ pub fn recent_nodes(db: State<'_, Db>) -> AppResult<Vec<NodeCard>> {
 #[tauri::command]
 pub fn set_node_pinned(db: State<'_, Db>, node_id: i64, pinned: bool) -> AppResult<()> {
     db.with(|conn| queries::set_node_pinned(conn, node_id, pinned))
+}
+
+/// Delete a folder node and its ENTIRE subtree — every descendant subfolder and every
+/// material inside them — in one transaction.
+///
+/// After the DB commit: any OS watcher rooted inside the deleted subtree is dropped (a
+/// deleted `registered_dirs` row can't be rescanned), local material files are
+/// best-effort removed from disk so a future rescan can't re-import them, and
+/// `library://changed` is emitted so open pages refresh.
+#[tauri::command]
+pub fn remove_node(app: AppHandle, db: State<'_, Db>, node_id: i64) -> AppResult<RemoveOutcome> {
+    let result = db.with_mut(|conn| queries::remove_node(conn, node_id))?;
+    for dir_id in &result.unwatch_dir_ids {
+        WatcherManager::remove_watch(&app, *dir_id);
+    }
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, node_id);
+    Ok(RemoveOutcome {
+        nodes_deleted: result.outcome.nodes_deleted,
+        materials_deleted: result.outcome.materials_deleted,
+        files_deleted: remove_local_files(&result.local_files),
+    })
+}
+
+/// Delete a single material (lesson) row. Study sessions detach (FK safety), local
+/// files are best-effort removed from disk, and `library://changed` is emitted.
+#[tauri::command]
+pub fn remove_material(
+    app: AppHandle,
+    db: State<'_, Db>,
+    material_id: i64,
+) -> AppResult<RemoveOutcome> {
+    let result = db.with_mut(|conn| queries::remove_material(conn, material_id))?;
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, material_id);
+    Ok(RemoveOutcome {
+        nodes_deleted: 0,
+        materials_deleted: result.outcome.materials_deleted,
+        files_deleted: remove_local_files(&result.local_files),
+    })
 }
