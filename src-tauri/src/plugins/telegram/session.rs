@@ -252,6 +252,8 @@ pub struct TgState {
     inner: tokio::sync::Mutex<Option<TgInner>>,
     /// In-flight login state (holds the LoginToken + optional PasswordToken).
     login: tokio::sync::Mutex<Option<TgLogin>>,
+    /// QR-code login session: the DC the token lives on + the token to keep importing.
+    qr: tokio::sync::Mutex<Option<TgQrLogin>>,
 }
 
 struct TgInner {
@@ -280,6 +282,23 @@ pub struct TgLogin {
     pub password_token: Option<PasswordToken>,
 }
 
+/// In-flight QR-code login session.
+///
+/// QR login is a *poll*: the initial `auth.exportLoginToken` returns a token to render
+/// (which may carry a `LoginTokenMigrateTo` moving us to the user's home DC), and every
+/// subsequent tick re-imports that token — which yields a fresh one when it expires or a
+/// success once the user scans and approves. The token and the DC it lives on must persist
+/// between `tg_request_qr_token` calls, so they live here rather than being re-exported
+/// each tick (which would invalidate the QR the user is already looking at).
+pub struct TgQrLogin {
+    /// The DC the token was created on (from `LoginTokenMigrateTo`, or the session home DC).
+    pub dc_id: i32,
+    /// The current login token, verbatim.
+    pub token: Vec<u8>,
+    /// Present once the account requires 2FA (`SESSION_PASSWORD_NEEDED`).
+    pub password_token: Option<PasswordToken>,
+}
+
 impl Default for TgState {
     fn default() -> Self {
         Self::new()
@@ -291,6 +310,7 @@ impl TgState {
         Self {
             inner: tokio::sync::Mutex::new(None),
             login: tokio::sync::Mutex::new(None),
+            qr: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -396,6 +416,7 @@ impl TgState {
             shutdown(inner).await;
         }
         *self.login.lock().await = None;
+        *self.qr.lock().await = None;
     }
 
     /// Store the in-flight login token (from `tg_request_code`), clearing any prior attempt.
@@ -420,6 +441,41 @@ impl TgState {
         *self.login.lock().await = None;
     }
 
+    /// Whether a QR login is in flight (any token exists to keep importing).
+    pub async fn qr_login(&self) -> Option<TgQrSnapshot> {
+        self.qr.lock().await.as_ref().map(|q| TgQrSnapshot {
+            dc_id: q.dc_id,
+            token: q.token.clone(),
+            needs_password: q.password_token.is_some(),
+        })
+    }
+
+    /// Store the QR login's DC + token so the next `tg_request_qr_token` tick resumes it.
+    pub async fn set_qr_login(&self, dc_id: i32, token: Vec<u8>) {
+        *self.qr.lock().await = Some(TgQrLogin {
+            dc_id,
+            token,
+            password_token: None,
+        });
+    }
+
+    /// Attach the 2FA password token once `SESSION_PASSWORD_NEEDED` was caught.
+    pub async fn set_qr_password_token(&self, password_token: PasswordToken) {
+        if let Some(qr) = self.qr.lock().await.as_mut() {
+            qr.password_token = Some(password_token);
+        }
+    }
+
+    /// Borrow the in-flight QR login to consume the 2FA password token during `tg_sign_in_2fa`.
+    pub async fn qr_login_guard(&self) -> MutexGuard<'_, Option<TgQrLogin>> {
+        self.qr.lock().await
+    }
+
+    /// Abandon the in-flight QR login.
+    pub async fn clear_qr_login(&self) {
+        *self.qr.lock().await = None;
+    }
+
     /// Sign out: revoke the session server-side, stop the pool, and wipe the session file.
     ///
     /// Order is load-bearing: `auth.logOut` must be invoked while the client still works, and
@@ -438,6 +494,7 @@ impl TgState {
             shutdown(inner).await;
         }
         *self.login.lock().await = None;
+        *self.qr.lock().await = None;
 
         // Remove the session file, plus any leftovers from the pre-JSON SQLite backend (and
         // its -wal/-shm sidecars). A surviving -wal could otherwise replay committed session
@@ -452,7 +509,7 @@ impl TgState {
             legacy.with_file_name("tg.session-shm"),
         ];
 
-        for path in targets {
+for path in targets {
             if path.exists() {
                 if let Err(e) = std::fs::remove_file(&path) {
                     // Losing the primary file is a real failure; the rest are advisory.
@@ -465,6 +522,14 @@ impl TgState {
         }
         Ok(())
     }
+}
+
+/// A `Clone` snapshot of the in-flight QR login for cross-module reads.
+#[derive(Clone)]
+pub struct TgQrSnapshot {
+    pub dc_id: i32,
+    pub token: Vec<u8>,
+    pub needs_password: bool,
 }
 
 /// Stop a client's sender pool and wait for its runner task to finish.

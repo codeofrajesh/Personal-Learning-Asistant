@@ -42,6 +42,13 @@ export interface TgSignInResult {
   hint: string | null;
 }
 
+/** One tick of the QR-login poll. */
+export type QrPollResult =
+  | { status: "token"; base64url: string; expires_in: number }
+  | { status: "success" }
+  | { status: "needs_password"; password_hint: string | null }
+  | { status: "expired" };
+
 /** Stored MTProto credentials. The hash itself is never returned by the backend. */
 export interface TgCredentials {
   api_id: string;
@@ -119,6 +126,11 @@ export const tg = {
   /** Complete login with the received `code`. May report `needs_password`. */
   async signIn(code: string): Promise<TgSignInResult> {
     return invokeCommand("tg_sign_in", { code });
+  },
+
+  /** One poll tick for QR-code login. Returns a token to render, success, or 2FA-needed. */
+  async requestQrToken(): Promise<QrPollResult> {
+    return invokeCommand("tg_request_qr_token");
   },
 
   /** Complete 2FA login with `password`. */

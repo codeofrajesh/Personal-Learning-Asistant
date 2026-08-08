@@ -58,6 +58,9 @@ http-body-util = "0.1"
 # CSPRNG for the stream server's per-run access token. Already transitive; named here
 # because a predictable token would let any local process enumerate the endpoint.
 getrandom = "0.3"
+# base64url encoding of the QR login token (grammers returns raw bytes). Already
+# transitive in the tree (0.22.1); named because we're about to use it directly.
+base64 = "0.22"
 # `default-features = false` drops the `sqlite-storage` feature, and with it `libsql`.
 #
 # This is NOT a size optimization — it is required for the app to run. libsql bundles its own

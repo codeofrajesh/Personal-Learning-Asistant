@@ -25,6 +25,7 @@ import { usePerf } from "../../lib/perfStore";
 import { useTaskReminders } from "../useTaskReminders";
 import { useBlockReminders } from "../../lib/scheduleReminders";
 import { usePluginBoot } from "../../lib/plugins/boot";
+import { useAuth } from "../../plugins/telegram/authStore";
 
 export default function AppShell() {
   const [collapsed, setCollapsed] = useState(false);
@@ -42,6 +43,25 @@ export default function AppShell() {
   useEffect(() => {
     void hydratePerf();
   }, [hydratePerf]);
+
+  // Global network listener to instantly detect offline state across plugins.
+  useEffect(() => {
+    const handleOnline = () => useAuth.getState().setNetworkState(true);
+    const handleOffline = () => useAuth.getState().setNetworkState(false);
+    
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    
+    // Check initial
+    if (!navigator.onLine) {
+      handleOffline();
+    }
+    
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   // App-wide reminders. Both are event-driven off the shared minute clock (no polling) and
   // deduped through the durable `reminder_state` ledger, so nothing re-fires after a restart.

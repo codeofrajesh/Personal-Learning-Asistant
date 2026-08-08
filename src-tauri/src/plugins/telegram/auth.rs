@@ -8,12 +8,16 @@
 //! code went to (for the UI's "we texted +1 555…" line); the tokens grammers needs verbatim
 //! stay server-side, which is also why `tg_sign_in` takes no handle argument.
 
+use grammers_client::client::PasswordToken;
 use grammers_client::sender::RpcError;
-use grammers_client::{InvocationError, SignInError};
+use grammers_client::{Client, InvocationError, SignInError};
+use grammers_session::types::{PeerAuth, PeerInfo, UpdateState, UpdatesState};
+use grammers_session::Session;
+use grammers_tl_types as tl;
 use tauri::{AppHandle, State};
 
 use crate::db::Db;
-use crate::plugins::telegram::session::{read_credentials, TgState};
+use crate::plugins::telegram::session::{read_credentials, FileSession, TgState};
 use crate::utils::errors::{AppError, AppResult};
 
 /// Current auth status for the frontend.
@@ -211,6 +215,14 @@ pub async fn tg_sign_in(
 }
 
 /// Complete 2FA login with the account password.
+///
+/// Serves both login paths:
+/// - Phone-code login (token held in `TgState.login.password_token`).
+/// - QR-code login (token held in `TgState.qr.password_token`, set when the poll hit
+///   `SESSION_PASSWORD_NEEDED`).
+///
+/// The QR state is cleared on success (the session is authorized, so there's nothing left to
+/// poll).
 #[tauri::command]
 pub async fn tg_sign_in_2fa(
     app: AppHandle,
@@ -223,6 +235,33 @@ pub async fn tg_sign_in_2fa(
     }
     let client = state.ensure_client(&app, &db).await?;
 
+    // QR login first — the frontend reaches this screen from the QR flow.
+    if state.qr_login().await.is_some() {
+        let mut qr = state.qr_login_guard().await;
+        let password_token = qr
+            .as_mut()
+            .and_then(|q| q.password_token.take())
+            .ok_or_else(|| AppError::Invalid("Finish the QR scan first.".into()))?;
+
+        return match client.check_password(password_token, password).await {
+            Ok(_user) => {
+                *qr = None; // session is authorized; nothing left to poll
+                Ok(())
+            }
+            // A FRESH token comes back on failure — the one we sent is spent. Putting it
+            // back lets the user retype the password without re-scanning the QR.
+            Err(SignInError::InvalidPassword(fresh)) => {
+                if let Some(q) = qr.as_mut() {
+                    q.password_token = Some(fresh);
+                }
+                Err(AppError::Invalid("Incorrect 2FA password. Try again.".into()))
+            }
+            Err(SignInError::Other(e)) => Err(map_invocation(e)),
+            Err(other) => Err(AppError::Other(format!("Telegram sign-in failed: {other}"))),
+        };
+    }
+
+    // Phone-code login fallback.
     let mut guard = state.login_guard().await;
     let login = guard
         .as_mut()
@@ -255,6 +294,231 @@ pub async fn tg_sign_in_2fa(
 #[tauri::command]
 pub async fn tg_sign_out(app: AppHandle, state: State<'_, TgState>) -> AppResult<()> {
     state.sign_out(&app).await
+}
+
+/// One tick of the QR-login poll (`tg_request_qr_token` outcome for the frontend).
+///
+/// The bits the UI needs to render/advance, kept deliberately small across the IPC boundary —
+/// a raw `auth::LoginToken` would leak token bytes and the DC bookkeeping nobody but the
+/// backend should know about.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum QrStatus {
+    /// A fresh (or updated) token to render. `expires_in` is the token's remaining lifetime
+    /// in seconds — the QR must be regenerated before it, or the scan will fail.
+    Token { base64url: String, expires_in: i32 },
+    /// The user scanned and approved with no 2FA; the session is authorized.
+    Success,
+    /// The user scanned and approved, but the account needs its 2FA password.
+    NeedsPassword,
+    /// Telegram rejected the stored token (expired/invalid). The frontend must stop polling
+    /// and let the user tap to get a brand-new QR; the backend token was already cleared.
+    Expired,
+}
+
+/// Result of `tg_request_qr_token`. Distinct from `QrStatus` because a scan is one-time:
+/// `NeedsPassword` must surface a hint, and `Success` should clear the in-flight QR login.
+#[derive(Debug, serde::Serialize)]
+pub struct QrPollResult {
+    #[serde(flatten)]
+    pub status: QrStatus,
+    /// Present only when `status == NeedsPassword`.
+    pub password_hint: Option<String>,
+}
+
+/// Handle a single poll tick for QR-code login.
+///
+/// The flow (mirroring the production reference and grammers' own `bot_sign_in`):
+/// 1. No QR in flight → `auth.ExportLoginToken` on the session's home DC.
+///     - `LoginToken` → keep it; render the QR.
+///     - `LoginTokenMigrateTo{dc_id, token}` → the account lives on another Data Center;
+///       adopt the token + DC, continue.
+///     - `LoginTokenSuccess` → already scanned (rare on first tick) → finish.
+/// 2. A token exists (this or a prior tick) → `auth.ImportLoginToken(token)` on the DC where
+///    the token lives. This both polls progress AND refreshes an expired token.
+///     - `LoginToken` → render (possibly updated) QR.
+///     - `LoginTokenMigrateTo` → yet another DC hop (defensive), continue.
+///     - `LoginTokenSuccess` → the user approved → finalize the session.
+/// 3. `SESSION_PASSWORD_NEEDED` (RPC on either call) → 2FA — the password is handed to the
+///    existing `tg_sign_in_2fa` path (which already handles the QR-password token).
+///
+/// Token handoff: the token bytes never cross the IPC boundary — the backend keeps them in
+/// `TgState`, and `/tg://login?token=<base64url>` is returned instead.
+#[tauri::command]
+pub async fn tg_request_qr_token(
+    app: AppHandle,
+    db: State<'_, Db>,
+    state: State<'_, TgState>,
+) -> AppResult<QrPollResult> {
+    let (api_id, api_hash) = read_credentials(&db)?;
+    let client = state.ensure_client(&app, &db).await?;
+    let session = state.get_session().await.ok_or_else(|| {
+        AppError::Other("tg session missing".into())
+    })?;
+
+    // If 2FA was already tripped on a prior tick, keep reporting NeedsPassword
+    // (the frontend owns the password screen now; it switches to `tg_sign_in_2fa`).
+    if let Some(qr) = state.qr_login().await {
+        if qr.needs_password {
+            return Ok(QrPollResult {
+                status: QrStatus::NeedsPassword,
+                password_hint: None,
+            });
+        }
+    }
+
+    // Always invoke ExportLoginToken to poll (this is how MTProto QR polling works).
+    // Telegram returns the *same* token (or a refreshed one) if we just call ExportLoginToken
+    // again before it expires.
+    let home_dc = session.home_dc_id().unwrap_or(2);
+    let export = match client
+        .invoke(&tl::functions::auth::ExportLoginToken {
+            api_id,
+            api_hash: api_hash.clone(),
+            except_ids: Vec::new(),
+        })
+        .await
+    {
+        Ok(export) => export,
+        Err(InvocationError::Rpc(rpc)) if rpc.is("SESSION_PASSWORD_NEEDED") => {
+            let password = client
+                .invoke(&tl::functions::account::GetPassword {})
+                .await
+                .map_err(map_invocation)?;
+            let password: tl::types::account::Password = password.into();
+            let hint = password.hint.clone();
+            state.set_qr_password_token(PasswordToken::new(password)).await;
+            return Ok(QrPollResult {
+                status: QrStatus::NeedsPassword,
+                password_hint: hint,
+            });
+        }
+        Err(e) => return Err(map_invocation(e)),
+    };
+
+    match export {
+        tl::enums::auth::LoginToken::Token(t) => {
+            state.set_qr_login(home_dc, t.token.clone()).await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i32;
+            Ok(QrPollResult {
+                status: QrStatus::Token {
+                    base64url: base64_url(t.token),
+                    expires_in: 0.max(t.expires - now),
+                },
+                password_hint: None,
+            })
+        }
+        tl::enums::auth::LoginToken::MigrateTo(m) => {
+            // The user scanned on a different DC. We must migrate.
+            session.set_home_dc_id(m.dc_id).await
+                .map_err(|e| AppError::Other(format!("tg dc switch: {e}")))?;
+            state.set_qr_login(m.dc_id, m.token.clone()).await;
+            
+            // Now invoke ImportLoginToken on the NEW DC.
+            let import = match client
+                .invoke_in_dc(m.dc_id, &tl::functions::auth::ImportLoginToken { token: m.token })
+                .await
+            {
+                Ok(import) => import,
+                Err(InvocationError::Rpc(rpc)) if rpc.is("SESSION_PASSWORD_NEEDED") => {
+                    let password = client
+                        .invoke(&tl::functions::account::GetPassword {})
+                        .await
+                        .map_err(map_invocation)?;
+                    let password: tl::types::account::Password = password.into();
+                    let hint = password.hint.clone();
+                    state.set_qr_password_token(PasswordToken::new(password)).await;
+                    return Ok(QrPollResult {
+                        status: QrStatus::NeedsPassword,
+                        password_hint: hint,
+                    });
+                }
+                Err(e) => return Err(map_invocation(e)),
+            };
+
+            if let tl::enums::auth::LoginToken::Success(s) = import {
+                complete_qr_login(&client, s.authorization, &session).await?;
+                state.clear_qr_login().await;
+                Ok(QrPollResult {
+                    status: QrStatus::Success,
+                    password_hint: None,
+                })
+            } else {
+                Err(AppError::Other("Migration rejected".into()))
+            }
+        }
+        tl::enums::auth::LoginToken::Success(s) => {
+            complete_qr_login(&client, s.authorization, &session).await?;
+            state.clear_qr_login().await;
+            Ok(QrPollResult {
+                status: QrStatus::Success,
+                password_hint: None,
+            })
+        }
+    }
+}
+
+/// Finalize a QR login once the user has scanned and approved.
+///
+/// Mirrors grammers' private `Client::complete_login` — the authorization is server-side from
+/// the moment `LoginTokenSuccess` arrives, but caching the self peer (marking `is_self`) is
+/// what later lets `get_me` / dialogs resolve the account without re-looking it up, and it
+/// persists to the session file so a restart keeps recognizing the session.
+async fn complete_qr_login(
+    client: &Client,
+    authorization: tl::enums::auth::Authorization,
+    session: &std::sync::Arc<FileSession>,
+) -> AppResult<()> {
+    let tl::enums::auth::Authorization::Authorization(auth) = authorization else {
+        return Err(AppError::Other(
+            "Telegram returned sign-up-required during QR login.".into(),
+        ));
+    };
+
+    let me_id = match &auth.user {
+        tl::enums::User::User(u) => u.id,
+        tl::enums::User::Empty(u) => u.id,
+    };
+
+    // Same as grammers' `complete_login`: `updates::GetState` is best-effort (the session is
+    // authorized server-side regardless), and the self peer is cached for authority.
+    let state = client.invoke(&tl::functions::updates::GetState {}).await.ok();
+    if let Some(tl::enums::updates::State::State(update_state)) = state {
+        session
+            .set_update_state(UpdateState::All(UpdatesState {
+                pts: update_state.pts,
+                qts: update_state.qts,
+                date: update_state.date,
+                seq: update_state.seq,
+                channels: Vec::new(),
+            }))
+            .await
+            .map_err(|e| AppError::Other(format!("tg update state: {e}")))?;
+    }
+
+    session
+        .cache_peer(&PeerInfo::User {
+            id: me_id,
+            auth: Some(PeerAuth::default()),
+            bot: Some(false),
+            is_self: Some(true),
+        })
+        .await
+        .map_err(|e| AppError::Other(format!("tg cache self: {e}")))?;
+
+    Ok(())
+}
+
+/// Render a login token for `tg://login?token=<base64url>` — Telegram's deep link for QR.
+///
+/// MTProto gives us the token as raw bytes; the QR payload is its base64url (no padding)
+/// form. The reference implementation uses exactly this encoding.
+fn base64_url(token: Vec<u8>) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    URL_SAFE_NO_PAD.encode(token)
 }
 
 /// Check whether the persisted session is authorized.
@@ -519,12 +783,26 @@ mod tests {
         assert!(msg.contains("500"), "msg was: {msg}");
     }
 
-    #[test]
+#[test]
     fn maps_io_errors_to_a_connectivity_message() {
         let err = map_invocation(InvocationError::Io(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "connect timed out",
         )));
         assert!(err.to_string().contains("Couldn't reach Telegram"));
+    }
+
+    #[test]
+    fn base64_url_is_unpadded_url_safe() {
+        // The token Telegram hands back is opaque bytes; the QR payload must be the
+        // unpadded base64url form (matching the official clients + the reference bot).
+        //   - 3 bytes → 4 chars, no padding needed
+        //   - 2 bytes → 3 chars + 1 pad, which URL_SAFE_NO_PAD drops
+        assert_eq!(base64_url(vec![0xfb, 0xff, 0xbf]), "-_-_");
+        assert_eq!(base64_url(vec![0x0f, 0x0f]), "Dw8");
+        assert_eq!(
+            base64_url(vec![b'h', b'e', b'l', b'l', b'o']),
+            "aGVsbG8"
+        );
     }
 }

@@ -178,6 +178,7 @@ pub fn run() {
             plugins::telegram::auth::tg_request_code,
             plugins::telegram::auth::tg_sign_in,
             plugins::telegram::auth::tg_sign_in_2fa,
+            plugins::telegram::auth::tg_request_qr_token,
             plugins::telegram::auth::tg_sign_out,
             plugins::telegram::auth::tg_get_me,
             // Telegram import (Phase 4)

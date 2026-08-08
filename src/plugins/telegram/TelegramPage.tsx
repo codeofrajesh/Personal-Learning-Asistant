@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { Link } from "react-router-dom";
 import {
   LogOut,
   HelpCircle,
   KeyRound,
   WifiOff,
+  Wifi,
   ShieldCheck,
   Link as LinkIcon,
   LayoutDashboard,
@@ -13,6 +14,8 @@ import {
   Settings,
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
+import { useGSAP } from "@gsap/react";
+import gsap from "gsap";
 import Breadcrumb from "../../components/layout/Breadcrumb";
 import ConnectFlow from "./ConnectFlow";
 import LinkImport from "./LinkImport";
@@ -32,7 +35,71 @@ export default function TelegramPage() {
   const [activeTab, setActiveTab] = useState<Tab>("overview");
   const [refreshKey, setRefreshKey] = useState(0);
 
+  const pillRef = useRef<HTMLSpanElement>(null);
+  const iconRef = useRef<SVGSVGElement>(null);
+  const nameRef = useRef<HTMLSpanElement>(null);
+
   const connected = status === "connected";
+
+  useGSAP(() => {
+    if (connected) {
+      // Glow pulse animation
+      gsap.to(pillRef.current, {
+        boxShadow: "inset 0 1px 1px rgba(255,255,255,0.4), 0 0 15px rgba(42,171,238,0.6), 0 8px 16px rgba(0,0,0,0.4)",
+        duration: 1.5,
+        repeat: -1,
+        yoyo: true,
+        ease: "sine.inOut"
+      });
+      // Icon gentle bob
+      gsap.to(iconRef.current, {
+        y: -1,
+        duration: 1,
+        repeat: -1,
+        yoyo: true,
+        ease: "power1.inOut"
+      });
+      // Name 3D float
+      if (nameRef.current) {
+        gsap.fromTo(nameRef.current,
+          { y: 5, opacity: 0, rotationX: -15 },
+          { y: 0, opacity: 1, rotationX: 0, duration: 0.8, ease: "back.out(1.5)" }
+        );
+        gsap.to(nameRef.current, {
+          y: -1.5,
+          rotationX: 5,
+          duration: 2,
+          repeat: -1,
+          yoyo: true,
+          ease: "sine.inOut",
+          delay: 0.8
+        });
+      }
+    } else if (status === "unreachable") {
+      // Alert pulse animation
+      gsap.to(pillRef.current, {
+        boxShadow: "inset 0 1px 1px rgba(255,255,255,0.4), 0 0 20px rgba(249,115,22,0.8), 0 8px 16px rgba(0,0,0,0.5)",
+        borderColor: "rgba(249,115,22,0.6)",
+        duration: 0.8,
+        repeat: -1,
+        yoyo: true,
+        ease: "power2.inOut"
+      });
+      // Icon shake animation
+      gsap.to(iconRef.current, {
+        x: 2,
+        duration: 0.1,
+        repeat: -1,
+        yoyo: true,
+        ease: "power1.inOut"
+      });
+    } else {
+      gsap.killTweensOf([pillRef.current, iconRef.current, nameRef.current]);
+      gsap.set(pillRef.current, { clearProps: "all" });
+      gsap.set(iconRef.current, { clearProps: "all" });
+      gsap.set(nameRef.current, { clearProps: "all" });
+    }
+  }, { dependencies: [connected, status] });
   const hasSession = connected || status === "unreachable";
   const displayName =
     user?.first_name || (user?.username ? `@${user.username}` : null) || "your account";
@@ -243,33 +310,48 @@ export default function TelegramPage() {
                   <p className="text-xs text-content-muted">Stream and import private-channel media seamlessly.</p>
                </div>
             </div>
-             
-             {/* Live status pill */}
-            <span
-               className={cn(
-                  "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wide",
-                  connected
-                     ? "border-[#2AABEE]/30 bg-[#2AABEE]/10 text-[#2AABEE] shadow-[0_0_10px_rgba(42,171,238,0.1)]"
-                     : status === "unreachable"
-                     ? "border-orange/30 bg-orange/10 text-orange"
-                     : "border-white/10 bg-white/[0.04] text-content-faint"
-               )}
-            >
-               <span
-                  aria-hidden
-                  className={cn(
-                     "h-1.5 w-1.5 rounded-full",
-                     connected
-                        ? "bg-[#2AABEE] shadow-[0_0_8px_#2AABEE]"
-                        : status === "unreachable"
-                        ? "bg-orange"
-                        : "bg-white/20"
+                          {/* Live status pill & Name */}
+              <div className="flex flex-col items-end gap-1.5">
+                <span
+                   ref={pillRef}
+                   className={cn(
+                      "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold uppercase tracking-wide transition-all duration-300",
+                      connected
+                         ? "border-[#2AABEE]/40 bg-gradient-to-r from-[#2AABEE]/20 to-[#4D7CFF]/20 text-white shadow-[inset_0_1px_1px_rgba(255,255,255,0.2),0_4px_12px_rgba(42,171,238,0.2)]"
+                         : status === "unreachable"
+                         ? "border-orange/40 bg-gradient-to-r from-orange/20 to-red/20 text-white shadow-[inset_0_1px_1px_rgba(255,255,255,0.2),0_4px_12px_rgba(249,115,22,0.2)]"
+                         : "border-white/10 bg-white/[0.04] text-content-faint"
+                   )}
+                >
+                   {status === "unreachable" ? (
+                     <WifiOff ref={iconRef as any} size={12} strokeWidth={2.5} className="text-orange" />
+                   ) : connected ? (
+                     <Wifi ref={iconRef as any} size={12} strokeWidth={2.5} className="text-[#2AABEE]" />
+                   ) : (
+                     <span
+                        aria-hidden
+                        className="h-1.5 w-1.5 rounded-full bg-white/20"
+                     />
+                   )}
+                   {connected ? "Connected" : status === "unreachable" ? "Offline" : "Idle"}
+                </span>
+                
+                {connected && displayName && (
+                     <span 
+                       ref={nameRef}
+                       className="text-sm font-display font-bold tracking-wide mr-1.5"
+                       style={{
+                         color: "#2AABEE",
+                         textShadow: "0px 1px 0px #0e5b85, 0px 2px 0px #0b4566, 0px 4px 6px rgba(0,0,0,0.6)",
+                         transformStyle: "preserve-3d"
+                       }}
+                     >
+                       {displayName}
+                     </span>
                   )}
-               />
-               {connected ? "Connected" : status === "unreachable" ? "Offline" : "Idle"}
-            </span>
-          </div>
-        </header>
+              </div>
+            </div>
+          </header>
 
         <div className="flex flex-col lg:flex-row gap-6">
            {/* Sidebar Navigation */}

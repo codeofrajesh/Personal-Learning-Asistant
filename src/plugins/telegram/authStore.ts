@@ -39,6 +39,12 @@ interface TgAuthStore {
   pendingPhone: string | null;
   /** 2FA password hint surfaced after `tg_sign_in` reports `needs_password`. */
   passwordHint: string | null;
+  /** QR token (base64url) to render, while a QR poll is live. */
+  qrToken: string | null;
+  /** Seconds until the current QR token expires (drives the "expired" restart button). */
+  qrExpiresIn: number | null;
+  /** Whether a QR poll is currently in flight. */
+  qrPolling: boolean;
   /** Last error message (cleared at the start of the next action). */
   error: string | null;
   /** Hydrate once on boot: read credentials + ask the backend for the session state. */
@@ -51,10 +57,16 @@ interface TgAuthStore {
   submitCode: (code: string) => Promise<boolean>;
   /** Submit the 2FA password. */
   submitPassword: (password: string) => Promise<boolean>;
+  /** Start the QR-code poll: fetch a token, render it, poll every ~4s. Returns false on failure. */
+  startQrPoll: () => Promise<boolean>;
+  /** Stop the QR poll (component unmount / login complete / user aborts). */
+  stopQrPoll: () => void;
   /** Abandon an in-flight login and return to the phone step. */
   resetLogin: () => void;
   /** Disconnect + wipe the session. */
   signOut: () => Promise<void>;
+  /** Dynamically update network state from window events. */
+  setNetworkState: (isOnline: boolean) => void;
 }
 
 /**
@@ -70,12 +82,78 @@ function messageOf(e: unknown): string {
   return "Something went wrong. Please try again.";
 }
 
+// ── QR poll lifecycle ──────────────────────────────────────────────────────────
+// The timer handle lives at module scope so `stopQrPoll` can always cancel it — even after
+// `startQrPoll` resolved (connect complete) or the component unmounted mid-poll.
+const QR_POLL_MS = 4000;
+const QR_TOTAL_MS = 120_000;
+const qrPoll = { timer: null as ReturnType<typeof setInterval> | null, deadline: 0 };
+
+/** A single poll tick. Returns true while the poll should continue. */
+async function qrTick(set: (partial: Partial<TgAuthStore>) => void, get: () => TgAuthStore): Promise<boolean> {
+  if (!get().qrPolling) return false;
+  if (Date.now() > qrPoll.deadline) {
+    // 120s of live QR is up; Telegram's token side also expires → stop and show the restart
+    // button (the UI reads `qrExpiresIn === 0` as "expired").
+    set({ qrPolling: false, qrToken: null, qrExpiresIn: 0, error: null });
+    return false;
+  }
+  try {
+    const res = await tg.requestQrToken();
+    if (res.status === "success") {
+      set({
+        status: "connected",
+        passwordHint: null,
+        pendingPhone: null,
+        qrToken: null,
+        qrExpiresIn: null,
+        qrPolling: false,
+        error: null,
+      });
+      try {
+        set({ user: await tg.getMe() });
+      } catch {
+        /* best-effort */
+      }
+      return false;
+    }
+    if (res.status === "needs_password") {
+      set({
+        status: "needs_password",
+        passwordHint: res.password_hint ?? null,
+        qrPolling: false,
+        qrToken: null,
+        error: null,
+      });
+      return false;
+    }
+    // Token (possibly refreshed): only re-render when it actually changed — the QR library
+    // re-renders eagerly, so avoiding a no-op set keeps the rasterizer from flickering.
+    const current = get();
+    if (res.status === "expired") {
+      // Backend cleared the dead token; stop polling and show the "expired" UI.
+      set({ qrPolling: false, qrToken: null, qrExpiresIn: 0, error: null });
+      return false;
+    }
+    if (current.qrToken !== res.base64url || current.qrExpiresIn !== res.expires_in) {
+      set({ qrToken: res.base64url, qrExpiresIn: res.expires_in });
+    }
+    return true;
+  } catch (e) {
+    set({ status: "disconnected", qrPolling: false, qrToken: null, qrExpiresIn: null, error: messageOf(e) });
+    return false;
+  }
+}
+
 export const useAuth = create<TgAuthStore>((set, get) => ({
   status: "unknown",
   user: null,
   hasCredentials: false,
   pendingPhone: null,
   passwordHint: null,
+  qrToken: null,
+  qrExpiresIn: null,
+  qrPolling: false,
   error: null,
 
   hydrate: async () => {
@@ -106,6 +184,15 @@ export const useAuth = create<TgAuthStore>((set, get) => ({
       // Not in Tauri / backend unreachable: stay "unknown" so the dot reads idle rather than
       // claiming the user is signed out.
       set({ status: "unknown", user: null });
+    }
+  },
+
+  setNetworkState: (isOnline: boolean) => {
+    const current = get().status;
+    if (!isOnline && current === "connected") {
+      set({ status: "unreachable" });
+    } else if (isOnline && current === "unreachable") {
+      set({ status: "connected" });
     }
   },
 
@@ -194,8 +281,78 @@ export const useAuth = create<TgAuthStore>((set, get) => ({
       status: get().status === "connected" ? "connected" : "disconnected",
       pendingPhone: null,
       passwordHint: null,
+      qrToken: null,
+      qrExpiresIn: null,
+      qrPolling: false,
       error: null,
     });
+  },
+
+  // Poll timer lives at module scope so `stopQrPoll` can always cancel it, even after the
+  // store's `startQrPoll` finished or the component unmounted.
+  startQrPoll: async () => {
+    set({ status: "connecting", error: null, qrToken: null, qrExpiresIn: null, qrPolling: true });
+    qrPoll.deadline = Date.now() + QR_TOTAL_MS;
+    try {
+      const first = await tg.requestQrToken();
+      // The first tick may already have resolved (rare) — honor it before starting the loop.
+      if (first.status === "success") {
+        set({
+          status: "connected",
+          passwordHint: null,
+          pendingPhone: null,
+          qrToken: null,
+          qrExpiresIn: null,
+          qrPolling: false,
+          error: null,
+        });
+        try {
+          set({ user: await tg.getMe() });
+        } catch {
+          /* best-effort */
+        }
+        return true;
+      }
+      if (first.status === "needs_password") {
+        set({
+          status: "needs_password",
+          passwordHint: first.password_hint ?? null,
+          qrPolling: false,
+          qrToken: null,
+          error: null,
+        });
+        return true;
+      }
+      if (first.status === "expired" || !first.base64url) {
+        // Backend had a stale token; nothing to render on the very first fetch.
+        set({ status: "disconnected", qrPolling: false, qrToken: null, qrExpiresIn: 0, error: null });
+        return false;
+      }
+      set({
+        status: "connecting",
+        qrToken: first.base64url,
+        qrExpiresIn: first.expires_in,
+        qrPolling: true,
+        error: null,
+      });
+      // Start the 4s polling loop (the first fetch already rendered a live token).
+      if (qrPoll.timer) clearInterval(qrPoll.timer);
+      qrPoll.timer = setInterval(() => {
+        void qrTick(set, get);
+      }, QR_POLL_MS);
+      return true;
+    } catch (e) {
+      set({ status: "disconnected", qrPolling: false, error: messageOf(e) });
+      return false;
+    }
+  },
+
+  stopQrPoll: () => {
+    if (qrPoll.timer) {
+      clearInterval(qrPoll.timer);
+      qrPoll.timer = null;
+    }
+    set({ qrPolling: false, qrToken: null, qrExpiresIn: null });
   },
 
   signOut: async () => {
@@ -211,6 +368,9 @@ export const useAuth = create<TgAuthStore>((set, get) => ({
       user: null,
       pendingPhone: null,
       passwordHint: null,
+      qrToken: null,
+      qrExpiresIn: null,
+      qrPolling: false,
     });
   },
 }));
