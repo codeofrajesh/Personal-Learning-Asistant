@@ -1,11 +1,35 @@
 {
-  "mcpServers": {
-    "21st": {
-      "type": "http",
-      "url": "https://21st.dev/api/mcp",
-      "headers": {
-        "x-api-key": "21st_sk_cfab935980a9d8d031962ed62c7de6ae49fb973a159d5a0b34d201cc98db3ae6"
-      }
+  "apiKeyHelper": "echo 'sk-sGiRz7kNFI2AtjRFhKT9zN95t3qehyocWfbwnf9Q77I2pH0z'",
+  "env": {
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_MODEL": "claude-opus-4-8",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "ANTHROPIC_BASE_URL": "https://agentrouter.org",
+    "ANTHROPIC_AUTH_TOKEN": "sk-sGiRz7kNFI2AtjRFhKT9zN95t3qehyocWfbwnf9Q77I2pH0z"
+  },
+  "model": "opus",
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "effortLevel": "xhigh",
+  "theme": "dark",
+  "hasCompletedOnboarding": true,
+  "customModels": {
+    "claude-opus-5": {
+      "aliases": [
+        "opus-5",
+        "opus"
+      ],
+      "displayName": "Opus 5",
+      "contextWindow": 1000000
+    },
+    "claude-opus-4-8": {
+      "aliases": [
+        "opus-4-8",
+        "opus"
+      ],
+      "displayName": "Opus 4.8",
+      "contextWindow": 1000000
     }
   }
 }

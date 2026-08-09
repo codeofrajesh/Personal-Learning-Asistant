@@ -22,15 +22,16 @@
  * cards + file rows re-stagger on each drill.
  */
 
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { gsap } from "gsap";
 import { motion, AnimatePresence } from "framer-motion";
-import { Play, Plus, Bookmark, Check, ChevronRight, FileVideo, FileText, FileAudio, FileImage, File as FileLucide, Pin, Activity, Sparkles, LibraryBig, Trash2 } from "lucide-react";
+import { Play, Plus, Check, ChevronRight, Pin, Activity, Sparkles, LibraryBig } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import BackButton from "../components/layout/BackButton";
 import FolderCard from "../components/courses/FolderCard";
 import CourseHubSection from "../components/courses/CourseHubSection";
+import LessonList from "../components/courses/LessonList";
 import ConfirmDeleteModal from "../components/ui/ConfirmDeleteModal";
 
 import ProgressRing from "../components/courses/ProgressRing";
@@ -76,14 +77,6 @@ const TYPE_GLYPH: Record<string, string> = {
   note: "📝",
   image: "🖼️",
   audio: "🎧",
-};
-
-const FILE_ICON: Record<string, typeof FileLucide> = {
-  video: FileVideo,
-  pdf: FileText,
-  note: FileText,
-  image: FileImage,
-  audio: FileAudio,
 };
 
 const btnPrimary =
@@ -142,6 +135,11 @@ export default function CoursesPage() {
       return true;
     });
   }, [materials, activeTab, activeFilter]);
+
+  // Dragging writes an order for the WHOLE folder, so it's only offered when the whole folder
+  // is on screen — otherwise the hidden rows would all be pushed to the end by a drag that
+  // never mentioned them.
+  const isFiltered = activeTab !== "all" || activeFilter !== "all";
 
   const errMsg = (err: unknown) =>
     err instanceof NotInTauriError
@@ -257,6 +255,45 @@ export default function CoursesPage() {
       );
     }
   }, []);
+
+  /**
+   * Save a new manual lesson order.
+   *
+   * The list is updated locally first so the rows stay where the student dropped them, then the
+   * write goes out. On failure this rethrows: `LessonList` owns the rollback, since it's the one
+   * holding the arrangement the drag produced.
+   */
+  const reorderMaterials = useCallback(
+    async (orderedIds: number[]) => {
+      if (nodeId == null) return;
+      const previous = materials;
+      setMaterials((prev) => {
+        if (!prev) return prev;
+        const byId = new Map(prev.map((m) => [m.id, m]));
+        // Reordered rows first, then anything the caller didn't mention, so a stale list can
+        // never drop a lesson from the page.
+        const reordered = orderedIds.map((id) => byId.get(id)).filter((m): m is MaterialRowData => m != null);
+        const seen = new Set(orderedIds);
+        return [...reordered, ...prev.filter((m) => !seen.has(m.id))];
+      });
+      try {
+        await ipc.reorderMaterials(nodeId, orderedIds);
+      } catch (err) {
+        setMaterials(previous);
+        throw err;
+      }
+    },
+    [nodeId, materials],
+  );
+
+  /** Reset the folder to A–Z and save that as the order, so it survives the next import. */
+  const sortAlphabetical = useCallback(async () => {
+    if (!materials) return;
+    const sorted = [...materials].sort((a, b) =>
+      a.file_name.localeCompare(b.file_name, undefined, { numeric: true, sensitivity: "base" }),
+    );
+    await reorderMaterials(sorted.map((m) => m.id));
+  }, [materials, reorderMaterials]);
 
   /** Run the delete, surface a toast with the real counts, then refetch. The backend
    *  emits `library://changed` on success, but we refresh immediately (no race). */
@@ -680,18 +717,15 @@ export default function CoursesPage() {
 
             <div className="flex flex-col gap-2.5 min-h-[200px]">
               {filteredMaterials.length > 0 ? (
-                filteredMaterials.map((m, i) => (
-                  <div key={m.id} className="cv-row">
-                    <LessonRow
-                      lesson={m}
-                      idxLabel={String(i + 1).padStart(2, "0")}
-                      missing={m.status === "missing"}
-                      onOpen={() => navigate(`/library/material/${m.id}`, withSource("courses"))}
-                      onToggleBookmark={() => void toggleBookmark(m.id)}
-                      onDelete={() => openDeleteMaterial(m)}
-                    />
-                  </div>
-                ))
+                <LessonList
+                  lessons={filteredMaterials}
+                  isFiltered={isFiltered}
+                  onReorder={reorderMaterials}
+                  onSortAlphabetical={sortAlphabetical}
+                  onOpen={(m) => navigate(`/library/material/${m.id}`, withSource("courses"))}
+                  onToggleBookmark={(m) => void toggleBookmark(m.id)}
+                  onDelete={openDeleteMaterial}
+                />
               ) : (
                 <motion.div 
                   initial={{ opacity: 0 }}
@@ -782,159 +816,4 @@ export default function CoursesPage() {
       />
     </div>
   );
-}
-
-/**
- * One lesson row: 3D numbered circle · title + muted metadata · bookmark · status.
- * Transparent background, faint bottom separator + 3D hover glow, no neon.
- *
- * Memoized: on a large folder, bookmarking one row previously re-rendered every row (the
- * page refetched + replaced the whole list). With the optimistic in-place update + memo,
- * only the toggled row re-renders. `onOpen`/`onToggleBookmark` are cheap inline closures;
- * `lesson` is a stable object reference except for the row that actually changed.
- */
-const LessonRow = memo(function LessonRow({
-  lesson,
-  idxLabel,
-  missing,
-  onOpen,
-  onToggleBookmark,
-  onDelete,
-}: {
-  lesson: MaterialRowData;
-  idxLabel: string;
-  missing: boolean;
-  onOpen: () => void;
-  onToggleBookmark: () => void;
-  onDelete?: () => void;
-}) {
-  const done = lesson.is_completed;
-  const dur = lesson.duration_secs;
-  const durLabel = dur != null && dur > 0 ? formatShortDuration(dur) : null;
-  const inLabel =
-    lesson.progress_pct > 0 && !done ? `${lesson.progress_pct}% in` : null;
-  const FileIcon = FILE_ICON[lesson.file_type] ?? FileLucide;
-
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onOpen}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onOpen();
-        }
-      }}
-      aria-label={`Play lesson: ${lesson.file_name}`}
-      className={cn(
-        "lesson-row group flex cursor-pointer items-center gap-4 bg-transparent px-3 py-4 outline-none border-b border-white/[0.04] transition-all duration-300 hover:bg-gradient-to-r hover:from-white/[0.06] hover:to-transparent hover:border-white/[0.05] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] focus-visible:ring-1 focus-visible:ring-white/30",
-        missing && "opacity-60",
-      )}
-    >
-      {/* Numbered circle — 3D tactile, identical for every row; cyan accent on hover */}
-      <span
-        aria-hidden
-        className="w-9 h-9 rounded-full flex items-center justify-center bg-gradient-to-b from-white/[0.12] to-white/[0.02] border border-white/[0.15] shadow-[inset_0_1px_2px_rgba(255,255,255,0.2)] text-white/70 font-medium transition-all duration-300 group-hover:border-cyan-400/40 group-hover:text-cyan-400 group-hover:shadow-[inset_0_1px_3px_rgba(34,211,238,0.35)]"
-      >
-        {idxLabel}
-      </span>
-
-      {/* Title + muted metadata */}
-      <div className="min-w-0 flex-1">
-        <p
-          className={cn(
-            "truncate text-sm font-medium",
-            missing ? "text-content-muted" : "text-content-primary",
-          )}
-        >
-          {lesson.file_name}
-          {missing && (
-            <span className="ml-1.5 text-xs text-orange-400/80">· file missing</span>
-          )}
-        </p>
-        <p className="mt-1 flex items-center gap-1.5 truncate text-xs text-content-muted">
-          <FileIcon
-            size={12}
-            strokeWidth={2}
-            aria-hidden
-            className="shrink-0 text-content-muted"
-          />
-          {durLabel && <span>{durLabel}</span>}
-          {durLabel && inLabel && (
-            <span aria-hidden className="text-white/20">
-              ·
-            </span>
-          )}
-          {inLabel && (
-            <span className="text-content-secondary">{inLabel}</span>
-          )}
-        </p>
-      </div>
-
-      {/* Bookmark — faint gray default, solid lime only when active */}
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          onToggleBookmark();
-        }}
-        aria-label={lesson.is_bookmarked ? "Remove bookmark" : "Bookmark lesson"}
-        aria-pressed={lesson.is_bookmarked}
-        className={cn(
-          "grid h-8 w-8 shrink-0 place-items-center rounded-btn transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30",
-          lesson.is_bookmarked
-            ? "text-lime hover:bg-lime/10"
-            : "text-white/30 hover:bg-white/[0.05] hover:text-white/50",
-        )}
-      >
-        <Bookmark
-          size={16}
-          strokeWidth={2}
-          fill={lesson.is_bookmarked ? "currentColor" : "none"}
-          aria-hidden
-        />
-      </button>
-
-      {/* Delete — hover-revealed trash, so it never gets in the way of the row's
-          play/bookmark actions. Stops propagation so it never opens the lesson. */}
-      {onDelete && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          aria-label={`Delete lesson: ${lesson.file_name}`}
-          title="Delete lesson"
-          className="grid h-8 w-8 shrink-0 place-items-center rounded-btn text-white/25 opacity-0 transition-all duration-200 hover:bg-orange/15 hover:text-orange focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-orange/40 group-hover:opacity-100"
-        >
-          <Trash2 size={16} strokeWidth={2} aria-hidden />
-        </button>
-      )}
-
-      {/* Status: subtle-green ✔ Done, or muted-orange Start › */}
-      {done ? (
-        <span className="flex shrink-0 items-center gap-1 text-xs font-semibold text-lime/70">
-          <Check size={14} strokeWidth={3} aria-hidden />
-          Done
-        </span>
-      ) : (
-        <span className="flex shrink-0 items-center gap-1 text-xs font-semibold text-cyan-400/90">
-          Start
-          <ChevronRight size={13} strokeWidth={2.5} aria-hidden />
-        </span>
-      )}
-    </div>
-  );
-});
-
-/** Seconds → `H:MM:SS` / `M:SS`. */
-function formatShortDuration(secs: number): string {
-  const total = Math.floor(secs);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const pad = (n: number) => n.toString().padStart(2, "0");
-  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }

@@ -80,6 +80,28 @@ export interface TgImportResult {
   node_id: number;
 }
 
+/** What a range scan found (`tg_scan_range`). Nothing is written — this is a preview. */
+export interface TgRangeScanResult {
+  items: TgMediaItem[];
+  /** Messages inspected to find those items. */
+  scanned: number;
+  /** True when the sweep stopped on a safety cap rather than the end of the range. */
+  truncated: boolean;
+}
+
+/** One progress tick while a range scan runs (`tg://import-progress`). */
+export interface TgRangeProgress {
+  /** `discovering` while walking history, `fetching` while pulling metadata, then `done`. */
+  stage: string;
+  /** Media items confirmed so far. */
+  found: number;
+  /** Messages looked at so far (always >= `found`). */
+  scanned: number;
+  /** The requested count, or 0 for a start/end range whose total isn't known up front. */
+  target: number;
+  done: boolean;
+}
+
 /** One material from the Telegram import history (`tg_import_history`). */
 export interface TgImportedMaterial {
   material_id: number;
@@ -159,6 +181,27 @@ export const tg = {
   },
 
   /**
+   * Find the media in a run of messages starting at `startUrl`, **without importing it**.
+   *
+   * Pass exactly one bound: `endUrl` to sweep up to another link, or `count` to take that many
+   * media items. The backend rejects both-or-neither rather than guessing which was meant.
+   * When `startUrl` names a forum topic, the sweep stays inside that topic.
+   *
+   * The result feeds the same selection table as `channelMedia`, and the items the student keeps
+   * go to `importBatch`. Scanning is read-only, so an over-wide range costs time, not cleanup.
+   */
+  async scanRange(
+    startUrl: string,
+    bound: { endUrl: string } | { count: number },
+  ): Promise<TgRangeScanResult> {
+    return invokeCommand("tg_scan_range", {
+      startUrl,
+      endUrl: "endUrl" in bound ? bound.endUrl : null,
+      count: "count" in bound ? bound.count : null,
+    });
+  },
+
+  /**
    * List recent media in a channel. `url` accepts any message link from the channel, a
    * channel link, or a bare `@username` — finding a numeric channel id is not something a
    * student should have to do.
@@ -185,4 +228,21 @@ export const tg = {
 /** True when the Telegram backend is reachable (i.e. inside the Tauri shell). */
 export function tgAvailable(): boolean {
   return isTauri();
+}
+
+/**
+ * Subscribe to `tg://import-progress` — emitted while a range scan sweeps.
+ *
+ * A sweep can take a while (history walk + metadata fetch), so the UI shows real counts
+ * rather than an indeterminate spinner. Returns an unlisten function; call it on cleanup.
+ * Resolves to a no-op outside the Tauri shell.
+ */
+export async function onImportProgress(
+  cb: (progress: TgRangeProgress) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<TgRangeProgress>("tg://import-progress", (event) => {
+    cb(event.payload);
+  });
 }

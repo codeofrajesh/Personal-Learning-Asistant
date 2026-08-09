@@ -1,58 +1,40 @@
-import { useMemo, useState } from "react";
+/**
+ * Import lessons from Telegram: one link, a range, or by browsing a channel.
+ *
+ * All three modes end at the same place — a list of what was found, with the student ticking
+ * what they want and `tg_import_batch` committing it. Range used to be the exception: it swept
+ * and imported in one step, so a mistyped bound became rows to delete rather than a list to
+ * ignore. Now it scans, shows, and waits.
+ */
+
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Link as LinkIcon,
   FolderTree,
   Check,
   Loader2,
-  Download,
-  Sparkles,
   FolderPlus,
   Send,
-  FileType2,
-  Play,
-  Music,
-  FileText,
-  Image as ImageIcon,
+  Layers,
+  Hash,
+  MessagesSquare,
+  ScanLine,
 } from "lucide-react";
 import NodePicker from "../../components/wizard/NodePicker";
 import Modal from "../../components/ui/Modal";
-import { tg } from "./api";
-import type { TgMediaItem } from "./api";
+import RangeSweep from "./RangeSweep";
+import MediaSelectList from "./MediaSelectList";
+import type { MediaFilter } from "./MediaSelectList";
+import { onImportProgress, tg } from "./api";
+import type { TgMediaItem, TgRangeProgress } from "./api";
 import type { NodeCard } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { motion } from "framer-motion";
+import { AnimatePresence, motion } from "framer-motion";
 
-type Mode = "link" | "browse";
+type Mode = "link" | "range" | "browse";
 
-function formatSize(bytes: number): string {
-  if (bytes <= 0) return "";
-  const units = ["B", "KB", "MB", "GB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
-}
-
-function formatDuration(secs: number | null): string {
-  if (secs == null || secs <= 0) return "";
-  const total = Math.round(secs);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m`;
-  return `${m}m ${String(s).padStart(2, "0")}s`;
-}
-
-const TYPE_GLYPH: Record<string, typeof Play> = {
-  video: Play,
-  audio: Music,
-  pdf: FileText,
-  image: ImageIcon,
-  note: FileType2,
-};
+/** How a range says where to stop. */
+type RangeBound = "end" | "count";
 
 interface LinkImportProps {
   onImported?: () => void;
@@ -71,19 +53,50 @@ export default function LinkImport({ onImported }: LinkImportProps) {
   const [items, setItems] = useState<TgMediaItem[] | null>(null);
   const [importing, setImporting] = useState<Set<number>>(new Set());
   const [selectedItems, setSelectedItems] = useState<Set<number>>(new Set());
-  const [mediaFilter, setMediaFilter] = useState<"all" | "videos" | "documents">("all");
+  const [mediaFilter, setMediaFilter] = useState<MediaFilter>("all");
 
-  const filteredItems = useMemo(() => {
-    if (!items) return null;
-    return items.filter((item) => {
-      if (mediaFilter === "all") return true;
-      if (mediaFilter === "videos") return item.file_type === "video";
-      return item.file_type !== "video";
+  // ── Range mode ──
+  const [endUrl, setEndUrl] = useState("");
+  const [rangeBound, setRangeBound] = useState<RangeBound>("count");
+  const [count, setCount] = useState("20");
+  const [progress, setProgress] = useState<TgRangeProgress | null>(null);
+  /** What the last scan covered, kept for the summary above the list. */
+  const [scanSummary, setScanSummary] = useState<string | null>(null);
+
+  // Subscribe once and route ticks into state. The listener has to outlive any single scan
+  // (it is set up before the first one and torn down on unmount), so it can't live inside the
+  // scan handler — a per-call subscription would race the first event.
+  const progressRef = useRef<TgRangeProgress | null>(null);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void onImportProgress((tick) => {
+      progressRef.current = tick;
+      setProgress(tick);
+    }).then((fn) => {
+      // Unsubscribe immediately if the component unmounted before the listener resolved.
+      if (cancelled) fn();
+      else unlisten = fn;
     });
-  }, [items, mediaFilter]);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const messageOf = (e: unknown) =>
     typeof e === "string" ? e : e instanceof Error ? e.message : "Import failed.";
+
+  /** Clear whatever the previous run left on screen. */
+  const resetResults = () => {
+    setError(null);
+    setDone(null);
+    setItems(null);
+    setSelectedItems(new Set());
+    setScanSummary(null);
+    setProgress(null);
+    progressRef.current = null;
+  };
 
   const importOne = async () => {
     if (nodeId == null) {
@@ -99,7 +112,7 @@ export default function LinkImport({ onImported }: LinkImportProps) {
       setDone(
         result.created
           ? `Imported “${result.file_name}”${where}.`
-          : `Updated “${result.file_name}” — it was already in your library.`
+          : `Updated “${result.file_name}” — it was already in your library.`,
       );
       setUrl("");
       onImported?.();
@@ -110,16 +123,56 @@ export default function LinkImport({ onImported }: LinkImportProps) {
     }
   };
 
+  /**
+   * Sweep the range and show what's in it. Writes nothing — the student picks from the result
+   * and `importSelected` does the importing.
+   */
+  const scanRange = async () => {
+    const parsedCount = Number.parseInt(count, 10);
+    if (rangeBound === "count" && (!Number.isFinite(parsedCount) || parsedCount < 1)) {
+      setError("Enter how many lessons to look for.");
+      return;
+    }
+    if (rangeBound === "end" && !endUrl.trim()) {
+      setError("Paste the link of the last lesson in the range.");
+      return;
+    }
+
+    setBusy(true);
+    resetResults();
+
+    try {
+      const result = await tg.scanRange(
+        url,
+        rangeBound === "end" ? { endUrl: endUrl.trim() } : { count: parsedCount },
+      );
+      // Oldest first, so Lesson 1, 2, 3 read top-to-bottom.
+      const found = [...result.items].sort((a, b) => a.message_id - b.message_id);
+      setItems(found);
+      // Pre-tick everything not already in the library: the student asked for this range, so
+      // "all of it" is the expected answer and unticking a few is less work than ticking fifty.
+      setSelectedItems(new Set(found.filter((i) => !i.already_imported).map((i) => i.message_id)));
+
+      const parts = [`Found ${found.length} file${found.length === 1 ? "" : "s"}`];
+      parts.push(`scanned ${result.scanned} message${result.scanned === 1 ? "" : "s"}`);
+      if (result.truncated) parts.push("stopped at the safety limit");
+      setScanSummary(parts.join(" · "));
+    } catch (e) {
+      setError(messageOf(e));
+      // A failed sweep leaves a half-filled rail, which would read as partial success.
+      setProgress(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const browse = async () => {
     setBusy(true);
-    setError(null);
-    setDone(null);
-    setItems(null);
-    setSelectedItems(new Set());
+    resetResults();
     try {
       const fetched = await tg.channelMedia(url);
-      // Sort ascending (oldest first) so that Lesson 1, 2, 3 appear in order top-to-bottom
-      setItems(fetched.sort((a, b) => a.message_id - b.message_id));
+      // Sort ascending (oldest first) so that Lesson 1, 2, 3 appear in order top-to-bottom.
+      setItems([...fetched].sort((a, b) => a.message_id - b.message_id));
     } catch (e) {
       setError(messageOf(e));
     } finally {
@@ -139,9 +192,14 @@ export default function LinkImport({ onImported }: LinkImportProps) {
       setItems(
         (prev) =>
           prev?.map((i) =>
-            i.message_id === item.message_id ? { ...i, already_imported: true } : i
-          ) ?? null
+            i.message_id === item.message_id ? { ...i, already_imported: true } : i,
+          ) ?? null,
       );
+      setSelectedItems((prev) => {
+        const next = new Set(prev);
+        next.delete(item.message_id);
+        return next;
+      });
       onImported?.();
     } catch (e) {
       setError(messageOf(e));
@@ -160,44 +218,82 @@ export default function LinkImport({ onImported }: LinkImportProps) {
       return;
     }
     if (selectedItems.size === 0) return;
-    
+
     setError(null);
+    setDone(null);
     const toImport = Array.from(selectedItems);
-    
+
     try {
       setBusy(true);
-      toImport.forEach(msgId => setImporting((prev) => new Set(prev).add(msgId)));
+      setImporting((prev) => {
+        const next = new Set(prev);
+        toImport.forEach((id) => next.add(id));
+        return next;
+      });
 
-      // Call the bulk fetch backend command to do this safely in a single transaction
-      await tg.importBatch(url, toImport, nodeId);
-      
-      setItems((prev) =>
-        prev?.map((i) => (toImport.includes(i.message_id) ? { ...i, already_imported: true } : i)) ?? null
+      // One transaction in the backend: every ticked lesson lands, or none does.
+      const results = await tg.importBatch(url, toImport, nodeId);
+
+      const imported = new Set(toImport);
+      setItems(
+        (prev) =>
+          prev?.map((i) => (imported.has(i.message_id) ? { ...i, already_imported: true } : i)) ??
+          null,
       );
       setSelectedItems(new Set());
+      const where = destination ? ` into ${destination.name}` : "";
+      setDone(`Imported ${results.length} lesson${results.length === 1 ? "" : "s"}${where}.`);
       onImported?.();
     } catch (e) {
       setError(messageOf(e));
     } finally {
-      toImport.forEach(msgId => {
-        setImporting((prev) => {
-          const next = new Set(prev);
-          next.delete(msgId);
-          return next;
-        });
+      setImporting((prev) => {
+        const next = new Set(prev);
+        toImport.forEach((id) => next.delete(id));
+        return next;
       });
       setBusy(false);
     }
   };
 
-  const actionDisabled = busy || !url.trim() || (mode === "link" && nodeId == null);
+  // Every mode needs a start link; range also needs its bound filled in, and only the
+  // single-link path writes straight away, so only it needs a destination up front.
+  const rangeIncomplete =
+    mode === "range" && (rangeBound === "end" ? !endUrl.trim() : !count.trim());
+  const actionDisabled = busy || !url.trim() || rangeIncomplete || (mode === "link" && nodeId == null);
 
-  const browseStats = useMemo(() => {
-    if (!filteredItems || filteredItems.length === 0) return null;
-    const totalBytes = filteredItems.reduce((sum, i) => sum + (i.size_bytes ?? 0), 0);
-    const already = filteredItems.filter((i) => i.already_imported).length;
-    return { totalBytes, already };
-  }, [filteredItems]);
+  /** Run whichever action the current mode maps to. */
+  const runAction = () => {
+    if (mode === "link") return importOne();
+    if (mode === "range") return scanRange();
+    return browse();
+  };
+
+  /**
+   * Does the start link look like it names a forum topic?
+   *
+   * Display-only: the backend parser is the authority on what a link means, and this exists
+   * purely to warn before a sweep that the range will be topic-scoped. Deliberately loose —
+   * a false negative just omits a hint, and nothing branches on it.
+   */
+  const startLooksLikeTopic = useMemo(() => {
+    const raw = url.trim();
+    if (!raw) return false;
+    if (/[?&]thread=\d+/.test(raw)) return true;
+    // `/c/<id>/<topic>/<msg>` or `/<username>/<topic>/<msg>` — three numeric-ish path
+    // segments after the host, with the last two both numbers.
+    const path = raw.split("#")[0].split("?")[0];
+    const segments = path.replace(/^https?:\/\//, "").split("/").filter(Boolean);
+    // Drop the host, leaving the path segments.
+    const parts = segments.slice(1);
+    if (parts[0] === "c") return parts.length === 4 && /^\d+$/.test(parts[2]);
+    return parts.length === 3 && /^\d+$/.test(parts[1]) && /^\d+$/.test(parts[2]);
+  }, [url]);
+
+  // Both list-producing modes share the split layout: controls on the left, results beside them.
+  const hasList = (mode === "browse" || mode === "range") && items != null;
+  // The rail is live feedback, so it gives way once there's a real list to look at.
+  const showSweep = mode === "range" && (busy || (progress != null && items == null));
 
   return (
     <div className="space-y-6">
@@ -210,7 +306,13 @@ export default function LinkImport({ onImported }: LinkImportProps) {
         {(
           [
             { id: "link" as Mode, label: "One link", hint: "a single lesson", icon: LinkIcon },
-            { id: "browse" as Mode, label: "Browse channel", hint: "recent media", icon: FolderTree },
+            { id: "range" as Mode, label: "Range", hint: "many at once", icon: Layers },
+            {
+              id: "browse" as Mode,
+              label: "Browse channel",
+              hint: "recent media",
+              icon: FolderTree,
+            },
           ]
         ).map(({ id, label, hint, icon: Icon }) => (
           <button
@@ -220,15 +322,13 @@ export default function LinkImport({ onImported }: LinkImportProps) {
             aria-selected={mode === id}
             onClick={() => {
               setMode(id);
-              setError(null);
-              setDone(null);
-              setItems(null);
+              resetResults();
             }}
             className={cn(
               "relative inline-flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2AABEE]/40",
               mode === id
                 ? "bg-[#2AABEE] text-white shadow-[0_2px_10px_rgba(42,171,238,0.3)]"
-                : "text-content-secondary hover:bg-white/[0.05] hover:text-content-primary"
+                : "text-content-secondary hover:bg-white/[0.05] hover:text-content-primary",
             )}
           >
             <Icon size={16} strokeWidth={mode === id ? 2.5 : 2} aria-hidden />
@@ -236,7 +336,7 @@ export default function LinkImport({ onImported }: LinkImportProps) {
             <span
               className={cn(
                 "hidden leading-none sm:inline",
-                mode === id ? "text-white/70" : "text-content-faint"
+                mode === id ? "text-white/70" : "text-content-faint",
               )}
             >
               · {hint}
@@ -246,344 +346,294 @@ export default function LinkImport({ onImported }: LinkImportProps) {
       </div>
 
       {/* Responsive layout wrapper */}
-      <div className={cn("flex flex-col gap-6 transition-all duration-500", mode === "browse" && "xl:flex-row xl:items-start")}>
-        <div className={cn("w-full transition-all duration-500", mode === "browse" && "xl:w-[40%] xl:sticky xl:top-6")}>
-          {/* Input card */}
-          <div className="rounded-2xl border border-white/[0.06] bg-white/[0.02] p-6 shadow-card hover:border-[#2AABEE]/20 transition-colors duration-500">
-        <label className="block relative group">
-          <div className="absolute -inset-1 rounded-xl bg-gradient-to-r from-[#2AABEE]/0 via-[#2AABEE]/10 to-[#2AABEE]/0 opacity-0 group-focus-within:opacity-100 blur-md transition-opacity duration-500" />
-          <span className="mb-2 flex items-center gap-2 text-sm font-medium text-content-secondary">
-            <LinkIcon size={14} strokeWidth={2} className="text-[#2AABEE]" aria-hidden />
-            {mode === "link" ? "Message link" : "Channel, invite link, or @username"}
-          </span>
-          <div className="relative">
-            <input
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !actionDisabled) void (mode === "link" ? importOne() : browse());
-              }}
-              placeholder={
-                mode === "link" ? "https://t.me/c/1234567890/42" : "https://t.me/+AbCdEf… or @mychannel"
-              }
-              spellCheck={false}
-              className={cn(
-                "relative z-10 w-full rounded-xl border border-white/10 bg-[#09090b] px-4 py-3.5 pr-24 font-mono text-sm text-content-primary outline-none transition-all placeholder:text-content-faint focus:border-[#2AABEE]/50 focus:shadow-[0_0_15px_rgba(42,171,238,0.15)]",
-                busy && "opacity-60"
-              )}
-            />
-            <span className="pointer-events-none absolute z-20 right-3 top-1/2 -translate-y-1/2 rounded-full border border-white/[0.08] bg-white/[0.04] px-2.5 py-1 text-[0.65rem] font-semibold uppercase tracking-wide text-content-faint">
-              {mode === "link" ? "t.me/c/…" : "t.me or @"}
-            </span>
-          </div>
-        </label>
-
-        {/* Destination Section */}
-        <div className="mt-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-           <div className="flex-1">
-              <span className="mb-1 flex items-center gap-1.5 text-sm font-medium text-content-secondary">
-                 <FolderPlus size={14} strokeWidth={2} className="text-lime" aria-hidden />
-                 Destination
-              </span>
-              <button
-                 onClick={() => setIsNodePickerOpen(true)}
-                 className="flex w-full sm:max-w-xs items-center justify-between gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-2.5 text-sm text-content-primary transition-all hover:bg-white/[0.04] hover:border-lime/30"
-              >
-                 {destination ? (
-                    <span className="flex items-center gap-2 truncate">
-                       <Check size={14} strokeWidth={3} className="text-lime shrink-0" />
-                       <span className="truncate">{destination.name}</span>
-                    </span>
-                 ) : (
-                    <span className="text-content-faint">Choose a folder...</span>
-                 )}
-              </button>
-           </div>
-           
-           {/* Action */}
-           <div className="shrink-0 pt-6 sm:pt-0">
-             <button
-                type="button"
-                onClick={() => void (mode === "link" ? importOne() : browse())}
-                disabled={actionDisabled}
-                className={cn(
-                   "inline-flex h-[42px] min-w-[140px] items-center justify-center gap-2 rounded-xl bg-lime px-5 text-sm font-semibold text-ink-900 shadow-glow-lime transition-transform hover:scale-[1.02] active:scale-[0.98]",
-                   actionDisabled && "cursor-not-allowed opacity-50 hover:scale-100 shadow-none"
-                )}
-             >
-                {busy ? (
-                   <Loader2 size={16} strokeWidth={2.5} className="animate-spin" aria-hidden />
-                ) : (
-                   <Send size={15} strokeWidth={2.5} aria-hidden />
-                )}
-                {busy
-                   ? mode === "link"
-                      ? "Importing…"
-                      : "Loading…"
-                   : mode === "link"
-                      ? "Import lesson"
-                      : "Show media"}
-             </button>
-           </div>
-        </div>
-
-        {/* Feedback */}
-        {error && (
-          <p role="alert" className="mt-5 flex items-start gap-2 rounded-xl border border-orange/25 bg-orange/10 px-4 py-3 text-sm text-orange">
-            {error}
-          </p>
+      <div
+        className={cn(
+          "flex flex-col gap-6 transition-all duration-500",
+          hasList && "xl:flex-row xl:items-start",
         )}
-        {done && (
-          <motion.p
-            initial={{ opacity: 0, y: -5 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="mt-5 flex items-start gap-2 rounded-xl border border-lime/20 bg-lime/[0.08] px-4 py-3 text-sm text-lime shadow-[0_0_10px_rgba(163,230,53,0.1)]"
-          >
-            <Check size={16} strokeWidth={2.5} className="mt-[1px] shrink-0" aria-hidden />
-            {done}
-          </motion.p>
-        )}
-      </div>
-
-      {/* Destination Picker Modal */}
-      <Modal
-        open={isNodePickerOpen}
-        onClose={() => setIsNodePickerOpen(false)}
-        title="Choose destination"
-        subtitle="Select a folder to import the media into."
-        widthClass="max-w-xl"
       >
-        <div className="py-2">
-           <NodePicker 
-             selectedId={nodeId} 
-             onSelect={(node) => {
-               setDestination(node);
-               setIsNodePickerOpen(false);
-             }} 
-           />
-        </div>
-      </Modal>
-        </div>
-
-        {/* Browse results */}
-        {mode === "browse" && items != null && (
-          <div className="flex-1 min-w-0 w-full">
-            <motion.div
-               initial={{ opacity: 0, y: 10 }}
-               animate={{ opacity: 1, y: 0 }}
-               className="glass rounded-2xl border border-white/15 bg-[#050506]/50 shadow-[0_8px_32px_rgba(0,0,0,0.5),inset_0_1px_0_rgba(255,255,255,0.1)] p-4 max-h-[calc(100vh-380px)] xl:max-h-[calc(100vh-420px)] min-h-[250px] overflow-y-auto relative scroll-thin"
-            >
-          {items.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-10 text-center">
-               <span className="grid h-12 w-12 place-items-center rounded-xl bg-white/[0.03]">
-                  <FolderTree size={20} className="text-content-faint" />
-               </span>
-               <p className="mt-4 text-sm text-content-muted">
-                 No media found in that channel's recent messages.
-               </p>
-            </div>
-          ) : (
-            <>
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-3 px-1 pb-4 pt-1 text-xs text-content-faint">
-                <span className="flex items-center gap-1.5">
-                  <Sparkles size={14} strokeWidth={2} className="text-[#2AABEE]" aria-hidden />
-                  <span className="font-medium text-content-secondary">
-                    {filteredItems!.length} file{filteredItems!.length === 1 ? "" : "s"}
-                  </span>
-                  {browseStats && browseStats.totalBytes > 0 && (
-                    <span>· {formatSize(browseStats.totalBytes)}</span>
+        <div
+          className={cn(
+            "w-full transition-all duration-500",
+            hasList && "xl:sticky xl:top-6 xl:w-[40%]",
+          )}
+        >
+          {/* Input card */}
+          <div className="rounded-2xl border border-white/[0.06] bg-white/[0.02] p-6 shadow-card transition-colors duration-500 hover:border-[#2AABEE]/20">
+            <label className="group relative block">
+              <div className="absolute -inset-1 rounded-xl bg-gradient-to-r from-[#2AABEE]/0 via-[#2AABEE]/10 to-[#2AABEE]/0 opacity-0 blur-md transition-opacity duration-500 group-focus-within:opacity-100" />
+              <span className="mb-2 flex items-center gap-2 text-sm font-medium text-content-secondary">
+                <LinkIcon size={14} strokeWidth={2} className="text-[#2AABEE]" aria-hidden />
+                {mode === "link"
+                  ? "Message link"
+                  : mode === "range"
+                    ? "First lesson in the range"
+                    : "Channel, invite link, or @username"}
+              </span>
+              <div className="relative">
+                <input
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !actionDisabled) void runAction();
+                  }}
+                  placeholder={
+                    mode === "browse"
+                      ? "https://t.me/+AbCdEf… or @mychannel"
+                      : "https://t.me/c/1234567890/42"
+                  }
+                  spellCheck={false}
+                  className={cn(
+                    "relative z-10 w-full rounded-xl border border-white/10 bg-[#09090b] px-4 py-3.5 pr-24 font-mono text-sm text-content-primary outline-none transition-all placeholder:text-content-faint focus:border-[#2AABEE]/50 focus:shadow-[0_0_15px_rgba(42,171,238,0.15)]",
+                    busy && "opacity-60",
                   )}
+                />
+                <span className="pointer-events-none absolute right-3 top-1/2 z-20 -translate-y-1/2 rounded-full border border-white/[0.08] bg-white/[0.04] px-2.5 py-1 text-[0.65rem] font-semibold uppercase tracking-wide text-content-faint">
+                  {mode === "browse" ? "t.me or @" : "t.me/c/…"}
                 </span>
+              </div>
+            </label>
 
-                <div className="hidden sm:block mx-1 h-4 w-px bg-white/10" />
-
-                {/* Filter Pills */}
-                <div className="flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.02] p-1 shadow-inner">
-                  {(["all", "videos", "documents"] as const).map((f) => (
+            {/* Range controls. Shown only in range mode so the single-link path stays a one-field
+                form — the common case shouldn't pay for the rarer one. */}
+            {mode === "range" && (
+              <motion.div
+                initial={{ opacity: 0, y: -6 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+                className="mt-5 rounded-2xl border border-white/[0.06] bg-black/20 p-4"
+              >
+                {/* Where the range stops. Two genuinely different questions, so they get a switch
+                    rather than one field that means different things. */}
+                <div
+                  role="radiogroup"
+                  aria-label="Where the range ends"
+                  className="inline-flex rounded-lg border border-white/10 bg-white/[0.02] p-1"
+                >
+                  {(
+                    [
+                      { id: "count" as RangeBound, label: "Next N lessons", icon: Hash },
+                      { id: "end" as RangeBound, label: "Up to a link", icon: MessagesSquare },
+                    ]
+                  ).map(({ id, label, icon: Icon }) => (
                     <button
-                      key={f}
-                      onClick={() => setMediaFilter(f)}
+                      key={id}
+                      type="button"
+                      role="radio"
+                      aria-checked={rangeBound === id}
+                      onClick={() => {
+                        setRangeBound(id);
+                        setError(null);
+                      }}
                       className={cn(
-                        "relative rounded-full px-3 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#2AABEE]",
-                        mediaFilter === f ? "text-white" : "text-content-secondary hover:text-content-primary hover:bg-white/5"
+                        "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2AABEE]/40",
+                        rangeBound === id
+                          ? "bg-white/[0.08] text-content-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]"
+                          : "text-content-secondary hover:text-content-primary",
                       )}
                     >
-                      {mediaFilter === f && (
-                        <motion.div
-                          layoutId="tg-media-filter"
-                          className="absolute inset-0 bg-gradient-to-br from-blue-600/90 to-blue-400/90 rounded-full shadow-[inset_0_1px_0_rgba(255,255,255,0.3),_0_0_15px_rgba(59,130,246,0.5)] border border-blue-400/30"
-                          transition={{ type: "spring", bounce: 0.2, duration: 0.6 }}
-                        />
-                      )}
-                      <span className="relative z-10 capitalize">{f}</span>
+                      <Icon size={13} strokeWidth={2} aria-hidden />
+                      {label}
                     </button>
                   ))}
                 </div>
 
-                {/* Select All Toggle */}
-                {filteredItems!.length > 0 && (
-                  <button
-                    onClick={() => {
-                      const unimported = filteredItems!.filter(i => !i.already_imported);
-                      const allSelected = unimported.length > 0 && unimported.every(i => selectedItems.has(i.message_id));
-                      
-                      setSelectedItems((prev) => {
-                        const next = new Set(prev);
-                        if (allSelected) {
-                          unimported.forEach(i => next.delete(i.message_id));
-                        } else {
-                          unimported.forEach(i => next.add(i.message_id));
-                        }
-                        return next;
-                      });
-                    }}
-                    className="flex items-center gap-1.5 rounded bg-white/[0.04] px-2 py-1 transition-colors hover:bg-white/[0.08]"
-                  >
-                    <div className={cn(
-                      "flex h-3.5 w-3.5 items-center justify-center rounded-[3px] border",
-                      (() => {
-                        const unimported = filteredItems!.filter(i => !i.already_imported);
-                        const allSelected = unimported.length > 0 && unimported.every(i => selectedItems.has(i.message_id));
-                        return allSelected ? "border-[#2AABEE] bg-[#2AABEE] text-white" : "border-white/20 bg-transparent text-transparent";
-                      })()
-                    )}>
-                      <Check size={10} strokeWidth={3} />
-                    </div>
-                    Select {(() => {
-                      const unimported = filteredItems!.filter(i => !i.already_imported);
-                      const allSelected = unimported.length > 0 && unimported.every(i => selectedItems.has(i.message_id));
-                      return allSelected ? "None" : "All";
-                    })()}
-                  </button>
-                )}
-
-                <div className="flex-1" />
-
-                {/* Import Selected Button */}
-                {selectedItems.size > 0 ? (
-                  <button
-                    onClick={() => void importSelected()}
-                    disabled={nodeId == null || busy}
-                    className="flex shrink-0 items-center gap-1.5 rounded-full bg-lime px-3 py-1 font-semibold text-ink-900 shadow-glow-lime transition-transform hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
-                  >
-                    <Download size={12} strokeWidth={2.5} />
-                    Import {selectedItems.size} Selected
-                  </button>
-                ) : (
-                  nodeId == null ? (
-                    <span className="text-orange rounded-full bg-orange/10 px-2 py-0.5">Choose destination</span>
+                <div className="mt-4">
+                  {rangeBound === "count" ? (
+                    <label className="block">
+                      <span className="mb-2 block text-sm font-medium text-content-secondary">
+                        How many lessons
+                      </span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={500}
+                        value={count}
+                        onChange={(e) => setCount(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && !actionDisabled) void runAction();
+                        }}
+                        className="w-32 rounded-xl border border-white/10 bg-[#09090b] px-4 py-2.5 font-mono text-sm text-content-primary outline-none transition-all focus:border-[#2AABEE]/50"
+                      />
+                      <p className="mt-2 text-xs text-content-faint">
+                        Counts files, not messages — text posts in between don't use up the total.
+                      </p>
+                    </label>
                   ) : (
-                    <span className="flex shrink-0 items-center gap-1.5 rounded-full bg-lime/10 px-2.5 py-0.5 text-lime border border-lime/20">
-                      <Check size={12} strokeWidth={3} aria-hidden />
-                      Dest: {destination?.name}
-                    </span>
-                  )
+                    <label className="block">
+                      <span className="mb-2 block text-sm font-medium text-content-secondary">
+                        Last lesson in the range
+                      </span>
+                      <input
+                        value={endUrl}
+                        onChange={(e) => setEndUrl(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && !actionDisabled) void runAction();
+                        }}
+                        placeholder="https://t.me/c/1234567890/122"
+                        spellCheck={false}
+                        className="w-full rounded-xl border border-white/10 bg-[#09090b] px-4 py-2.5 font-mono text-sm text-content-primary outline-none transition-all placeholder:text-content-faint focus:border-[#2AABEE]/50"
+                      />
+                      <p className="mt-2 text-xs text-content-faint">
+                        Both links must come from the same channel.
+                      </p>
+                    </label>
+                  )}
+                </div>
+
+                {/* Forum links carry their topic, and the sweep stays inside it. Saying so up front
+                    prevents the "why did it only find some of them" question. */}
+                {startLooksLikeTopic && (
+                  <p className="mt-4 flex items-start gap-2 rounded-xl border border-[#2AABEE]/20 bg-[#2AABEE]/[0.07] px-3 py-2 text-xs text-[#2AABEE]">
+                    <MessagesSquare
+                      size={13}
+                      strokeWidth={2}
+                      className="mt-[2px] shrink-0"
+                      aria-hidden
+                    />
+                    That's a forum topic link — only lessons in that topic will be found.
+                  </p>
                 )}
+              </motion.div>
+            )}
+
+            {/* Destination Section */}
+            <div className="mt-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+              <div className="flex-1">
+                <span className="mb-1 flex items-center gap-1.5 text-sm font-medium text-content-secondary">
+                  <FolderPlus size={14} strokeWidth={2} className="text-lime" aria-hidden />
+                  Destination
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsNodePickerOpen(true)}
+                  className="flex w-full items-center justify-between gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-2.5 text-sm text-content-primary transition-all hover:border-lime/30 hover:bg-white/[0.04] sm:max-w-xs"
+                >
+                  {destination ? (
+                    <span className="flex items-center gap-2 truncate">
+                      <Check size={14} strokeWidth={3} className="shrink-0 text-lime" aria-hidden />
+                      <span className="truncate">{destination.name}</span>
+                    </span>
+                  ) : (
+                    <span className="text-content-faint">Choose a folder…</span>
+                  )}
+                </button>
               </div>
 
-              <ul className="flex flex-col gap-2">
-                {filteredItems!.length === 0 ? (
-                  <li className="py-8 text-center text-sm text-content-faint">
-                    No files match the selected filter.
-                  </li>
-                ) : (
-                  filteredItems!.map((item) => {
-                    const isImporting = importing.has(item.message_id);
-                    const isSelected = selectedItems.has(item.message_id);
-                    const Glyph = TYPE_GLYPH[item.file_type] ?? FileType2;
-                    const meta = [
-                      formatDuration(item.duration_secs),
-                      formatSize(item.size_bytes),
-                    ]
-                      .filter(Boolean)
-                      .join(" · ");
-                    return (
-                      <li
-                        key={item.message_id}
-                        onClick={() => {
-                          if (item.already_imported || isImporting) return;
-                          setSelectedItems((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(item.message_id)) next.delete(item.message_id);
-                            else next.add(item.message_id);
-                            return next;
-                          });
-                        }}
-                        className={cn(
-                          "group flex cursor-pointer items-center gap-4 rounded-xl border px-4 py-3 transition-all hover:-translate-y-[1px]",
-                          isSelected 
-                            ? "border-[#2AABEE]/40 bg-[#2AABEE]/10 shadow-[0_0_15px_rgba(42,171,238,0.05)]" 
-                            : "border-white/[0.04] bg-white/[0.02] hover:border-white/10 hover:bg-white/[0.04]"
-                        )}
-                      >
-                        {/* Checkbox */}
-                        <div className={cn(
-                          "flex h-4 w-4 shrink-0 items-center justify-center rounded-[4px] border transition-colors",
-                          item.already_imported
-                            ? "border-lime/30 bg-lime/10 text-lime"
-                            : isSelected
-                              ? "border-[#2AABEE] bg-[#2AABEE] text-white"
-                              : "border-white/20 bg-black/20 text-transparent group-hover:border-white/40"
-                        )}>
-                          <Check size={11} strokeWidth={3} />
-                        </div>
+              {/* Action */}
+              <div className="shrink-0 pt-6 sm:pt-0">
+                <button
+                  type="button"
+                  onClick={() => void runAction()}
+                  disabled={actionDisabled}
+                  className={cn(
+                    "inline-flex h-[42px] min-w-[140px] items-center justify-center gap-2 rounded-xl bg-lime px-5 text-sm font-semibold text-ink-900 shadow-glow-lime transition-transform hover:scale-[1.02] active:scale-[0.98]",
+                    actionDisabled && "cursor-not-allowed opacity-50 shadow-none hover:scale-100",
+                  )}
+                >
+                  {busy ? (
+                    <Loader2 size={16} strokeWidth={2.5} className="animate-spin" aria-hidden />
+                  ) : mode === "range" ? (
+                    <ScanLine size={15} strokeWidth={2.5} aria-hidden />
+                  ) : (
+                    <Send size={15} strokeWidth={2.5} aria-hidden />
+                  )}
+                  {busy
+                    ? mode === "link"
+                      ? "Importing…"
+                      : mode === "range"
+                        ? "Scanning…"
+                        : "Loading…"
+                    : mode === "link"
+                      ? "Import lesson"
+                      : mode === "range"
+                        ? "Scan range"
+                        : "Show media"}
+                </button>
+              </div>
+            </div>
 
-                        <span
-                          aria-hidden
-                          className={cn(
-                            "grid h-10 w-10 shrink-0 place-items-center rounded-xl border",
-                            item.file_type === "video"
-                              ? "border-lime/20 bg-lime/10 text-lime shadow-[0_0_10px_rgba(163,230,53,0.1)]"
-                              : item.file_type === "pdf"
-                                ? "border-orange/20 bg-orange/10 text-orange"
-                                : "border-white/10 bg-white/[0.05] text-content-secondary"
-                          )}
-                        >
-                          <Glyph size={18} strokeWidth={2} />
-                        </span>
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm font-medium text-content-primary group-hover:text-white transition-colors">{item.file_name}</p>
-                          <p className="mt-1 flex items-center gap-2 text-xs text-content-muted">
-                            <span className="rounded bg-white/5 px-1.5 py-0.5 uppercase tracking-wide text-content-faint">
-                              {item.file_type}
-                            </span>
-                            {meta && <span>{meta}</span>}
-                          </p>
-                        </div>
-                        {item.already_imported ? (
-                          <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-lime/20 bg-lime/10 px-3 py-1.5 text-xs font-semibold text-lime shadow-[0_0_8px_rgba(163,230,53,0.1)]">
-                            <Check size={14} strokeWidth={2.5} aria-hidden />
-                            In library
-                          </span>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void importItem(item);
-                            }}
-                            disabled={isImporting || nodeId == null}
-                            className={cn(
-                              "inline-flex h-[34px] min-w-[80px] shrink-0 items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 text-xs font-semibold text-content-secondary transition-all hover:border-[#2AABEE]/40 hover:bg-[#2AABEE]/10 hover:text-[#2AABEE] active:scale-[0.97]",
-                              (isImporting || nodeId == null) && "cursor-not-allowed opacity-40 hover:scale-100 hover:border-white/10 hover:bg-white/[0.03] hover:text-content-secondary"
-                            )}
-                          >
-                            {isImporting ? (
-                              <Loader2 size={13} strokeWidth={2.5} className="animate-spin" aria-hidden />
-                            ) : (
-                              <Download size={13} strokeWidth={2} aria-hidden />
-                            )}
-                            {isImporting ? "..." : "Import"}
-                          </button>
-                        )}
-                      </li>
-                    );
-                  })
-                )}
-              </ul>
-            </>
-          )}
-            </motion.div>
+            {/* Live sweep, while the range is being walked. It gives way to the list of results,
+                which is a far better answer to "did that work" than a full rail. */}
+            <AnimatePresence>
+              {showSweep && (
+                <motion.div
+                  key="sweep"
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
+                  className="overflow-hidden"
+                >
+                  <div className="mt-5">
+                    <RangeSweep progress={progress} active={busy} />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Feedback */}
+            {error && (
+              <p
+                role="alert"
+                className="mt-5 flex items-start gap-2 rounded-xl border border-orange/25 bg-orange/10 px-4 py-3 text-sm text-orange"
+              >
+                {error}
+              </p>
+            )}
+            {done && (
+              <motion.p
+                initial={{ opacity: 0, y: -5 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="mt-5 flex items-start gap-2 rounded-xl border border-lime/20 bg-lime/[0.08] px-4 py-3 text-sm text-lime shadow-[0_0_10px_rgba(163,230,53,0.1)]"
+              >
+                <Check size={16} strokeWidth={2.5} className="mt-[1px] shrink-0" aria-hidden />
+                {done}
+              </motion.p>
+            )}
+          </div>
+
+          {/* Destination Picker Modal */}
+          <Modal
+            open={isNodePickerOpen}
+            onClose={() => setIsNodePickerOpen(false)}
+            title="Choose destination"
+            subtitle="Select a folder to import the media into."
+            widthClass="max-w-xl"
+          >
+            <div className="py-2">
+              <NodePicker
+                selectedId={nodeId}
+                onSelect={(node) => {
+                  setDestination(node);
+                  setIsNodePickerOpen(false);
+                }}
+              />
+            </div>
+          </Modal>
+        </div>
+
+        {/* Results — the same selection list for a scanned range and a browsed channel */}
+        {hasList && (
+          <div className="w-full min-w-0 flex-1">
+            <MediaSelectList
+              items={items!}
+              filter={mediaFilter}
+              onFilterChange={setMediaFilter}
+              selected={selectedItems}
+              onSelectedChange={setSelectedItems}
+              importing={importing}
+              onImportOne={(item) => void importItem(item)}
+              onImportSelected={() => void importSelected()}
+              destinationName={destination?.name ?? null}
+              busy={busy}
+              summary={mode === "range" ? (scanSummary ?? undefined) : undefined}
+              emptyMessage={
+                mode === "range"
+                  ? "No files in that range. Check the links point at lessons with a video, PDF, or audio file."
+                  : "No media found in that channel's recent messages."
+              }
+            />
           </div>
         )}
       </div>
