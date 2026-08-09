@@ -165,6 +165,13 @@ export const ipc = {
     return call<MaterialRow[]>("node_materials", { nodeId });
   },
 
+  /** Save the manual lesson order for one folder. `materialIds` is the folder's FULL list in
+   *  its new order — ids from another folder are skipped by the backend rather than trusted.
+   *  Resolves to the number of rows that actually moved. */
+  reorderMaterials(nodeId: number, materialIds: number[]): Promise<number> {
+    return call<number>("reorder_materials", { nodeId, materialIds });
+  },
+
   // ── Courses hub sections (v8) ───────────────────────────────────────────────
 
   /** Nodes the user pinned to the Courses hub ("Pinned" section + Explore Pinned). */

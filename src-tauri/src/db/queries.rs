@@ -149,9 +149,14 @@ pub fn insert_material(conn: &Connection, node_id: i64, file: &ScannedFile) -> A
         return Ok(true);
     }
 
+    let sql = format!(
+        "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension,
+                               file_size_bytes, sort_order)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, {})",
+        next_sort_order("?1")
+    );
     conn.execute(
-        "INSERT INTO materials(node_id, file_path, file_name, file_type, file_extension, file_size_bytes)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        &sql,
         rusqlite::params![
             node_id,
             file.path,
@@ -660,7 +665,7 @@ pub fn next_up(conn: &Connection, limit: i64) -> AppResult<Vec<NextUpItem>> {
                 rn2.name AS root_name,
                 ROW_NUMBER() OVER (
                     PARTITION BY mr.root_id
-                    ORDER BY pn.sort_order, pn.name, m.sort_order, m.file_name
+                    ORDER BY pn.sort_order, pn.name, {MATERIAL_ORDER}
                 ) AS rn,
                 COUNT(*) OVER (PARTITION BY mr.root_id) AS remaining,
                 (SELECT MAX(m3.last_opened_at)
@@ -979,11 +984,45 @@ pub fn chapter_detail(conn: &Connection, chapter_id: i64) -> AppResult<ChapterDe
     })
 }
 
+/// Ordering key for materials inside one folder — shared by every list the student reads as
+/// "the lessons, in order".
+///
+/// `sort_order` stays 0 until someone drags a lesson (see [`reorder_materials`]), so both cases
+/// have to live in one clause:
+///   · **untouched folder** — every row is 0, the first term is constant for all of them, and the
+///     order collapses to alphabetical, exactly as it was before manual ordering existed;
+///   · **arranged folder** — ranked rows (1..N) come first in the chosen order, and anything added
+///     afterwards (still 0) lands at the end instead of jumping to the top.
+pub const MATERIAL_ORDER: &str = "(m.sort_order = 0), m.sort_order, m.file_name";
+
+/// `sort_order` normalised for *comparison* rather than ordering: an unordered row (0) has to
+/// rank after every arranged one, which a bare `<` would get backwards.
+fn rank_of(alias: &str) -> String {
+    format!("CASE WHEN {alias}.sort_order = 0 THEN 2147483647 ELSE {alias}.sort_order END")
+}
+
+/// A scalar subquery giving the `sort_order` a newly-inserted material should take, so every
+/// INSERT path agrees on where an arriving lesson lands.
+///
+/// `node_param` is the SQL placeholder holding the destination node (e.g. `"?1"`); it is a
+/// caller-supplied literal, never user input.
+///
+/// In a folder the student has arranged, a new lesson goes at the **end** (`MAX + 1`) rather than
+/// wherever its filename sorts — appearing mid-list would look like the saved order broke. In an
+/// untouched folder every row is 0, so `EXISTS` is false and this stays 0, preserving the
+/// alphabetical default that [`MATERIAL_ORDER`] falls back to.
+pub(crate) fn next_sort_order(node_param: &str) -> String {
+    format!(
+        "(SELECT COALESCE(MAX(sort_order), 0) FROM materials WHERE node_id = {node_param})
+         + (SELECT EXISTS(SELECT 1 FROM materials WHERE node_id = {node_param} AND sort_order > 0))"
+    )
+}
+
 /// Materials of a chapter (active only), with watch progress.
 pub fn list_materials(conn: &Connection, chapter_id: i64) -> AppResult<Vec<MaterialRow>> {
     // Include `missing` rows (file no longer on disk) so the UI can show a ⚠️ badge
     // rather than silently dropping them (Section 3). Active rows sort first.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT
             m.id, m.file_name, m.file_type, m.file_extension, m.file_size_bytes,
             m.duration_secs, m.thumbnail_path,
@@ -992,8 +1031,8 @@ pub fn list_materials(conn: &Connection, chapter_id: i64) -> AppResult<Vec<Mater
          FROM materials m
          LEFT JOIN watch_progress wp ON wp.material_id = m.id
          WHERE m.node_id = ?1 AND m.status IN ('active', 'missing')
-         ORDER BY (m.status = 'missing'), m.sort_order, m.file_name",
-    )?;
+         ORDER BY (m.status = 'missing'), {MATERIAL_ORDER}"
+    ))?;
     let rows = stmt.query_map([chapter_id], |r| {
         Ok(MaterialRow {
             id: r.get(0)?,
@@ -1223,6 +1262,37 @@ pub fn node_ancestors(conn: &Connection, node_id: i64) -> AppResult<Vec<NodeCrum
 /// ordering) exposed under the tree-browser vocabulary.
 pub fn node_materials(conn: &Connection, node_id: i64) -> AppResult<Vec<MaterialRow>> {
     list_materials(conn, node_id)
+}
+
+/// Write a manual lesson order for one folder.
+///
+/// `material_ids` is the folder's full list in the order the student arranged it; each row gets
+/// its 1-based position in `sort_order`. Ranks start at 1 because **0 means "never ordered"**
+/// everywhere else in the schema — every material starts at the column default, and
+/// [`list_materials`] leans on that to fall back to alphabetical. Handing out 0 here would make
+/// an explicitly-placed first lesson indistinguishable from an unplaced one.
+///
+/// `AND node_id = ?` scopes every UPDATE to the folder being reordered, so an id from another
+/// folder (a stale list, a client bug) is silently skipped instead of renumbering a folder the
+/// student wasn't even looking at. One transaction, so a half-applied order can't be observed.
+pub fn reorder_materials(
+    conn: &mut Connection,
+    node_id: i64,
+    material_ids: &[i64],
+) -> AppResult<usize> {
+    let tx = conn.transaction()?;
+    let mut updated = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE materials SET sort_order = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND node_id = ?3",
+        )?;
+        for (index, material_id) in material_ids.iter().enumerate() {
+            updated += stmt.execute(rusqlite::params![index as i64 + 1, material_id, node_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(updated)
 }
 
 // ── Unified deletion (remove_node / remove_material) ──────────────────────────
@@ -1467,7 +1537,7 @@ pub fn course_lessons(conn: &Connection, subject_id: i64) -> AppResult<Vec<Cours
     // Walk the subject's subtree, tagging every descendant node with the "chapter" it
     // rolls up to = the direct child of `subject_id` that is its ancestor-or-self. A
     // material directly under the subject uses the subject itself as its chapter.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "WITH RECURSIVE tagged(id, chap_id, chap_name, chap_sort) AS (
              -- Seed: the subject's direct children are their own chapter.
              SELECT id, id, name, sort_order FROM nodes WHERE parent_id = ?1
@@ -1492,8 +1562,8 @@ pub fn course_lessons(conn: &Connection, subject_id: i64) -> AppResult<Vec<Cours
          JOIN chap_map cm ON cm.id = m.node_id
          LEFT JOIN watch_progress wp ON wp.material_id = m.id
          WHERE m.status IN ('active', 'missing')
-         ORDER BY cm.chap_sort, cm.chap_name, (m.status = 'missing'), m.sort_order, m.file_name",
-    )?;
+         ORDER BY cm.chap_sort, cm.chap_name, (m.status = 'missing'), {MATERIAL_ORDER}"
+    ))?;
     let rows = stmt.query_map([subject_id], |r| {
         Ok(CourseLesson {
             id: r.get(0)?,
@@ -1549,6 +1619,12 @@ pub fn recommended_materials(
     // "chapter" = the material's parent node, "subject" = its depth-1 ancestor, "goal" =
     // its root. `cur` captures those for the current material; candidates are ranked by
     // how closely they share that ancestry.
+    //
+    // Positions are compared through `rank_of` rather than raw `sort_order`: in a folder the
+    // student has arranged, an unordered row is 0, and `0 < cur.sort_order` would read as
+    // "earlier in the series" and drop the lesson from the suggestions entirely.
+    let m_rank = rank_of("m");
+    let cur_rank = rank_of("cur");
     let sql = format!(
         "WITH {MAT_ANC_CTE},
          cur AS (
@@ -1579,11 +1655,11 @@ pub fn recommended_materials(
            AND m.id <> cur.mid
            AND a.goal_id = cur.goal_id
            AND m.is_completed = 0
-           AND NOT (a.chapter_id = cur.chapter_id AND m.sort_order < cur.sort_order)
+           AND NOT (a.chapter_id = cur.chapter_id AND {m_rank} < {cur_rank})
          ORDER BY rank_bucket,
-                  CASE WHEN a.chapter_id = cur.chapter_id THEN m.sort_order ELSE 0 END,
+                  CASE WHEN a.chapter_id = cur.chapter_id THEN {m_rank} ELSE 0 END,
                   m.last_opened_at IS NOT NULL,
-                  m.sort_order, m.file_name
+                  {MATERIAL_ORDER}
          LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -3188,6 +3264,135 @@ mod tests {
             extension: "mp4".to_string(),
             size_bytes: size,
         }
+    }
+
+    // ── Manual lesson order (reorder_materials) ───────────────────────────────
+    //
+    // The contract these lock down: `sort_order = 0` means "never arranged", so an untouched
+    // folder must stay alphabetical, an arranged one must hold its order, and rows arriving
+    // afterwards must land at the end rather than in the middle of the student's arrangement.
+
+    /// Insert n videos and return their ids in insertion order.
+    fn seed_materials(conn: &Connection, node_id: i64, names: &[&str]) -> Vec<i64> {
+        names
+            .iter()
+            .map(|name| {
+                insert_material(conn, node_id, &file(&format!("/lib/{name}"), name, 10)).unwrap();
+                conn.query_row(
+                    "SELECT id FROM materials WHERE file_path = ?1",
+                    [format!("/lib/{name}")],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn listed_names(conn: &Connection, node_id: i64) -> Vec<String> {
+        list_materials(conn, node_id)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.file_name)
+            .collect()
+    }
+
+    /// A folder nobody has dragged stays alphabetical — every row is still `sort_order = 0`,
+    /// so the manual-order clause has to collapse to the name comparison it replaced.
+    #[test]
+    fn an_unarranged_folder_still_lists_alphabetically() {
+        let conn = test_conn();
+        let node = upsert_root_node(&conn, "Course").unwrap();
+        seed_materials(&conn, node, &["c.mp4", "a.mp4", "b.mp4"]);
+        assert_eq!(listed_names(&conn, node), ["a.mp4", "b.mp4", "c.mp4"]);
+    }
+
+    /// After a drag, the saved order wins over the alphabet.
+    #[test]
+    fn an_arranged_folder_lists_in_the_saved_order() {
+        let mut conn = test_conn();
+        let node = upsert_root_node(&conn, "Course").unwrap();
+        let ids = seed_materials(&conn, node, &["a.mp4", "b.mp4", "c.mp4"]);
+
+        // Drag c to the front: c, a, b.
+        let moved = reorder_materials(&mut conn, node, &[ids[2], ids[0], ids[1]]).unwrap();
+        assert_eq!(moved, 3);
+        assert_eq!(listed_names(&conn, node), ["c.mp4", "a.mp4", "b.mp4"]);
+    }
+
+    /// Ranks are 1-based. A 0 would be indistinguishable from "never arranged", which would
+    /// quietly send the first lesson back to alphabetical position on the next insert.
+    #[test]
+    fn ranks_start_at_one_so_first_place_is_not_mistaken_for_unarranged() {
+        let mut conn = test_conn();
+        let node = upsert_root_node(&conn, "Course").unwrap();
+        let ids = seed_materials(&conn, node, &["a.mp4", "b.mp4"]);
+        reorder_materials(&mut conn, node, &ids).unwrap();
+
+        let lowest: i64 = conn
+            .query_row(
+                "SELECT MIN(sort_order) FROM materials WHERE node_id = ?1",
+                [node],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lowest, 1, "the first arranged lesson must not be rank 0");
+    }
+
+    /// A lesson added after the student arranged the folder goes to the END, even when its
+    /// name sorts first. Landing mid-list would read as the saved order having broken.
+    #[test]
+    fn a_new_lesson_lands_at_the_end_of_an_arranged_folder() {
+        let mut conn = test_conn();
+        let node = upsert_root_node(&conn, "Course").unwrap();
+        let ids = seed_materials(&conn, node, &["b.mp4", "c.mp4"]);
+        reorder_materials(&mut conn, node, &[ids[1], ids[0]]).unwrap(); // c, b
+
+        seed_materials(&conn, node, &["a.mp4"]);
+        assert_eq!(
+            listed_names(&conn, node),
+            ["c.mp4", "b.mp4", "a.mp4"],
+            "an alphabetically-first arrival must not jump the arranged order"
+        );
+    }
+
+    /// The same insert into an UNTOUCHED folder must not silently start arranging it — the
+    /// row stays at 0 and the folder keeps listing alphabetically.
+    #[test]
+    fn a_new_lesson_in_an_unarranged_folder_keeps_it_alphabetical() {
+        let conn = test_conn();
+        let node = upsert_root_node(&conn, "Course").unwrap();
+        seed_materials(&conn, node, &["b.mp4", "c.mp4"]);
+        seed_materials(&conn, node, &["a.mp4"]);
+
+        let arranged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM materials WHERE node_id = ?1 AND sort_order > 0",
+                [node],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(arranged, 0, "an untouched folder must stay untouched");
+        assert_eq!(listed_names(&conn, node), ["a.mp4", "b.mp4", "c.mp4"]);
+    }
+
+    /// Reordering is scoped to one folder. An id from somewhere else is skipped rather than
+    /// renumbering a folder the student isn't looking at — the guard against a stale list.
+    #[test]
+    fn reordering_ignores_ids_from_another_folder() {
+        let mut conn = test_conn();
+        let a = upsert_root_node(&conn, "A").unwrap();
+        let b = upsert_root_node(&conn, "B").unwrap();
+        let in_a = seed_materials(&conn, a, &["a1.mp4"]);
+        let in_b = seed_materials(&conn, b, &["b1.mp4"]);
+
+        // Ask folder A to order one of its own rows plus one of B's.
+        let moved = reorder_materials(&mut conn, a, &[in_a[0], in_b[0]]).unwrap();
+        assert_eq!(moved, 1, "only the row that actually lives in A moves");
+
+        let b_order: i64 = conn
+            .query_row("SELECT sort_order FROM materials WHERE id = ?1", [in_b[0]], |r| r.get(0))
+            .unwrap();
+        assert_eq!(b_order, 0, "the other folder's row is untouched");
     }
 
     /// A filesystem rescan must NEVER touch a plugin-sourced material (v11).

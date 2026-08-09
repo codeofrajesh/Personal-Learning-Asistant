@@ -37,6 +37,13 @@ pub enum LinkTarget {
 pub struct MessageLink {
     pub target: LinkTarget,
     pub message_id: i32,
+    /// The forum topic this message lives in, when the link says so.
+    ///
+    /// Irrelevant for a single import — `get_messages_by_id` addresses a message by its id
+    /// alone, whatever topic it sits in. It matters for **range import**: a forum's message ids
+    /// interleave across every topic, so sweeping a range without this would pull in other
+    /// topics' posts. `None` means "not a forum link", not "the General topic" (which is `1`).
+    pub topic_id: Option<i32>,
 }
 
 /// Parse a `t.me` / `telegram.me` / `tg://` message link.
@@ -46,18 +53,23 @@ pub struct MessageLink {
 ///   · `https://t.me/c/1234567890/7/42`      — forum topic: 7 is the TOPIC, 42 the message
 ///   · `https://t.me/somechannel/42`         — public channel by username
 ///   · `t.me/somechannel/42`                 — scheme optional (people paste it this way)
-///   · `https://t.me/c/1234567890/42?single` — query/fragment ignored
+///   · `https://t.me/c/1234567890/42?single` — query ignored except `thread`
+///   · `https://t.me/c/1234567890/42?thread=7` — forum topic in the query instead of the path
 ///   · `tg://privatepost?channel=123&post=42`— the in-app "copy link" shape
+///   · `tg://resolve?domain=durov&post=42`   — the in-app shape for a PUBLIC channel
 pub fn parse_message_link(input: &str) -> AppResult<MessageLink> {
     let raw = input.trim();
     if raw.is_empty() {
         return Err(AppError::Invalid("Paste a Telegram message link.".into()));
     }
 
-    // `tg://privatepost?channel=<bare>&post=<id>` — what Telegram Desktop copies for a
-    // private channel. Handled first because it isn't path-shaped at all.
+    // `tg://` shapes are handled first because they aren't path-shaped at all — everything
+    // they carry lives in the query string.
     if let Some(rest) = raw.strip_prefix("tg://privatepost") {
         return parse_tg_privatepost(rest);
+    }
+    if let Some(rest) = raw.strip_prefix("tg://resolve") {
+        return parse_tg_resolve(rest);
     }
 
     // Strip scheme, then host. Splitting on `/` rather than using a URL crate keeps this
@@ -76,13 +88,16 @@ pub fn parse_message_link(input: &str) -> AppResult<MessageLink> {
         return Err(AppError::Invalid(not_a_link()));
     }
 
-    // Drop `?query` and `#fragment` — `?single`, `?comment=…` and `?t=` are all common on
-    // copied links and none of them change which message is addressed.
-    let path = path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('/');
+    // Split the path from `?query` / `#fragment`. The query is NOT simply discarded: Telegram
+    // documents `?thread=<id>` as the query-string spelling of a forum topic, so it has to be
+    // read before the path segments are matched. Everything else in there (`single`,
+    // `comment=`, `t=`) genuinely doesn't change which message is addressed.
+    let (path, query) = split_query(path);
+    let thread_from_query = query_param(query, "thread")
+        .map(parse_topic_id)
+        .transpose()?;
+
+    let path = path.trim_end_matches('/');
 
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -103,24 +118,39 @@ pub fn parse_message_link(input: &str) -> AppResult<MessageLink> {
                 channel_id: parse_channel_id(channel)?,
             },
             message_id: parse_message_id(message)?,
+            topic_id: thread_from_query,
         }),
         // Forum topic: /c/<bare_channel_id>/<topic_id>/<message_id>.
         // The LAST segment is the message; the middle one is the topic root. Reading the
         // middle segment as the message id (the intuitive-but-wrong reading) would import the
-        // topic's first post instead of the lesson the student linked.
-        ["c", channel, _topic, message] => Ok(MessageLink {
+        // topic's first post instead of the lesson the student linked. The topic is KEPT —
+        // range import needs it to avoid sweeping every other topic in the forum.
+        ["c", channel, topic, message] => Ok(MessageLink {
             target: LinkTarget::PrivateChannel {
                 channel_id: parse_channel_id(channel)?,
             },
             message_id: parse_message_id(message)?,
+            // An explicit `?thread=` wins over the path segment: the two agree in every link
+            // Telegram itself generates, and if they ever disagree the query is the more
+            // specific statement.
+            topic_id: thread_from_query.or(Some(parse_topic_id(topic)?)),
         }),
         // Public: /<username>/<message_id>, and its forum variant /<username>/<topic>/<msg>.
         // Same rule as the private case — the LAST segment is the message.
-        [username, message] | [username, _, message] => {
+        [username, message] => {
             let username = validate_username(username)?;
             Ok(MessageLink {
                 target: LinkTarget::Username { username },
                 message_id: parse_message_id(message)?,
+                topic_id: thread_from_query,
+            })
+        }
+        [username, topic, message] => {
+            let username = validate_username(username)?;
+            Ok(MessageLink {
+                target: LinkTarget::Username { username },
+                message_id: parse_message_id(message)?,
+                topic_id: thread_from_query.or(Some(parse_topic_id(topic)?)),
             })
         }
         // A bare channel link with no message ("t.me/foo") is valid as a *channel* link but
@@ -132,25 +162,91 @@ pub fn parse_message_link(input: &str) -> AppResult<MessageLink> {
     }
 }
 
+/// Split a path from its query string, dropping any `#fragment`.
+///
+/// Returns `(path, query)` where `query` is `""` when there isn't one. The fragment is cut from
+/// both halves — `#anchor` is a client-side scroll target and never carries link data.
+fn split_query(path: &str) -> (&str, &str) {
+    let no_fragment = path.split('#').next().unwrap_or("");
+    match no_fragment.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (no_fragment, ""),
+    }
+}
+
+/// Look up one `key=value` pair in a query string.
+///
+/// Tolerates the valueless flags Telegram sprinkles on copied links (`?single`,
+/// `?single&thread=7`) — a bare `single` simply doesn't match any key. Comparison is
+/// case-sensitive because Telegram's own parameter names are all lowercase.
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+/// `tg://privatepost?channel=<bare>&post=<id>[&thread=<topic>]` — what Telegram Desktop copies
+/// for a message in a **private** channel.
 fn parse_tg_privatepost(rest: &str) -> AppResult<MessageLink> {
     let query = rest.trim_start_matches('?');
-    let mut channel = None;
-    let mut post = None;
-    for pair in query.split('&') {
-        match pair.split_once('=') {
-            Some(("channel", v)) => channel = Some(v),
-            Some(("post", v)) => post = Some(v),
-            _ => {}
-        }
-    }
-    let channel = channel.ok_or_else(|| AppError::Invalid(not_a_link()))?;
-    let post = post.ok_or_else(|| AppError::Invalid(not_a_link()))?;
+    let channel = query_param(query, "channel").ok_or_else(|| AppError::Invalid(not_a_link()))?;
+    let post = query_param(query, "post").ok_or_else(|| AppError::Invalid(not_a_link()))?;
     Ok(MessageLink {
         target: LinkTarget::PrivateChannel {
             channel_id: parse_channel_id(channel)?,
         },
         message_id: parse_message_id(post)?,
+        topic_id: tg_thread(query)?,
     })
+}
+
+/// `tg://resolve?domain=<username>&post=<id>[&thread=<topic>]` — the same in-app shape for a
+/// **public** channel.
+///
+/// Telegram Desktop hands this out for public channels exactly as it hands out
+/// `tg://privatepost` for private ones, so failing to recognize it rejected a link the user
+/// copied straight from the official client.
+fn parse_tg_resolve(rest: &str) -> AppResult<MessageLink> {
+    let query = rest.trim_start_matches('?');
+    let domain = query_param(query, "domain").ok_or_else(|| AppError::Invalid(not_a_link()))?;
+    let username = validate_username(domain)?;
+
+    // A `tg://resolve` with no `post` names a channel, not a message — the same situation as a
+    // bare `t.me/<username>`, and it gets the same guidance.
+    let post = query_param(query, "post").ok_or_else(|| {
+        AppError::Invalid(
+            "That link points at a channel, not a specific message. Open the message in Telegram and copy its link."
+                .into(),
+        )
+    })?;
+
+    Ok(MessageLink {
+        target: LinkTarget::Username { username },
+        message_id: parse_message_id(post)?,
+        topic_id: tg_thread(query)?,
+    })
+}
+
+/// The `thread=<topic>` parameter shared by both `tg://` shapes.
+fn tg_thread(query: &str) -> AppResult<Option<i32>> {
+    query_param(query, "thread").map(parse_topic_id).transpose()
+}
+
+/// Parse a forum topic id.
+///
+/// A topic id is the id of the topic's root message, so it obeys the same rule as any message
+/// id: ids start at 1, and `1` specifically is the forum's "General" topic.
+fn parse_topic_id(raw: &str) -> AppResult<i32> {
+    let id: i32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| AppError::Invalid(format!("\"{raw}\" isn't a valid topic id.")))?;
+    if id <= 0 {
+        return Err(AppError::Invalid("Topic ids start at 1.".into()));
+    }
+    Ok(id)
 }
 
 /// Parse the channel id from a `/c/` link, normalizing a `-100` prefix if one is present.
@@ -292,15 +388,22 @@ pub fn parse_channel_link(input: &str) -> AppResult<LinkTarget> {
     let no_scheme = no_scheme.strip_prefix("www.").unwrap_or(no_scheme);
     if let Some((host, path)) = no_scheme.split_once('/') {
         if matches!(host, "t.me" | "telegram.me" | "telegram.dog") {
-            let path = path
-                .split(['?', '#'])
-                .next()
-                .unwrap_or("")
-                .trim_end_matches('/');
+            let (path, _) = split_query(path);
+            let path = path.trim_end_matches('/');
             let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             if let Some(hash) = invite_hash(&segments) {
                 return Ok(LinkTarget::Invite { hash });
             }
+        }
+    }
+
+    // `tg://resolve?domain=<username>` with no `post` names a whole channel, which is exactly
+    // what this function is for (the message parser rejects it for lacking a message id).
+    if let Some(rest) = raw.strip_prefix("tg://resolve") {
+        if let Some(domain) = query_param(rest.trim_start_matches('?'), "domain") {
+            return Ok(LinkTarget::Username {
+                username: validate_username(domain)?,
+            });
         }
     }
 
@@ -311,8 +414,11 @@ pub fn parse_channel_link(input: &str) -> AppResult<LinkTarget> {
     }
 
     // Channel-only links (`t.me/c/<id>`, `t.me/<username>`): append a dummy message id so the
-    // same parser can validate the channel half, then discard it.
-    if let Ok(link) = parse_message_link(&format!("{}/1", raw.trim_end_matches('/'))) {
+    // same parser can validate the channel half, then discard it. The query string is dropped
+    // first — appending after it (`t.me/foo?x=1/1`) would put the dummy id inside the query,
+    // where the parser can't see it.
+    let (bare, _) = split_query(raw);
+    if let Ok(link) = parse_message_link(&format!("{}/1", bare.trim_end_matches('/'))) {
         return Ok(link.target);
     }
 
@@ -340,6 +446,16 @@ mod tests {
         MessageLink {
             target: LinkTarget::PrivateChannel { channel_id },
             message_id,
+            topic_id: None,
+        }
+    }
+
+    /// The same, in a forum topic.
+    fn private_topic(channel_id: i64, message_id: i32, topic_id: i32) -> MessageLink {
+        MessageLink {
+            target: LinkTarget::PrivateChannel { channel_id },
+            message_id,
+            topic_id: Some(topic_id),
         }
     }
 
@@ -379,11 +495,76 @@ mod tests {
     #[test]
     fn forum_topic_link_uses_the_last_segment_as_the_message() {
         // `/c/<chan>/<topic>/<msg>`: reading the middle segment would import the topic's first
-        // post instead of the linked lesson.
+        // post instead of the linked lesson. The topic is kept, not discarded — range import
+        // needs it to stay inside one topic.
         assert_eq!(
             parse_message_link("https://t.me/c/1234567890/7/42").unwrap(),
-            private(1234567890, 42)
+            private_topic(1234567890, 42, 7)
         );
+    }
+
+    #[test]
+    fn captures_the_topic_from_the_thread_query_parameter() {
+        // Telegram documents `?thread=<id>` as the query spelling of a forum topic. It used to
+        // be stripped along with `?single`, which silently turned a topic link into a
+        // whole-channel one for range import.
+        assert_eq!(
+            parse_message_link("https://t.me/c/1234567890/42?thread=7").unwrap(),
+            private_topic(1234567890, 42, 7)
+        );
+        // Combined with the valueless flags Telegram also emits.
+        assert_eq!(
+            parse_message_link("https://t.me/c/1234567890/42?single&thread=7").unwrap(),
+            private_topic(1234567890, 42, 7)
+        );
+        // Public form.
+        assert_eq!(
+            parse_message_link("https://t.me/durov/42?thread=7").unwrap(),
+            MessageLink {
+                target: LinkTarget::Username {
+                    username: "durov".into()
+                },
+                message_id: 42,
+                topic_id: Some(7),
+            }
+        );
+    }
+
+    #[test]
+    fn public_forum_topic_link_keeps_both_the_topic_and_the_message() {
+        // `t.me/<username>/<topic>/<msg>` — the public twin of the `/c/` forum shape.
+        assert_eq!(
+            parse_message_link("https://t.me/mychannel/7/42").unwrap(),
+            MessageLink {
+                target: LinkTarget::Username {
+                    username: "mychannel".into()
+                },
+                message_id: 42,
+                topic_id: Some(7),
+            }
+        );
+    }
+
+    #[test]
+    fn the_general_topic_is_a_real_topic_not_an_absent_one() {
+        // Forums put "General" at topic id 1. `Some(1)` and `None` mean different things to
+        // range import: the first scopes to General, the second sweeps the whole chat.
+        assert_eq!(
+            parse_message_link("https://t.me/c/1234567890/1/42").unwrap(),
+            private_topic(1234567890, 42, 1)
+        );
+        assert_eq!(
+            parse_message_link("https://t.me/c/1234567890/42").unwrap().topic_id,
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_topic_ids() {
+        assert!(parse_message_link("https://t.me/c/123/abc/42").is_err());
+        assert!(parse_message_link("https://t.me/c/123/0/42").is_err());
+        assert!(parse_message_link("https://t.me/c/123/42?thread=0").is_err());
+        assert!(parse_message_link("https://t.me/c/123/42?thread=abc").is_err());
     }
 
     #[test]
@@ -412,6 +593,7 @@ mod tests {
                     username: "durov".to_string()
                 },
                 message_id: 42,
+                topic_id: None,
             }
         );
     }
@@ -421,6 +603,57 @@ mod tests {
         assert_eq!(
             parse_message_link("tg://privatepost?channel=1234567890&post=42").unwrap(),
             private(1234567890, 42)
+        );
+        // With a topic.
+        assert_eq!(
+            parse_message_link("tg://privatepost?channel=1234567890&post=42&thread=7").unwrap(),
+            private_topic(1234567890, 42, 7)
+        );
+    }
+
+    #[test]
+    fn parses_tg_resolve_scheme() {
+        // What Telegram Desktop copies for a message in a PUBLIC channel. Previously rejected
+        // outright, so a link straight from the official client looked invalid.
+        assert_eq!(
+            parse_message_link("tg://resolve?domain=durov&post=42").unwrap(),
+            MessageLink {
+                target: LinkTarget::Username {
+                    username: "durov".into()
+                },
+                message_id: 42,
+                topic_id: None,
+            }
+        );
+        assert_eq!(
+            parse_message_link("tg://resolve?domain=mychannel&post=42&thread=7").unwrap(),
+            MessageLink {
+                target: LinkTarget::Username {
+                    username: "mychannel".into()
+                },
+                message_id: 42,
+                topic_id: Some(7),
+            }
+        );
+        // Parameter order is not guaranteed.
+        assert_eq!(
+            parse_message_link("tg://resolve?post=42&domain=durov").unwrap().message_id,
+            42
+        );
+    }
+
+    #[test]
+    fn tg_resolve_without_a_post_is_a_channel_not_a_message() {
+        let err = parse_message_link("tg://resolve?domain=durov")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a specific message"), "{err}");
+        // …and it IS a valid channel reference.
+        assert_eq!(
+            parse_channel_link("tg://resolve?domain=durov").unwrap(),
+            LinkTarget::Username {
+                username: "durov".into()
+            }
         );
     }
 

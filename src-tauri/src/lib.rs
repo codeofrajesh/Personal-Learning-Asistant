@@ -99,6 +99,7 @@ pub fn run() {
             commands::nodes::node_children,
             commands::nodes::node_ancestors,
             commands::nodes::node_materials,
+            commands::nodes::reorder_materials,
             commands::nodes::pinned_nodes,
             commands::nodes::nodes_in_progress,
             commands::nodes::recent_nodes,
@@ -184,6 +185,7 @@ pub fn run() {
             // Telegram import (Phase 4)
             plugins::telegram::import::tg_import_link,
             plugins::telegram::import::tg_import_batch,
+            plugins::telegram::import::tg_scan_range,
             plugins::telegram::import::tg_channel_media,
             plugins::telegram::import::tg_import_history,
             // Telegram streaming (Phase 5)

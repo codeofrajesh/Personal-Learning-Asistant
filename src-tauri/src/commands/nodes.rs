@@ -106,6 +106,24 @@ pub fn node_materials(db: State<'_, Db>, node_id: i64) -> AppResult<Vec<Material
     db.with(|conn| queries::node_materials(conn, node_id))
 }
 
+/// Save the manual lesson order for one folder.
+///
+/// `material_ids` is the folder's full list in its new order. Returns how many rows actually
+/// moved, which is how the caller learns that a stale list was partly ignored (ids belonging to
+/// another folder are skipped rather than trusted).
+///
+/// No `library://changed` is emitted: the drag already showed the new order, and the event
+/// triggers a refetch on every open page — which would yank the list out from under the hand
+/// that just dropped an item.
+#[tauri::command]
+pub fn reorder_materials(
+    db: State<'_, Db>,
+    node_id: i64,
+    material_ids: Vec<i64>,
+) -> AppResult<usize> {
+    db.with_mut(|conn| queries::reorder_materials(conn, node_id, &material_ids))
+}
+
 /// Nodes the user has pinned to the Courses hub ("Pinned" section + Explore Pinned).
 #[tauri::command]
 pub fn pinned_nodes(db: State<'_, Db>) -> AppResult<Vec<NodeCard>> {

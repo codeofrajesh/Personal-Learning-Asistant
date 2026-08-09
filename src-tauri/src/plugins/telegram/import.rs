@@ -23,11 +23,12 @@ use tauri::{AppHandle, State};
 use crate::db::Db;
 use crate::plugins::telegram::auth::map_invocation;
 use crate::plugins::telegram::link::{
-    parse_channel_link, parse_message_link, synthetic_path, LinkTarget,
+    parse_channel_link, parse_message_link, synthetic_path, LinkTarget, MessageLink,
 };
 use crate::plugins::telegram::session::{FileSession, TgState};
 use crate::utils::errors::{AppError, AppResult};
 use rusqlite::Connection;
+use tauri::Emitter;
 
 /// One importable media message.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -325,11 +326,18 @@ fn upsert_material(
         return Ok((id, false));
     }
 
-    conn.execute(
+    // A lesson imported into a folder the student has already arranged belongs at the END of it,
+    // not wherever its filename happens to fall. `next_sort_order` is shared with the disk
+    // scanner so both kinds of arrival land in the same place.
+    let sql = format!(
         "INSERT INTO materials(
              node_id, file_path, file_name, file_type, file_extension,
-             file_size_bytes, duration_secs, source, tg_chat_id, tg_message_id
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'telegram', ?8, ?9)",
+             file_size_bytes, duration_secs, source, tg_chat_id, tg_message_id, sort_order
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'telegram', ?8, ?9, {})",
+        crate::db::queries::next_sort_order("?1")
+    );
+    conn.execute(
+        &sql,
         rusqlite::params![
             node_id,
             path,
@@ -375,8 +383,8 @@ fn unreachable_peer_or(e: InvocationError) -> AppError {
 /// must already be a member — which is exactly the case we're serving.
 ///
 /// Bounded at ~200 dialogs: enough to cover any realistic account, and a hard stop so a
-/// pathological list can't spin here. Best-effort by contract; the caller reports the failure.
-async fn prime_peer_cache(client: &Client) {
+/// pathological list can't spin here.
+async fn prime_peer_cache(client: &Client) -> AppResult<()> {
     log::info!("telegram: peer cache miss, priming via iter_dialogs");
     let mut dialogs = client.iter_dialogs();
     for _ in 0..200 {
@@ -385,10 +393,11 @@ async fn prime_peer_cache(client: &Client) {
             Ok(None) => break,
             Err(e) => {
                 log::warn!("telegram: dialog priming stopped early: {e}");
-                break;
+                return Err(map_invocation(e));
             }
         }
     }
+    Ok(())
 }
 
 /// Resolve a bare channel id into a `PeerRef` carrying a REAL `access_hash`.
@@ -419,7 +428,19 @@ pub async fn resolve_peer_ref(
         return Ok(cached);
     }
 
-    prime_peer_cache(client).await;
+    // Try to prime the cache. If the computer just woke from sleep, the TCP socket might be
+    // half-open and the first network call will fail with an IO error (which also drops the
+    // dead socket in grammers). A single retry here seamlessly builds a fresh connection.
+    for attempt in 1..=2 {
+        match prime_peer_cache(client).await {
+            Ok(_) => break,
+            Err(e) if attempt == 1 => {
+                log::warn!("telegram: peer cache prime failed on attempt 1 ({e}), retrying to rebuild connection...");
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     if let Ok(Some(cached)) = session.peer_ref(peer.id).await {
         return Ok(cached);
@@ -544,20 +565,7 @@ pub async fn tg_import_batch(
     let client = state.ensure_client(&app, &db).await?;
 
     // Validate the destination first.
-    let node_exists: bool = db.with(|conn| {
-        Ok(conn
-            .query_row(
-                "SELECT 1 FROM nodes WHERE id = ?1",
-                [node_id],
-                |_| Ok(()),
-            )
-            .is_ok())
-    })?;
-    if !node_exists {
-        return Err(AppError::NotFound(
-            "That destination folder no longer exists.".into(),
-        ));
-    }
+    ensure_node_exists(&db, node_id)?;
 
     let peer = resolve_target(&client, &link).await?;
     let session = state.get_session().await.ok_or_else(|| {
@@ -568,25 +576,10 @@ pub async fn tg_import_batch(
         AppError::Invalid("That link doesn't point at a channel.".into())
     })?;
 
-    let mut all_fetched_messages = Vec::new();
-
-    // Fetch messages in chunks of 100 to avoid limits or payload size bounds.
-    for chunk in message_ids.chunks(100) {
-        let messages = client
-            .get_messages_by_id(peer_ref.clone(), chunk)
-            .await
-            .map_err(unreachable_peer_or)?;
-        
-        all_fetched_messages.extend(messages.into_iter().flatten());
-    }
-
-    // Prepare items to be imported.
-    let mut importable_items = Vec::new();
-    for message in all_fetched_messages {
-        if let Some(item) = media_item(&message, chat_id, false) {
-            importable_items.push(item);
-        }
-    }
+    // Fetch in chunks of 100 and keep only what carries importable media. Ids are addressed
+    // exactly, so no topic filter applies — the caller already picked these messages.
+    let importable_items =
+        fetch_media_items(&client, peer_ref, chat_id, &message_ids, None).await?;
 
     if importable_items.is_empty() {
         return Err(AppError::Invalid(
@@ -594,33 +587,594 @@ pub async fn tg_import_batch(
         ));
     }
 
-    // Execute bulk upsert in a single database transaction.
-    let results: AppResult<Vec<TgImportResult>> = db.with_mut(move |conn| {
-        let tx = conn.transaction()?;
-        let mut batch_results = Vec::with_capacity(importable_items.len());
+    // One transaction for the whole batch.
+    upsert_items(&db, node_id, &importable_items)
+}
 
-        for item in &importable_items {
+/// Progress ticks emitted while a range scan runs (`tg://import-progress`).
+///
+/// A sweep can take a while — finding 80 lessons means walking the history that holds them — so
+/// the UI needs to show forward motion rather than a spinner that might be stuck.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TgRangeProgress {
+    /// `discovering` while walking history, `fetching` while pulling metadata, then `done`.
+    pub stage: String,
+    /// Media items confirmed so far.
+    pub found: usize,
+    /// Messages looked at so far (always ≥ `found`).
+    pub scanned: usize,
+    /// The target count when one was given, else 0 (a start/end range has no known total).
+    pub target: usize,
+    pub done: bool,
+}
+
+pub const IMPORT_PROGRESS_EVENT: &str = "tg://import-progress";
+
+/// What a range **scan** found.
+///
+/// A scan writes nothing. It reports what the range contains so the student can look over the
+/// list and pick, which is the review step "Browse channel" always had and a range import used
+/// to skip. Committing the chosen rows is `tg_import_batch`'s job, so exactly one code path
+/// writes material rows.
+#[derive(Debug, serde::Serialize)]
+pub struct TgRangeScanResult {
+    pub items: Vec<TgMediaItem>,
+    /// Messages inspected to find those items.
+    pub scanned: usize,
+    /// True when the sweep stopped on a safety cap rather than reaching the end of the range.
+    pub truncated: bool,
+}
+
+/// Hard caps. A range import is the one place a student can ask for thousands of round trips by
+/// accident (a typo in an id turns "next 20" into "next 20000"), so both strategies are bounded.
+const MAX_RANGE_IDS: usize = 2000;
+const MAX_SCAN: usize = 5000;
+const MAX_COUNT: u32 = 500;
+
+/// Fail early when the destination folder is gone, before spending any network round trip.
+fn ensure_node_exists(db: &Db, node_id: i64) -> AppResult<()> {
+    let exists: bool = db.with(|conn| {
+        Ok(conn
+            .query_row("SELECT 1 FROM nodes WHERE id = ?1", [node_id], |_| Ok(()))
+            .is_ok())
+    })?;
+    if !exists {
+        return Err(AppError::NotFound(
+            "That destination folder no longer exists.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Upsert a batch of media items into `node_id` in ONE transaction.
+///
+/// Shared by batch and range import so both get the same atomicity: either every lesson in the
+/// sweep lands or none does, and a mid-sweep failure can't leave a half-imported course.
+fn upsert_items(db: &Db, node_id: i64, items: &[TgMediaItem]) -> AppResult<Vec<TgImportResult>> {
+    db.with_mut(|conn| {
+        let tx = conn.transaction()?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
             let (material_id, created) = upsert_material(&tx, node_id, item)?;
-            
             let file_name: String = tx.query_row(
                 "SELECT file_name FROM materials WHERE id = ?1",
                 [material_id],
                 |r| r.get(0),
             )?;
-
-            batch_results.push(TgImportResult {
+            out.push(TgImportResult {
                 material_id,
                 file_name,
                 created,
                 node_id,
             });
         }
-        
         tx.commit()?;
-        Ok(batch_results)
-    });
+        Ok(out)
+    })
+}
 
-    results
+/// Flag the items already sitting in the library.
+///
+/// One query for the whole batch rather than a lookup per item — a per-row check would take the
+/// DB mutex once per lesson on the UI's hot path. Shared by the browse and range listings so
+/// "In library" means the same thing in both.
+fn mark_already_imported(db: &Db, chat_id: i64, items: &mut [TgMediaItem]) -> AppResult<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let imported = db.with(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT tg_message_id FROM materials WHERE tg_chat_id = ?1 AND tg_message_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([chat_id], |r| r.get::<_, i32>(0))?;
+        let mut set = std::collections::HashSet::new();
+        for row in rows {
+            set.insert(row?);
+        }
+        Ok(set)
+    })?;
+    for item in items {
+        item.already_imported = imported.contains(&item.message_id);
+    }
+    Ok(())
+}
+
+/// Fetch a set of message ids and keep the ones carrying importable media.
+///
+/// Chunked at 100 — `channels.getMessages` caps the id list, and this is the same chunk size
+/// `tg_import_batch` already uses. `flatten()` drops the `None`s Telegram returns for deleted
+/// messages, which is what makes a range tolerant of gaps.
+async fn fetch_media_items(
+    client: &Client,
+    peer_ref: PeerRef,
+    chat_id: i64,
+    ids: &[i32],
+    topic_filter: Option<i32>,
+) -> AppResult<Vec<TgMediaItem>> {
+    let mut items = Vec::new();
+    for chunk in ids.chunks(100) {
+        let messages = client
+            .get_messages_by_id(peer_ref, chunk)
+            .await
+            .map_err(unreachable_peer_or)?;
+        for message in messages.into_iter().flatten() {
+            // A forum's ids interleave across topics, so an id RANGE inside one topic
+            // necessarily spans other topics' messages. Fetching by exact id says nothing
+            // about which topic a message belongs to — this is the filter that keeps a
+            // "next 50 in this topic" import from dragging in unrelated posts.
+            if let Some(topic) = topic_filter {
+                if !message_in_topic(&message.raw, topic) {
+                    continue;
+                }
+            }
+            if let Some(item) = media_item(&message, chat_id, false) {
+                items.push(item);
+            }
+        }
+    }
+    Ok(items)
+}
+
+/// Which forum topic a raw message belongs to, if it is in one.
+///
+/// Telegram encodes this in the reply header rather than a dedicated field:
+///   · a post made directly in topic T carries `reply_to_msg_id = T`,
+///   · a reply to another message inside T carries `reply_to_top_id = T`,
+///   · both are flagged `forum_topic`.
+/// So the topic is `reply_to_top_id` first, `reply_to_msg_id` second. Messages in a forum's
+/// **General** topic carry no reply header at all, which is why `None` is reported rather than
+/// guessed — `message_in_topic` maps that to General (id 1).
+fn raw_topic_id(raw: &tl::enums::Message) -> Option<i32> {
+    let reply = match raw {
+        tl::enums::Message::Message(m) => m.reply_to.as_ref()?,
+        tl::enums::Message::Service(m) => m.reply_to.as_ref()?,
+        tl::enums::Message::Empty(_) => return None,
+    };
+    match reply {
+        tl::enums::MessageReplyHeader::Header(h) if h.forum_topic => {
+            h.reply_to_top_id.or(h.reply_to_msg_id)
+        }
+        _ => None,
+    }
+}
+
+/// Does this raw message live in `topic`?
+///
+/// The General topic (id 1) is the special case: its messages have no reply header, so an
+/// absent topic means General rather than "unknown".
+fn message_in_topic(raw: &tl::enums::Message, topic: i32) -> bool {
+    match raw_topic_id(raw) {
+        Some(found) => found == topic,
+        None => topic == GENERAL_TOPIC_ID,
+    }
+}
+
+/// A forum's "General" topic is always the chat's first message id.
+const GENERAL_TOPIC_ID: i32 = 1;
+
+/// Scan a run of messages starting at `start_url` and report the media it contains.
+///
+/// **Nothing is written.** The result feeds the same selection list "Browse channel" uses, and
+/// the rows the student ticks are committed through `tg_import_batch`. Keeping the sweep and
+/// the write apart means a mistyped range costs a scan, not an import that has to be undone.
+///
+/// Two ways to say where to stop, mirroring how people actually describe the job:
+///   · **to a link** — paste the first and last lesson (`end_url`), and every media message
+///     between them is swept. Boundaries are known, so the ids are addressed directly.
+///   · **by count** — "the next 50 lessons" (`count`), where the end is unknown and history has
+///     to be walked until that many media items turn up.
+///
+/// `count` means *media items found*, not messages scanned: a channel that interleaves lessons
+/// with text announcements still yields the 50 lessons that were asked for.
+///
+/// Forum topics are honored throughout. A forum's message ids interleave across every topic, so
+/// a range that ignored the topic would report other topics' posts — see `message_in_topic`.
+#[tauri::command]
+pub async fn tg_scan_range(
+    app: AppHandle,
+    db: State<'_, Db>,
+    state: State<'_, TgState>,
+    start_url: String,
+    end_url: Option<String>,
+    count: Option<u32>,
+) -> AppResult<TgRangeScanResult> {
+    let start = parse_message_link(&start_url)?;
+
+    // Exactly one bound. Accepting both would leave two disagreeing answers to "where does this
+    // stop?", and accepting neither is an unbounded sweep of the channel.
+    let end = match (end_url.as_deref().map(str::trim).filter(|s| !s.is_empty()), count) {
+        (Some(url), None) => RangeEnd::Link(parse_message_link(url)?),
+        (None, Some(n)) => {
+            if n == 0 {
+                return Err(AppError::Invalid("Ask for at least one lesson.".into()));
+            }
+            RangeEnd::Count(n.min(MAX_COUNT))
+        }
+        (Some(_), Some(_)) => {
+            return Err(AppError::Invalid(
+                "Choose one: scan up to an end link, or scan a number of lessons.".into(),
+            ))
+        }
+        (None, None) => {
+            return Err(AppError::Invalid(
+                "Add an end link, or say how many lessons to scan.".into(),
+            ))
+        }
+    };
+
+    let client = state.ensure_client(&app, &db).await?;
+    let session = state
+        .get_session()
+        .await
+        .ok_or_else(|| AppError::Other("Telegram session is not initialized.".into()))?;
+    let peer = resolve_target(&client, &start.target).await?;
+    let peer_ref = resolve_peer_ref(&client, &session, peer).await?;
+    let chat_id = peer_ref
+        .id
+        .bare_id()
+        .ok_or_else(|| AppError::Invalid("That link doesn't point at a channel.".into()))?;
+
+    let emit = |stage: &str, found: usize, scanned: usize, target: usize, done: bool| {
+        let _ = app.emit(
+            IMPORT_PROGRESS_EVENT,
+            TgRangeProgress {
+                stage: stage.to_string(),
+                found,
+                scanned,
+                target,
+                done,
+            },
+        );
+    };
+
+    let (mut items, scanned, truncated) = match end {
+        RangeEnd::Link(end) => {
+            // Both links must name the same chat, or the "range" spans two channels and the
+            // ids on either side are unrelated numbers.
+            if !same_target(&start.target, &end.target) {
+                return Err(AppError::Invalid(
+                    "Those two links are from different channels. Both ends of a range have to come from the same one."
+                        .into(),
+                ));
+            }
+            // Pasting them in either order is the same request.
+            let (lo, hi) = if start.message_id <= end.message_id {
+                (start.message_id, end.message_id)
+            } else {
+                (end.message_id, start.message_id)
+            };
+
+            // Both ids are >= 1 (the parser enforces it), so this can't underflow. The cap is
+            // applied with a saturating add because a message id near i32::MAX would otherwise
+            // overflow when the cap is added to it.
+            let span = (hi - lo) as usize + 1;
+            let truncated = span > MAX_RANGE_IDS;
+            let hi = if truncated {
+                lo.saturating_add(MAX_RANGE_IDS as i32 - 1)
+            } else {
+                hi
+            };
+            if truncated {
+                log::warn!(
+                    "telegram: range capped at {MAX_RANGE_IDS} ids ({lo}..={hi}, asked for {span})"
+                );
+            }
+
+            let ids: Vec<i32> = (lo..=hi).collect();
+            emit("fetching", 0, 0, ids.len(), false);
+
+            // A topic on EITHER link scopes the sweep: someone pasting a topic link for one end
+            // and a plain link for the other still means "inside this topic".
+            let topic = start.topic_id.or(end.topic_id);
+            let items = fetch_media_items(&client, peer_ref, chat_id, &ids, topic).await?;
+            let scanned = ids.len();
+            emit("fetching", items.len(), scanned, ids.len(), false);
+            (items, scanned, truncated)
+        }
+        RangeEnd::Count(target) => {
+            emit("discovering", 0, 0, target as usize, false);
+            let found = match start.topic_id {
+                // Forum topic: `GetHistory` (what `iter_messages` wraps) has no topic filter,
+                // so walking it would mix in every other topic's posts. `GetReplies` is
+                // topic-scoped server-side.
+                Some(topic) => {
+                    collect_in_topic(
+                        &client,
+                        peer_ref,
+                        chat_id,
+                        topic,
+                        start.message_id,
+                        target as usize,
+                        &emit,
+                    )
+                    .await?
+                }
+                // Flat channel: plain forward history walk.
+                None => {
+                    collect_in_history(
+                        &client,
+                        peer_ref,
+                        chat_id,
+                        start.message_id,
+                        target as usize,
+                        &emit,
+                    )
+                    .await?
+                }
+            };
+            (found.items, found.scanned, found.truncated)
+        }
+    };
+
+    // An empty range is not an error — the list has an empty state that can say what to check,
+    // and the scan counts are worth showing either way ("looked at 300 messages, found nothing"
+    // tells the student something a red error box doesn't).
+    mark_already_imported(&db, chat_id, &mut items)?;
+    emit("done", items.len(), scanned, items.len(), true);
+
+    Ok(TgRangeScanResult {
+        items,
+        scanned,
+        truncated,
+    })
+}
+
+/// Where a range stops.
+enum RangeEnd {
+    /// Up to (and including) another message link.
+    Link(MessageLink),
+    /// Until this many media items have been found.
+    Count(u32),
+}
+
+/// Do two links name the same chat?
+///
+/// Compared structurally rather than by resolved peer: a username and a `/c/` id for the same
+/// channel are not interchangeable here because only one of them was used to resolve the peer.
+fn same_target(a: &LinkTarget, b: &LinkTarget) -> bool {
+    match (a, b) {
+        (
+            LinkTarget::PrivateChannel { channel_id: x },
+            LinkTarget::PrivateChannel { channel_id: y },
+        ) => x == y,
+        (LinkTarget::Username { username: x }, LinkTarget::Username { username: y }) => {
+            x.eq_ignore_ascii_case(y)
+        }
+        (LinkTarget::Invite { hash: x }, LinkTarget::Invite { hash: y }) => x == y,
+        _ => false,
+    }
+}
+
+/// What a bounded sweep found.
+struct Collected {
+    items: Vec<TgMediaItem>,
+    scanned: usize,
+    truncated: bool,
+}
+
+/// Walk a flat channel's history forward from `start_id`, collecting media.
+///
+/// `offset_id` is exclusive and `reverse(true)` reads oldest-to-newest, so `start_id - 1` makes
+/// the starting message itself the first one returned.
+async fn collect_in_history(
+    client: &Client,
+    peer_ref: PeerRef,
+    chat_id: i64,
+    start_id: i32,
+    target: usize,
+    emit: &impl Fn(&str, usize, usize, usize, bool),
+) -> AppResult<Collected> {
+    let mut items = Vec::new();
+    let mut scanned = 0usize;
+    let mut iter = client
+        .iter_messages(peer_ref)
+        .offset_id(start_id - 1)
+        .reverse(true);
+
+    loop {
+        match iter.next().await {
+            Ok(Some(message)) => {
+                scanned += 1;
+                if let Some(item) = media_item(&message, chat_id, false) {
+                    items.push(item);
+                    if items.len() % 5 == 0 || items.len() == target {
+                        emit("discovering", items.len(), scanned, target, false);
+                    }
+                    if items.len() >= target {
+                        return Ok(Collected {
+                            items,
+                            scanned,
+                            truncated: false,
+                        });
+                    }
+                }
+                // The scan cap bounds the *messages read*, not the items wanted: a channel
+                // with long text-only stretches must not spin forever looking for media.
+                if scanned >= MAX_SCAN {
+                    log::warn!("telegram: range scan stopped at the {MAX_SCAN}-message cap");
+                    return Ok(Collected {
+                        items,
+                        scanned,
+                        truncated: true,
+                    });
+                }
+            }
+            // End of the channel — fewer items than asked for, which is not an error.
+            Ok(None) => {
+                return Ok(Collected {
+                    items,
+                    scanned,
+                    truncated: false,
+                })
+            }
+            Err(e) => return Err(unreachable_peer_or(e)),
+        }
+    }
+}
+
+/// Walk ONE forum topic forward from `start_id`, collecting media.
+///
+/// Uses the raw `messages.GetReplies` TL call, which takes the topic's root id as `msg_id` and
+/// filters server-side. grammers has no high-level wrapper for it, and its `iter_messages`
+/// (`messages.GetHistory`) cannot substitute: `GetHistory` returns the whole chat, so in a
+/// forum with many topics it would download thousands of unrelated messages to find a handful.
+///
+/// Pagination mirrors grammers' own reverse-iteration: `add_offset = -limit` with
+/// `min_id = offset_id` reads a page *forward* of the offset, and the offset then advances to
+/// the highest id seen.
+///
+/// The returned raw messages are deliberately NOT converted into `grammers_client::Message` —
+/// that needs `Message::from_raw(.., PeerMap)`, and `PeerMap` has no public constructor in
+/// grammers 0.10. Their ids are collected instead and the metadata is fetched through the same
+/// `get_messages_by_id` path everything else uses, which also keeps one definition of what
+/// counts as importable media.
+#[allow(clippy::too_many_arguments)]
+async fn collect_in_topic(
+    client: &Client,
+    peer_ref: PeerRef,
+    chat_id: i64,
+    topic_id: i32,
+    start_id: i32,
+    target: usize,
+    emit: &impl Fn(&str, usize, usize, usize, bool),
+) -> AppResult<Collected> {
+    const PAGE: i32 = 100;
+
+    let mut ids: Vec<i32> = Vec::new();
+    let mut scanned = 0usize;
+    let mut truncated = false;
+    // Exclusive, like `iter_messages().offset_id()`, so the starting message is included.
+    let mut offset_id = start_id - 1;
+
+    'pages: loop {
+        // Reading *forward* from an exclusive offset, mirroring grammers' reverse iterator:
+        // `add_offset = -limit` with `min_id = offset_id` returns the page after the offset.
+        //
+        // `offset_id == 0` is the exception grammers also special-cases: 0 means "unset" to
+        // Telegram, so the window has to be nudged by one to keep message id 1 in it. Without
+        // this, importing a range that starts at the chat's very first message silently drops
+        // that message.
+        let (request_offset_id, add_offset) = if offset_id == 0 {
+            (1, -PAGE + 1)
+        } else {
+            (offset_id, -PAGE)
+        };
+
+        let response = client
+            .invoke(&tl::functions::messages::GetReplies {
+                peer: (&peer_ref).into(),
+                msg_id: topic_id,
+                offset_id: request_offset_id,
+                offset_date: 0,
+                add_offset,
+                limit: PAGE,
+                max_id: 0,
+                min_id: offset_id,
+                hash: 0,
+            })
+            .await
+            .map_err(unreachable_peer_or)?;
+
+        let raw_messages = match response {
+            tl::enums::messages::Messages::Messages(m) => m.messages,
+            tl::enums::messages::Messages::Slice(m) => m.messages,
+            tl::enums::messages::Messages::ChannelMessages(m) => m.messages,
+            // Only returned when a non-zero `hash` was sent; `hash: 0` above means it can't be.
+            tl::enums::messages::Messages::NotModified(_) => break 'pages,
+        };
+
+        if raw_messages.is_empty() {
+            break 'pages;
+        }
+
+        // Telegram answers newest-first even when reading forward.
+        let mut page: Vec<i32> = raw_messages
+            .iter()
+            .map(|m| m.id())
+            .filter(|id| *id >= start_id)
+            .collect();
+        page.sort_unstable();
+
+        // Advance past every id this page returned, not just the ones that survived the filter.
+        // Using only the kept ids would stall the offset on a page of older messages and
+        // re-request it forever.
+        let highest = raw_messages.iter().map(|m| m.id()).max();
+
+        // Every message the server handed back counts as scanned, filtered or not — otherwise
+        // a long run of pre-`start_id` messages would spin the network without ever tripping
+        // the scan cap.
+        scanned += raw_messages.len();
+
+        for id in page {
+            ids.push(id);
+            // Media can only be confirmed once the metadata is fetched, so this over-collects
+            // by design and the real count is applied below.
+            if ids.len() >= target.saturating_mul(3).max(target.saturating_add(50)) {
+                truncated = true;
+                break 'pages;
+            }
+        }
+
+        if scanned >= MAX_SCAN {
+            log::warn!("telegram: topic sweep stopped at the {MAX_SCAN}-message cap");
+            truncated = true;
+            break 'pages;
+        }
+
+        emit("discovering", 0, scanned, target, false);
+
+        match highest {
+            // No forward progress: stop rather than re-request the same page forever.
+            Some(h) if h > offset_id => offset_id = h,
+            _ => break 'pages,
+        }
+    }
+
+    if ids.is_empty() {
+        return Ok(Collected {
+            items: Vec::new(),
+            scanned,
+            truncated,
+        });
+    }
+
+    emit("fetching", 0, scanned, target, false);
+
+    // Topic membership is already guaranteed by `GetReplies`, so no second filter is needed.
+    let mut items = fetch_media_items(client, peer_ref, chat_id, &ids, None).await?;
+    if items.len() >= target {
+        items.truncate(target);
+        // The target was met — the look-ahead cap that stopped discovery isn't a shortfall, so
+        // it must not be reported as one.
+        truncated = false;
+    }
+
+    emit("fetching", items.len(), scanned, target, false);
+    Ok(Collected {
+        items,
+        scanned,
+        truncated,
+    })
 }
 
 /// List recent media messages in a channel, for the browse view.
@@ -682,25 +1236,7 @@ pub async fn tg_channel_media(
         }
     }
 
-    // Mark what's already in the library in ONE query rather than per item — a per-row
-    // lookup would take the DB mutex `limit` times on the UI's hot path.
-    let keys: Vec<i32> = items.iter().map(|i| i.message_id).collect();
-    if !keys.is_empty() {
-        let imported = db.with(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT tg_message_id FROM materials WHERE tg_chat_id = ?1 AND tg_message_id IS NOT NULL",
-            )?;
-            let rows = stmt.query_map([chat_id], |r| r.get::<_, i32>(0))?;
-            let mut set = std::collections::HashSet::new();
-            for row in rows {
-                set.insert(row?);
-            }
-            Ok(set)
-        })?;
-        for item in &mut items {
-            item.already_imported = imported.contains(&item.message_id);
-        }
-    }
+    mark_already_imported(&db, chat_id, &mut items)?;
 
     Ok(items)
 }
@@ -890,6 +1426,221 @@ mod tests {
 
     // Channel-reference parsing now lives in `link.rs` as `parse_channel_link` (it grew invite
     // support), and is tested there.
+}
+
+/// Topic attribution — the rule that keeps a forum range inside one topic.
+///
+/// These build raw TL messages directly rather than going through the network, so the
+/// `reply_to` shapes Telegram actually sends can be asserted without a live session.
+#[cfg(test)]
+mod topic_tests {
+    use super::*;
+
+    /// A raw message with the given reply header.
+    fn message_with_reply(reply: Option<tl::enums::MessageReplyHeader>) -> tl::enums::Message {
+        tl::enums::Message::Message(tl::types::Message {
+            out: false,
+            mentioned: false,
+            media_unread: false,
+            silent: false,
+            post: true,
+            from_scheduled: false,
+            legacy: false,
+            edit_hide: false,
+            pinned: false,
+            noforwards: false,
+            invert_media: false,
+            offline: false,
+            video_processing_pending: false,
+            paid_suggested_post_stars: false,
+            paid_suggested_post_ton: false,
+            id: 42,
+            from_id: None,
+            from_boosts_applied: None,
+            from_rank: None,
+            peer_id: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 1 }),
+            saved_peer_id: None,
+            fwd_from: None,
+            via_bot_id: None,
+            via_business_bot_id: None,
+            guestchat_via_from: None,
+            reply_to: reply,
+            date: 0,
+            message: String::new(),
+            media: None,
+            reply_markup: None,
+            entities: None,
+            views: None,
+            forwards: None,
+            replies: None,
+            edit_date: None,
+            post_author: None,
+            grouped_id: None,
+            reactions: None,
+            restriction_reason: None,
+            ttl_period: None,
+            quick_reply_shortcut_id: None,
+            effect: None,
+            factcheck: None,
+            report_delivery_until_date: None,
+            paid_message_stars: None,
+            suggested_post: None,
+            schedule_repeat_period: None,
+            summary_from_language: None,
+            rich_message: None,
+        })
+    }
+
+    /// The reply header Telegram attaches inside a forum.
+    fn forum_reply(
+        reply_to_msg_id: Option<i32>,
+        reply_to_top_id: Option<i32>,
+    ) -> tl::enums::MessageReplyHeader {
+        tl::enums::MessageReplyHeader::Header(tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic: true,
+            quote: false,
+            reply_to_ephemeral: false,
+            reply_to_msg_id,
+            reply_to_peer_id: None,
+            reply_from: None,
+            reply_media: None,
+            reply_to_top_id,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            todo_item_id: None,
+            poll_option: None,
+        })
+    }
+
+    #[test]
+    fn a_post_made_directly_in_a_topic_is_attributed_by_reply_to_msg_id() {
+        // Telegram points a top-level topic post at the topic's root message.
+        let msg = message_with_reply(Some(forum_reply(Some(7), None)));
+        assert_eq!(raw_topic_id(&msg), Some(7));
+        assert!(message_in_topic(&msg, 7));
+        assert!(!message_in_topic(&msg, 8));
+    }
+
+    #[test]
+    fn a_reply_inside_a_topic_is_attributed_by_reply_to_top_id() {
+        // Replying to another message in topic 7 makes reply_to_msg_id the *sibling* message;
+        // only reply_to_top_id still names the topic. Reading msg_id first would drop this
+        // message from its own topic's range.
+        let msg = message_with_reply(Some(forum_reply(Some(41), Some(7))));
+        assert_eq!(raw_topic_id(&msg), Some(7));
+        assert!(message_in_topic(&msg, 7));
+        assert!(!message_in_topic(&msg, 41));
+    }
+
+    #[test]
+    fn a_message_with_no_reply_header_belongs_to_the_general_topic() {
+        // Forums file General's posts with no reply header at all. Treating that as "unknown
+        // topic" would make a General-topic range import nothing.
+        let msg = message_with_reply(None);
+        assert_eq!(raw_topic_id(&msg), None);
+        assert!(message_in_topic(&msg, GENERAL_TOPIC_ID));
+        assert!(!message_in_topic(&msg, 7));
+    }
+
+    #[test]
+    fn a_plain_reply_outside_a_forum_is_not_a_topic() {
+        // Same header shape, `forum_topic` unset: an ordinary reply in a non-forum channel.
+        // Reading it as a topic would let a flat-channel range filter itself down to nothing.
+        let reply = tl::enums::MessageReplyHeader::Header(tl::types::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic: false,
+            quote: false,
+            reply_to_ephemeral: false,
+            reply_to_msg_id: Some(41),
+            reply_to_peer_id: None,
+            reply_from: None,
+            reply_media: None,
+            reply_to_top_id: None,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            todo_item_id: None,
+            poll_option: None,
+        });
+        let msg = message_with_reply(Some(reply));
+        assert_eq!(raw_topic_id(&msg), None);
+    }
+
+    #[test]
+    fn same_target_compares_channels_structurally() {        let a = LinkTarget::PrivateChannel { channel_id: 123 };
+        let b = LinkTarget::PrivateChannel { channel_id: 123 };
+        let c = LinkTarget::PrivateChannel { channel_id: 456 };
+        assert!(same_target(&a, &b));
+        assert!(!same_target(&a, &c));
+
+        // Usernames are case-insensitive in Telegram, so the same channel pasted two ways is
+        // still one channel.
+        assert!(same_target(
+            &LinkTarget::Username {
+                username: "MyChannel".into()
+            },
+            &LinkTarget::Username {
+                username: "mychannel".into()
+            }
+        ));
+
+        // A username and a bare id are NOT interchangeable here: only one of them resolved the
+        // peer, so treating them as equal would sweep ids from the wrong chat.
+        assert!(!same_target(
+            &a,
+            &LinkTarget::Username {
+                username: "mychannel".into()
+            }
+        ));
+    }
+
+    /// The `GetReplies` request built for the first page of a topic sweep.
+    ///
+    /// `collect_in_topic` can't run without a live session, so the offset arithmetic — the part
+    /// that decides whether a message is skipped or a page is re-requested forever — is
+    /// asserted directly here instead.
+    fn first_page_request(start_id: i32, page: i32) -> (i32, i32, i32) {
+        let offset_id = start_id - 1;
+        let (request_offset_id, add_offset) = if offset_id == 0 {
+            (1, -page + 1)
+        } else {
+            (offset_id, -page)
+        };
+        (request_offset_id, add_offset, offset_id)
+    }
+
+    #[test]
+    fn a_sweep_starting_at_the_first_message_still_includes_it() {
+        // `offset_id = 0` means "unset" to Telegram, so a range starting at message 1 has to
+        // nudge the window by one — exactly what grammers' own reverse iterator does. Without
+        // it, the first message of the chat is silently dropped from the import.
+        let (offset_id, add_offset, min_id) = first_page_request(1, 100);
+        assert_eq!(offset_id, 1, "offset must not be sent as 0");
+        assert_eq!(add_offset, -99, "the window shifts by one to keep id 1 in it");
+        assert_eq!(min_id, 0);
+    }
+
+    #[test]
+    fn a_sweep_starting_mid_history_reads_forward_from_an_exclusive_offset() {
+        // The ordinary case: `add_offset = -limit` with `min_id = offset_id` reads the page
+        // AFTER the offset rather than the page before it.
+        let (offset_id, add_offset, min_id) = first_page_request(42, 100);
+        assert_eq!(offset_id, 41, "exclusive, so message 42 is included");
+        assert_eq!(add_offset, -100);
+        assert_eq!(min_id, 41);
+    }
+
+    #[test]
+    fn the_look_ahead_cap_cannot_overflow() {
+        // The cap over-collects ids because media can only be confirmed after fetching. It has
+        // to stay finite for a pathological target.
+        for target in [1usize, 20, 500, usize::MAX] {
+            let cap = target.saturating_mul(3).max(target.saturating_add(50));
+            assert!(cap >= target, "cap must never be below the target");
+        }
+    }
 }
 
 #[cfg(test)]
