@@ -277,3 +277,196 @@ Each phase ends with `npm run build` + `cargo test --lib` and an atomic commit.
 3. **Registry scope** — v1 = in-repo plugins only (manifest + contribution points, no third-party installs). A plugin marketplace/dir-scan loader is explicitly out of scope.
 4. **`/plugins` hub vs. Settings-only** — recommend both (hub for discovery, Settings section for management), but Settings-only is a legitimate v1 cut.
 5. **grammers isolation** — commit now to the single-file isolation boundary so a future swap (tdlib-rs, or a Pyrogram sidecar) is a contained change.
+
+---
+
+## 10. Bulk / Range Import — Research & Verified Implementation Plan
+
+**Date:** 2026-08-09
+**Status:** Research-complete. Verified against codebase + MTProto spec + grammers 0.10 source.
+
+### 10.1 Problem statement
+
+Currently a user can import Telegram media in two ways:
+1. **Single link** — paste one `t.me/c/…/42` link → `tg_import_link` → one material row.
+2. **Browse channel** — paste a channel link → `tg_channel_media` lists recent media → select + batch import via `tg_import_batch`.
+
+**The gap:** Browse requires the user to have either a `@username`, an invite link, or a `/c/<id>` link to the *channel itself*. For a private channel where the user only has individual post links, they must paste links one at a time. Importing 80 videos means 80 paste-and-click cycles.
+
+**The solution:** Accept a **start link** and either an **end link** or a **count**, and automatically sweep the range.
+
+### 10.2 Telegram link structure reference (verified 2026)
+
+All link structures below were verified against the existing link parser in `src-tauri/src/plugins/telegram/link.rs` (549 lines, 38 unit tests).
+
+#### 10.2.1 Complete link anatomy
+
+| Entity type | Link format | Example | Parser coverage |
+|---|---|---|---|
+| **Public channel** — message | `t.me/<username>/<msg_id>` | `t.me/durov/42` | ✅ line 119 |
+| **Public channel** — topic message | `t.me/<username>/<topic_id>/<msg_id>` | `t.me/pythonforum/7/42` | ✅ line 119 (last segment = msg) |
+| **Private channel** — message | `t.me/c/<bare_id>/<msg_id>` | `t.me/c/1234567890/42` | ✅ line 101 |
+| **Private channel** — topic message | `t.me/c/<bare_id>/<topic_id>/<msg_id>` | `t.me/c/1234567890/7/42` | ✅ line 111 |
+| **Private channel** — Desktop copy | `tg://privatepost?channel=<bare_id>&post=<msg_id>` | `tg://privatepost?channel=123&post=42` | ✅ line 59 |
+| **Invite link** (modern) | `t.me/+<hash>` | `t.me/+0fNyqiUncH5mNjE9` | ✅ (channel-only; rejected as message link with guidance) |
+| **Invite link** (legacy) | `t.me/joinchat/<hash>` | `t.me/joinchat/AAAAAEjq0Ns` | ✅ same |
+| **Channel-only** (no msg) | `t.me/<username>` or `t.me/c/<id>` | `t.me/somechannel` | ✅ `parse_channel_link` line 272 |
+
+#### 10.2.2 Critical codebase finding: topic_id is discarded
+
+**Current behavior** (line 111):
+```rust
+[\"c\", channel, _topic, message] => Ok(MessageLink {
+    target: LinkTarget::PrivateChannel { channel_id: parse_channel_id(channel)? },
+    message_id: parse_message_id(message)?,
+})
+```
+
+The `_topic` segment is **intentionally ignored** because `parse_message_link` only needs to identify *one* message. For single imports this is correct — `get_messages_by_id` addresses messages by their global ID within the chat, regardless of topic.
+
+**For range import this creates a problem:** If the user provides `t.me/c/123/7/42` (topic 7, message 42) and asks for the next 80 media items, we must know that topic_id=7 so we can filter the stream to only that topic's messages. Without it, we'd import from every topic in the group.
+
+**Fix required:** Add `topic_id: Option<i32>` to `MessageLink`.
+
+#### 10.2.3 Message ID behavior (verified against MTProto)
+
+| Property | Channels | Groups (non-forum) | Groups with Topics (Forums) |
+|---|---|---|---|
+| **ID scope** | Per-channel, monotonically increasing | Per-supergroup, monotonically increasing | **Same supergroup-wide counter** — all topics share the same ID space |
+| **Consecutive IDs** | Generally sequential for media posts; gaps from deleted messages, service messages, or text-only posts | Same | IDs interleave across topics |
+| **Albums** | Each media item in an album gets its own message ID (consecutive). The `grouped_id` field ties them together | Same | Same |
+
+**Key implication for range import in forums:** Asking for messages 42–122 in a forum supergroup returns messages from *all* topics mixed together. The range must be post-filtered by topic.
+
+#### 10.2.4 The -100 prefix trap (existing, well-handled)
+
+The parser already handles the Bot API vs. MTProto ID convention mismatch (line 156–194). A `/c/` link carries the **bare** channel ID. The Bot API prefixes it with `-100`. The parser normalizes both to bare — this is correct and must be preserved.
+
+### 10.3 API approach: what grammers 0.10 actually supports
+
+#### 10.3.1 `client.iter_messages(peer)` — for flat channels
+
+**Verified in grammers-client 0.10.0** (`src/client/messages.rs`):
+- Returns `MessageIter` wrapping `messages.GetHistory`.
+- Supports `.offset_id(id)` — exclusive starting point.
+- Supports `.reverse(true)` — oldest-to-newest iteration.
+- When `reverse(true)` + `offset_id(X)`: sets `min_id = X`, iterates forward from X.
+- **Does NOT support topic/thread filtering.** `GetHistory` has no `topic_id` parameter. It returns all messages in the chat.
+
+**This is the right tool for channels and non-forum groups.**
+
+#### 10.3.2 `messages.GetReplies` — for forum topics
+
+**Verified in grammers-tl-types generated code:**
+```rust
+pub struct GetReplies {
+    pub peer: crate::enums::InputPeer,
+    pub msg_id: i32,        // ← the topic_id (root message of the topic)
+    pub offset_id: i32,
+    pub offset_date: i32,
+    pub add_offset: i32,
+    pub limit: i32,
+    pub max_id: i32,
+    pub min_id: i32,
+    pub hash: i64,
+}
+```
+
+This is a **raw TL function** — grammers has no high-level wrapper for it. Must be invoked via `client.invoke(&tl::functions::messages::GetReplies { ... })`.
+
+Returns `messages.Messages` (same as `GetHistory`), so pagination follows the same pattern. **This is the correct and only way to iterate messages within a specific forum topic.**
+
+**Critical: grammers' `iter_messages` will NOT work for topics.** The Gemini plan's suggestion to use `iter_messages().offset_id(start_id - 1).reverse(true)` and then filter by `reply_to_top_id` is **technically functional but dangerously inefficient**: in a forum with 50 active topics, to find 80 media items in one topic you might scan 4000+ messages. `GetReplies` is both correct and efficient — Telegram's server does the filtering.
+
+#### 10.3.3 `client.get_messages_by_id(peer, &[ids])` — for known ID ranges
+
+**Verified** (line 574 of `import.rs`): Already used in `tg_import_batch`. Takes a slice of message IDs, chunks them in groups of 100, returns `Vec<Option<Message>>`.
+
+**For range import with start/end IDs:** This is the simplest approach — generate the vector `[start_id..=end_id]`, chunk by 100, fetch, filter for media. **No iteration needed. No topic filtering needed** (messages are fetched by exact ID, so they're guaranteed to be the right messages regardless of topic).
+
+**Caveat:** If the range is large (e.g., 500 IDs), many might be non-media (text posts, deleted messages). The `Option<Message>` filtering handles deleted messages, and `media_item()` filters non-media. But the user may need to specify a wider range than expected if many messages in between are text-only.
+
+### 10.4 Verified implementation approach
+
+Based on the analysis above, **two distinct strategies** are needed depending on user input:
+
+#### Strategy A: Start link + End link (known boundaries)
+
+1. Parse both links. They must point at the **same channel/group** (same `channel_id` or `username`).
+2. Generate ID range: `[start_id..=end_id]`.
+3. Use existing `get_messages_by_id` in chunks of 100 (reuse the pattern from `tg_import_batch` at line 574).
+4. Filter with `media_item()` (already exists at line 238).
+5. Upsert via existing `upsert_material()` in a single transaction.
+
+**Advantages:** Simple, exact, works for channels + groups + forums (no topic confusion — exact IDs are exact IDs). No iteration overhead.
+
+**Edge case:** If `start_id > end_id`, swap them. If the gap is enormous (>2000 IDs), warn the user or cap.
+
+#### Strategy B: Start link + Count (open-ended)
+
+This is where it gets interesting. The behavior depends on whether the start link targets a **topic** or not:
+
+**B1: Non-topic (flat channel/group)**
+- Use `client.iter_messages(peer).offset_id(start_id - 1).reverse(true)`.
+- Iterate forward, collect media items until `count` is reached or the scan cap (5000 messages) is hit.
+- Works perfectly because `GetHistory` returns all messages in order.
+
+**B2: Topic (forum group)**
+- Detect from the parsed link that `topic_id` is present.
+- Use raw `client.invoke(&tl::functions::messages::GetReplies { peer, msg_id: topic_id, offset_id: start_id - 1, ... })` with pagination.
+- `GetReplies` returns only messages within that specific topic — no cross-topic pollution.
+- Iterate forward, collect media items until `count` is reached.
+
+### 10.5 Corrections to the Gemini implementation plan
+
+| # | Gemini's claim | Verdict | Correct approach |
+|---|---|---|---|
+| 1 | Use `iter_messages().offset_id(start_id - 1).reverse(true)` for all cases | ❌ **Wrong for topics.** `iter_messages` wraps `GetHistory` which has no topic filter. | Use `GetReplies` (raw TL invoke) for topics; `iter_messages` only for flat channels. |
+| 2 | "Filter by extracting `MessageReplyHeader` from `msg.raw` and checking `reply_to_top_id`" | ⚠️ **Technically works but wastes bandwidth.** Downloads all messages in the supergroup just to discard most of them. | Use `GetReplies` which filters server-side. Zero wasted bandwidth. |
+| 3 | "Hard cap of 5000 messages scanned" | ✅ Reasonable for Strategy B1 (flat channels). Unnecessary for B2 (`GetReplies` already scoped). | Keep the cap for flat-channel iteration; for topics it's naturally bounded. |
+| 4 | "Add `topic_id: Option<i32>` to `MessageLink`" | ✅ **Correct and necessary.** The parser currently discards the topic segment. | Modify `MessageLink` struct and the match arms in `parse_message_link`. |
+| 5 | "Register `tg_import_range` in lib.rs" | ✅ Standard procedure. | Add to the invoke handler alongside existing `tg_import_batch`. |
+| 6 | Frontend: toggle in "Link" tab + segmented control for end-link vs. count | ✅ Good UX approach. | Implement as described. |
+
+### 10.6 Known edge cases and exceptions
+
+| # | Edge case | How to handle |
+|---|---|---|
+| 1 | **Deleted messages in range** — `get_messages_by_id` returns `None` for deleted messages | Already handled: `messages.into_iter().flatten()` skips `None` values (line 580 of import.rs). |
+| 2 | **Albums / media groups** — multiple messages with the same `grouped_id` | Each media item in an album has its own `message_id`. They are naturally included in any ID range. No special handling needed. |
+| 3 | **Service messages** (user joined, topic created, pinned message) | `media_item()` returns `None` for messages without `Media::Document`. They are silently skipped. |
+| 4 | **Start and end links point to different channels** | Validate: both must resolve to the same `channel_id` or `username`. Return a clear error if they don't match. |
+| 5 | **FLOOD_WAIT on large ranges** | `get_messages_by_id` in chunks of 100 is well within Telegram's limits. For `iter_messages`/`GetReplies`, the existing flood-wait handling in grammers applies. Add a sensible delay between chunks (200ms). |
+| 6 | **Private channel where the user is not a member** | Already handled by `resolve_peer_ref` (line 408 of import.rs) — surfaces "Make sure this Telegram account is a member" error. |
+| 7 | **Topic ID = 1 (General topic)** | In forums, the "General" topic has `topic_id = 1`. `GetReplies` with `msg_id = 1` correctly returns messages in the General topic. |
+| 8 | **Messages that exist but have no media** | The count refers to *media items found*, not *messages scanned*. The user asks for 80 videos and gets 80 videos, even if 120 messages were scanned to find them. |
+| 9 | **Large gap between start and end (>2000 IDs)** | For Strategy A, cap at 2000 IDs per request to avoid Telegram rate limits. Warn the user if the range is too wide. For Strategy B, the 5000-scan cap handles this naturally. |
+| 10 | **Public channel topics** — `t.me/<username>/<topic>/<msg>` | Parser already handles this (line 119). The `topic_id` extraction must also cover this public path segment shape. |
+
+### 10.7 Files to modify (verified against codebase)
+
+#### Backend (Rust)
+
+| File | Change | Lines affected |
+|---|---|---|
+| `src-tauri/src/plugins/telegram/link.rs` | Add `topic_id: Option<i32>` to `MessageLink`; capture topic segment instead of discarding it with `_topic` | Struct at L36–40, match arms at L111 and L119 |
+| `src-tauri/src/plugins/telegram/import.rs` | New command `tg_import_range` implementing Strategy A + B; reuse `resolve_target`, `resolve_peer_ref`, `media_item`, `upsert_material` | New function (~120 lines); import `tl::functions::messages::GetReplies` |
+| `src-tauri/src/lib.rs` | Register `tg_import_range` in the invoke handler | 1 line addition |
+
+#### Frontend (TypeScript/React)
+
+| File | Change |
+|---|---|
+| `src/plugins/telegram/api.ts` | Add `importRange(startUrl, endUrl, count, nodeId)` wrapper |
+| `src/plugins/telegram/LinkImport.tsx` | Add "Import range" mode to the existing tab switcher; inputs for start link, end link / count, destination |
+
+### 10.8 What the existing `tg_import_batch` already does right
+
+The existing batch import command (line 526–624 of `import.rs`) is a solid foundation:
+- Chunks message IDs by 100 ✅
+- Single SQLite transaction for atomicity ✅
+- Returns per-item results with `material_id`, `file_name`, `created` ✅
+- Proper error handling for unreachable peers ✅
+
+The new `tg_import_range` should **delegate to the same chunking + upsert logic** rather than duplicating it. The only new responsibility is generating the ID list (Strategy A) or iterating for media items (Strategy B).
+
