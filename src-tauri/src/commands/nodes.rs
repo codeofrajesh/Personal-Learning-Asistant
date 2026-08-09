@@ -124,6 +124,40 @@ pub fn reorder_materials(
     db.with_mut(|conn| queries::reorder_materials(conn, node_id, &material_ids))
 }
 
+/// Create a new folder node. When `parent_id` is null a new root (goal) is created;
+/// otherwise a subfolder under the specified parent. Returns the new node's id.
+///
+/// This is the backend for the Visual Course Builder — folders appear instantly in
+/// the tree without waiting for the file scanner, and the scanner recognises them via
+/// `upsert_child_node`'s UNIQUE match when it eventually runs.
+#[tauri::command]
+pub fn create_node(
+    app: AppHandle,
+    db: State<'_, Db>,
+    parent_id: Option<i64>,
+    name: String,
+) -> AppResult<i64> {
+    let id = db.with(|conn| queries::create_virtual_node(conn, parent_id, &name))?;
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, id);
+    Ok(id)
+}
+
+/// Rename an existing folder node. Returns the trimmed new name.
+///
+/// The backend validates the name (empty, illegal characters, duplicate sibling) and
+/// returns a human-readable error the frontend can display inline.
+#[tauri::command]
+pub fn rename_node(
+    app: AppHandle,
+    db: State<'_, Db>,
+    node_id: i64,
+    new_name: String,
+) -> AppResult<String> {
+    let trimmed = db.with(|conn| queries::rename_node(conn, node_id, &new_name))?;
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, node_id);
+    Ok(trimmed)
+}
+
 /// Nodes the user has pinned to the Courses hub ("Pinned" section + Explore Pinned).
 #[tauri::command]
 pub fn pinned_nodes(db: State<'_, Db>) -> AppResult<Vec<NodeCard>> {

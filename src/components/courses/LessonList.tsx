@@ -17,7 +17,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { Reorder, useDragControls, useMotionValue } from "framer-motion";
+import { Reorder, useDragControls } from "framer-motion";
 import { useGSAP } from "@gsap/react";
 import gsap from "gsap";
 import {

@@ -172,6 +172,17 @@ export const ipc = {
     return call<number>("reorder_materials", { nodeId, materialIds });
   },
 
+  /** Create a new folder node. Pass null for parentId to create a root (goal).
+   *  Returns the new node's id. */
+  createNode(parentId: number | null, name: string): Promise<number> {
+    return call<number>("create_node", { parentId, name });
+  },
+
+  /** Rename an existing folder node. Returns the trimmed new name. */
+  renameNode(nodeId: number, newName: string): Promise<string> {
+    return call<string>("rename_node", { nodeId, newName });
+  },
+
   // ── Courses hub sections (v8) ───────────────────────────────────────────────
 
   /** Nodes the user pinned to the Courses hub ("Pinned" section + Explore Pinned). */

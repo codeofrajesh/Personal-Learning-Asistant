@@ -33,6 +33,7 @@ import FolderCard from "../components/courses/FolderCard";
 import CourseHubSection from "../components/courses/CourseHubSection";
 import LessonList from "../components/courses/LessonList";
 import ConfirmDeleteModal from "../components/ui/ConfirmDeleteModal";
+import CourseTreeBuilder from "../components/courses/CourseTreeBuilder";
 
 import ProgressRing from "../components/courses/ProgressRing";
 import CoverArt from "../components/ui/CoverArt";
@@ -102,7 +103,7 @@ export default function CoursesPage() {
   // Ids optimistically pinned/unpinned this session (overrides node.is_pinned in cards
   // so a toggle doesn't need a hub refetch + GSAP re-stagger).
   const [pinnedIds, setPinnedIds] = useState<Set<number>>(new Set());
-  const openAddFolder = useMaterialManager((s) => s.openAddFolder);
+  const [builderOpen, setBuilderOpen] = useState(false);
   const importNonce = useMaterialManager((s) => s.importNonce);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -461,9 +462,9 @@ export default function CoursesPage() {
             </p>
           </div>
           {boot.kind !== "preview" && (
-            <button type="button" onClick={openAddFolder} className={btnPrimary}>
+            <button type="button" onClick={() => setBuilderOpen(true)} className={btnPrimary}>
               <Plus size={16} strokeWidth={2.5} aria-hidden />
-              Add Folder
+              Course Builder
             </button>
           )}
         </header>
@@ -755,9 +756,9 @@ export default function CoursesPage() {
               </p>
             </div>
             {isRoot ? (
-              <button type="button" onClick={openAddFolder} className={btnPrimary}>
+              <button type="button" onClick={() => setBuilderOpen(true)} className={btnPrimary}>
                 <Plus size={16} strokeWidth={2.5} aria-hidden />
-                Add a folder
+                Course Builder
               </button>
             ) : (
               <button
@@ -814,6 +815,14 @@ export default function CoursesPage() {
         onCancel={closeDelete}
         onConfirm={() => void confirmDelete()}
       />
+
+      {/* Visual Course Builder Overlay */}
+      {builderOpen && (
+        <CourseTreeBuilder
+          onClose={() => setBuilderOpen(false)}
+          currentNodeId={nodeId}
+        />
+      )}
     </div>
   );
 }

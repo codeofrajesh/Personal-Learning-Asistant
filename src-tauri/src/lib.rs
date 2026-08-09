@@ -105,6 +105,8 @@ pub fn run() {
             commands::nodes::recent_nodes,
             commands::nodes::set_node_pinned,
             commands::nodes::remove_node,
+            commands::nodes::create_node,
+            commands::nodes::rename_node,
             commands::nodes::remove_material,
             commands::player::open_material,
             commands::player::save_progress,

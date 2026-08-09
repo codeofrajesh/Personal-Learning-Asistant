@@ -8,7 +8,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::scanner::walker::{ScannedFile, ScannedNode};
-use crate::utils::errors::AppResult;
+use crate::utils::errors::{AppResult, AppError};
 
 /// Round-trip proof: write a key into `settings`, read it back, return it.
 ///
@@ -85,6 +85,135 @@ pub fn upsert_child_node(conn: &Connection, parent_id: i64, name: &str) -> AppRe
         |r| r.get(0),
     )?;
     Ok(id)
+}
+
+/// Create a new child node under `parent_id` (or a new root when `parent_id` is `None`).
+///
+/// Unlike `upsert_child_node`, this is NOT idempotent: a duplicate name under the same
+/// parent returns a UNIQUE-constraint error so the frontend can show "name already taken".
+/// This is the entry point for the Visual Course Builder, which creates folders on demand
+/// without waiting for the background scanner.
+///
+/// Returns the new node's id.
+pub fn create_virtual_node(
+    conn: &Connection,
+    parent_id: Option<i64>,
+    name: &str,
+) -> AppResult<i64> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::Invalid("Folder name can't be empty.".into()));
+    }
+    // Reject characters that are illegal in Windows/macOS/Linux directory names.
+    if name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
+        return Err(AppError::Invalid(
+            "Folder names can't contain / \\ : * ? \" < > | characters.".into(),
+        ));
+    }
+
+    let (kind, depth) = match parent_id {
+        None => ("root", 0i64),
+        Some(pid) => {
+            let d: i64 = conn
+                .query_row("SELECT depth FROM nodes WHERE id = ?1", [pid], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| AppError::NotFound("Parent folder not found.".into()))?;
+            ("folder", d + 1)
+        }
+    };
+
+    // A UNIQUE(parent_id, name) constraint guards against duplicates. For root nodes
+    // (parent_id IS NULL) SQLite treats NULLs as distinct, so we need an explicit check.
+    if parent_id.is_none() {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE parent_id IS NULL AND name = ?1)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Err(AppError::Invalid(format!(
+                "A top-level folder named \"{name}\" already exists."
+            )));
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO nodes(parent_id, name, kind, depth) VALUES(?1, ?2, ?3, ?4)",
+        rusqlite::params![parent_id, name, kind, depth],
+    )
+    .map_err(|e| {
+        if let rusqlite::Error::SqliteFailure(ref f, _) = e {
+            if f.extended_code == 2067 {
+                // UNIQUE constraint
+                return AppError::Invalid(format!(
+                    "A folder named \"{name}\" already exists here."
+                ));
+            }
+        }
+        AppError::from(e)
+    })?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Rename an existing node. Returns the new name on success.
+///
+/// Fails if the new name collides with a sibling under the same parent (UNIQUE constraint)
+/// or if the node doesn't exist.
+pub fn rename_node(conn: &Connection, node_id: i64, new_name: &str) -> AppResult<String> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(AppError::Invalid("Folder name can't be empty.".into()));
+    }
+    if new_name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
+        return Err(AppError::Invalid(
+            "Folder names can't contain / \\ : * ? \" < > | characters.".into(),
+        ));
+    }
+
+    // Verify the node exists and get its parent_id for the duplicate check.
+    let parent_id: Option<i64> = conn
+        .query_row(
+            "SELECT parent_id FROM nodes WHERE id = ?1",
+            [node_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound("Folder not found.".into()))?;
+
+    // Root-level duplicate guard (SQLite treats NULL as distinct in UNIQUE).
+    if parent_id.is_none() {
+        let clash: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE parent_id IS NULL AND name = ?1 AND id != ?2)",
+            rusqlite::params![new_name, node_id],
+            |r| r.get(0),
+        )?;
+        if clash {
+            return Err(AppError::Invalid(format!(
+                "A top-level folder named \"{new_name}\" already exists."
+            )));
+        }
+    }
+
+    let changed = conn
+        .execute(
+            "UPDATE nodes SET name = ?1, updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![new_name, node_id],
+        )
+        .map_err(|e| {
+            if let rusqlite::Error::SqliteFailure(ref f, _) = e {
+                if f.extended_code == 2067 {
+                    return AppError::Invalid(format!(
+                        "A folder named \"{new_name}\" already exists here."
+                    ));
+                }
+            }
+            AppError::from(e)
+        })?;
+
+    if changed == 0 {
+        return Err(AppError::NotFound("Folder not found.".into()));
+    }
+    Ok(new_name.to_string())
 }
 
 /// Insert (or refresh) a single material row under `node_id`. Keyed on the UNIQUE
