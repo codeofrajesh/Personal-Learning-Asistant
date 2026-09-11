@@ -27,6 +27,7 @@ import {
   ChevronLeft,
   ChevronRight,
   RotateCcw,
+  Coffee,
 } from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import KpiCards from "../components/analytics/KpiCards";
@@ -112,6 +113,7 @@ export default function AnalyticsHub() {
 
   // Compute active study streak with Rest Day preservation (Path B relaxation engine)
   const restDaysMap = useRestDayStore((s) => s.restDays);
+  const toggleRestDay = useRestDayStore((s) => s.toggleRestDay);
   const restDaysSet = useMemo(() => new Set(Object.keys(restDaysMap)), [restDaysMap]);
   const streaks = useMemo(() => studyStreaks(daily, today, restDaysSet), [daily, today, restDaysSet]);
   const effectiveStreak = streaks.current;
@@ -482,6 +484,28 @@ export default function AnalyticsHub() {
                   className="ml-1"
                 />
               )}
+
+              {/* Rest day quick action for the inspected day in Day view */}
+              {view === "day" && (
+                <button
+                  type="button"
+                  onClick={() => toggleRestDay(activePeriod.start)}
+                  className={cn(
+                    "ml-1.5 flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-all duration-150 active:scale-95",
+                    restDaysSet.has(activePeriod.start)
+                      ? "border-indigo-500/40 bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 shadow-[0_0_10px_rgba(99,102,241,0.25)]"
+                      : "border-white/[0.08] bg-white/[0.03] text-white/60 hover:border-indigo-400/35 hover:bg-white/[0.06] hover:text-white"
+                  )}
+                  title={
+                    restDaysSet.has(activePeriod.start)
+                      ? `Remove rest day for ${activePeriod.label}`
+                      : `Mark ${activePeriod.label} as a Rest Day (Preserves streak) ☕`
+                  }
+                >
+                  <Coffee size={12} className={restDaysSet.has(activePeriod.start) ? "text-indigo-300" : "text-white/40"} />
+                  <span>{restDaysSet.has(activePeriod.start) ? "Rest Day Active ☕" : "Take Rest Day"}</span>
+                </button>
+              )}
             </div>
 
             {/* Jump to current button when surfing the past */}
@@ -608,6 +632,7 @@ export default function AnalyticsHub() {
                 streakDays={effectiveStreak}
                 restDays={streaks.restDaysInStreak}
                 restDaysSet={restDaysSet}
+                onToggleRestDay={toggleRestDay}
               />
             </div>
           </>

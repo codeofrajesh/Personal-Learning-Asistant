@@ -49,6 +49,7 @@ interface Props {
   streakDays?: number;
   restDays?: number;
   restDaysSet?: Set<string>;
+  onToggleRestDay?: (date: string) => void;
 }
 
 const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"];
@@ -69,6 +70,7 @@ export default function CalendarHeatmap({
   streakDays,
   restDays = 0,
   restDaysSet = new Set(),
+  onToggleRestDay,
 }: Props) {
   const today = useScheduleClock((s) => s.day);
   const target = targetMins ?? 0;
@@ -371,8 +373,12 @@ export default function CalendarHeatmap({
                           onSelectDay?.(date);
                           onPickDay?.(date);
                         }}
-                        disabled={!onPickDay && !onSelectDay}
-                        title={`${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · ${tone.label}`}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          onToggleRestDay?.(date);
+                        }}
+                        disabled={!onPickDay && !onSelectDay && !onToggleRestDay}
+                        title={`${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · ${tone.label} (Right-click to toggle rest day ☕)`}
                         className={cn(
                           "relative grid aspect-square place-items-center rounded-[7px] text-[0.66rem] font-semibold tabular-nums transition-transform duration-150 active:scale-95",
                           tone.cellText,
@@ -401,8 +407,12 @@ export default function CalendarHeatmap({
                           onSelectDay?.(date);
                           onPickDay?.(date);
                         }}
-                        disabled={!onPickDay && !onSelectDay}
-                        title={`${fmtDateShort(date)} · Rest day (Streak preserved) ☕`}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          onToggleRestDay?.(date);
+                        }}
+                        disabled={!onPickDay && !onSelectDay && !onToggleRestDay}
+                        title={`${fmtDateShort(date)} · Rest day (Streak preserved) ☕ (Right-click to remove)`}
                         className={cn(
                           "relative grid aspect-square place-items-center rounded-[7px] border border-indigo-500/40 bg-indigo-950/45 text-[0.62rem] font-semibold text-indigo-200 tabular-nums transition-colors duration-150 shadow-[inset_0_0_8px_rgba(99,102,241,0.2)]",
                           (onPickDay || onSelectDay) && "hover:bg-indigo-900/60 hover:text-white active:scale-95",
@@ -426,8 +436,12 @@ export default function CalendarHeatmap({
                         onSelectDay?.(date);
                         onPickDay?.(date);
                       }}
-                      disabled={!onPickDay && !onSelectDay}
-                      title={`${fmtDateShort(date)} · 0m study`}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        onToggleRestDay?.(date);
+                      }}
+                      disabled={!onPickDay && !onSelectDay && !onToggleRestDay}
+                      title={`${fmtDateShort(date)} · 0m study (Right-click to mark as rest day ☕)`}
                       className={cn(
                         "grid aspect-square place-items-center rounded-[7px] bg-[#181820] text-[0.62rem] font-medium text-white/35 tabular-nums transition-colors duration-150",
                         (onPickDay || onSelectDay) && "hover:bg-[#23232c] hover:text-white/70 active:scale-95",
@@ -474,6 +488,9 @@ export default function CalendarHeatmap({
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/40">
             <span className="h-3 w-3 rounded-[4px] border border-dashed border-white/20 bg-transparent" aria-hidden />
             Future date
+          </span>
+          <span className="hidden sm:flex items-center gap-1.5 text-[0.62rem] text-indigo-300/70 border-l border-white/10 pl-3">
+            <span>Tip: Right-click any day to toggle Rest Day ☕</span>
           </span>
         </div>
 
