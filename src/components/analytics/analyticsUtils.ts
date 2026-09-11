@@ -43,6 +43,34 @@ export function weekdayShort(day: string): string {
   return parseLocalDay(day).toLocaleDateString(undefined, { weekday: "short" });
 }
 
+/** `"Monday"`. */
+export function weekdayFull(day: string): string {
+  return parseLocalDay(day).toLocaleDateString(undefined, { weekday: "long" });
+}
+
+/** Format a date range cleanly: e.g. `"14–21 Aug"` or `"28 Jul – 4 Aug 2026"`. */
+export function fmtDateRange(start: string | null, end: string | null): string {
+  if (!start && !end) return "None yet";
+  if (!start) return fmtDateShort(end!);
+  if (!end || start === end) return fmtDateShort(start);
+  const d1 = parseLocalDay(start);
+  const d2 = parseLocalDay(end);
+  const m1 = d1.toLocaleDateString(undefined, { month: "short" });
+  const m2 = d2.toLocaleDateString(undefined, { month: "short" });
+  const day1 = d1.getDate();
+  const day2 = d2.getDate();
+  const y1 = d1.getFullYear();
+  const y2 = d2.getFullYear();
+
+  if (y1 === y2) {
+    if (m1 === m2) {
+      return `${day1}–${day2} ${m1}`;
+    }
+    return `${day1} ${m1} – ${day2} ${m2}`;
+  }
+  return `${day1} ${m1} ${y1} – ${day2} ${m2} ${y2}`;
+}
+
 /** Saturday / Sunday (local). */
 export function isWeekend(day: string): boolean {
   const wd = parseLocalDay(day).getDay();
@@ -623,32 +651,88 @@ export interface StudyStreaks {
   longest: number;
   /** Whether today counts (the student has studied today). */
   activeToday: boolean;
+  /** Date when the longest streak started (YYYY-MM-DD). */
+  longestStartDate: string | null;
+  /** Date when the longest streak ended (YYYY-MM-DD). */
+  longestEndDate: string | null;
+  /** Date when the current streak started (YYYY-MM-DD). */
+  currentStartDate: string | null;
+  /** Date when the current streak ended (YYYY-MM-DD). */
+  currentEndDate: string | null;
 }
 
 /** Count current and longest streaks from the daily array (must be OLDEST-first, contiguous). */
 export function studyStreaks(daily: DayStudy[], today: string): StudyStreaks {
-  if (!daily.length) return { current: 0, longest: 0, activeToday: false };
+  if (!daily.length) {
+    return {
+      current: 0,
+      longest: 0,
+      activeToday: false,
+      longestStartDate: null,
+      longestEndDate: null,
+      currentStartDate: null,
+      currentEndDate: null,
+    };
+  }
 
   let longest = 0;
+  let longestStart: string | null = null;
+  let longestEnd: string | null = null;
   let run = 0;
-  for (const d of daily) {
+  let runStart: string | null = null;
+
+  for (let i = 0; i < daily.length; i++) {
+    const d = daily[i];
     if (d.work_mins > 0) {
+      if (run === 0) runStart = d.date;
       run++;
-      if (run > longest) longest = run;
+      if (run > longest) {
+        longest = run;
+        longestStart = runStart;
+        longestEnd = d.date;
+      }
     } else {
       run = 0;
+      runStart = null;
     }
   }
 
-  // Current streak: walk back from today (the last entry), counting consecutive studied days.
+  // Current streak: walk back from today or yesterday
+  const lastIndex = daily.findIndex((d) => d.date === today);
+  const endScanIdx = lastIndex !== -1 ? lastIndex : daily.length - 1;
+
+  const todayEntry = daily.find((d) => d.date === today);
+  const activeToday = Boolean(todayEntry && todayEntry.work_mins > 0);
+
   let current = 0;
-  for (let i = daily.length - 1; i >= 0; i--) {
-    if (daily[i].work_mins > 0) current++;
-    else break;
+  let currentStart: string | null = null;
+  let currentEnd: string | null = null;
+
+  let scanFrom = endScanIdx;
+  if (daily[endScanIdx]?.date === today && daily[endScanIdx]?.work_mins === 0) {
+    // Today has no study yet: streak is alive if yesterday was studied
+    scanFrom = endScanIdx - 1;
   }
 
-  const activeToday = daily.length > 0 && daily[daily.length - 1].date === today && daily[daily.length - 1].work_mins > 0;
-  return { current, longest, activeToday };
+  for (let i = scanFrom; i >= 0; i--) {
+    if (daily[i]?.work_mins > 0) {
+      if (current === 0) currentEnd = daily[i].date;
+      current++;
+      currentStart = daily[i].date;
+    } else {
+      break;
+    }
+  }
+
+  return {
+    current,
+    longest,
+    activeToday,
+    longestStartDate: longestStart,
+    longestEndDate: longestEnd,
+    currentStartDate: currentStart,
+    currentEndDate: currentEnd,
+  };
 }
 
 // ── Weekday rhythm (which days of the week are strongest?) ────────────────────
