@@ -290,17 +290,17 @@ export interface PerfTone {
   cellText: string;
 }
 
-// Under target — CALM VELVET CRIMSON / RUBY BOX. Rich deficit indicator without harsh eye strain.
+// Under target — PURE VIBRANT RED BOX. Striking, crisp, and high-contrast without muddy magenta/wine tint.
 const TONE_UNDER: PerfTone = {
   key: "under",
   label: "Below target",
-  solid: "#BE123C",
-  bar: "linear-gradient(to top, #881337, #BE123C)",
+  solid: "#EF4444",
+  bar: "linear-gradient(to top, #DC2626, #EF4444)",
   glow: null,
-  text: "text-rose-400",
-  chip: "border-rose-500/35 bg-rose-500/15 text-rose-300",
-  cellBg: "linear-gradient(180deg, #BE123C 0%, #9F1239 100%)",
-  cellBorder: "rgba(255,255,255,0.18)",
+  text: "text-red-400",
+  chip: "border-red-500/35 bg-red-500/15 text-red-300",
+  cellBg: "linear-gradient(180deg, #EF4444 0%, #DC2626 100%)",
+  cellBorder: "rgba(255,255,255,0.22)",
   cellGlow: null,
   cellText: "text-white font-semibold",
 };

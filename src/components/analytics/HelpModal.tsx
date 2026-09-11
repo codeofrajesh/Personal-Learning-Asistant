@@ -112,8 +112,8 @@ export default function HelpModal({ open, onClose }: Props) {
         </p>
         <div className="pt-1.5 space-y-1">
           <p className="flex items-center gap-2">
-            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#BE123C]" />
-            <span className="font-medium text-content-primary">Ruby Crimson:</span> Below target — logged study time under target; a clear visual cue to stay consistent.
+            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#EF4444]" />
+            <span className="font-medium text-content-primary">Pure Red:</span> Below target — logged study time under target; a clear visual cue to stay consistent.
           </p>
           <p className="flex items-center gap-2">
             <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#2563EB]" />

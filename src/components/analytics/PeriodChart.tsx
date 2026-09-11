@@ -299,7 +299,7 @@ function AxisRow({ labels }: { labels: string[] }) {
 /** The performance-color key (+ optional weekend / last-week / target markers). */
 function PerfLegend({ target, weekend = false, lastWeek = false }: { target: boolean; weekend?: boolean; lastWeek?: boolean }) {
   const items: { color: string; label: string }[] = [
-    { color: "#BE123C", label: "Below" },
+    { color: "#EF4444", label: "Below" },
     { color: "#2563EB", label: "Met" },
     { color: "#10B981", label: "Over" },
   ];

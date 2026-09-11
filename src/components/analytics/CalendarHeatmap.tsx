@@ -381,8 +381,8 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
             <span
               className="h-3 w-3 rounded-[4px] border border-white/20"
               style={{
-                background: "linear-gradient(180deg, #BE123C 0%, #9F1239 100%)",
-                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.2)",
+                background: "linear-gradient(180deg, #EF4444 0%, #DC2626 100%)",
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.25)",
               }}
               aria-hidden
             />

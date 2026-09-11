@@ -119,10 +119,10 @@ export default function StudyMeter({ collapsed }: Props) {
             glow: null as string | null,
           }
         : {
-            from: "#BE123C",
-            to: "#9F1239",
-            text: "text-rose-400",
-            ring: "border-rose-500/25",
+            from: "#EF4444",
+            to: "#DC2626",
+            text: "text-red-400",
+            ring: "border-red-500/25",
             glow: null as string | null,
           };
 
