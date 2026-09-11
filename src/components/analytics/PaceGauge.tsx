@@ -23,11 +23,17 @@ import { computePace, reconcileCaption, fmtHM, type PaceState } from "./analytic
 import { cn } from "../../lib/utils";
 
 interface Props {
-  meter: StudyMeter | null;
-  nowMins: number;
-  wakeMins: number;
-  hardStopMins: number;
-  targetMins: number | null;
+  meter?: StudyMeter | null;
+  nowMins?: number;
+  wakeMins?: number;
+  hardStopMins?: number;
+  targetMins?: number | null;
+  /** Historical / period modes */
+  mode?: "day" | "week" | "month";
+  isToday?: boolean;
+  periodLabel?: string;
+  studiedMins?: number;
+  goalMins?: number;
 }
 
 /** Gradient stops + accent per pace state using the unified color system:
@@ -37,8 +43,8 @@ interface Props {
  */
 const TONES: Record<PaceState, { from: string; to: string; text: string; glow: boolean; chip: string; label: string; Icon: typeof Target }> = {
   crushed: { from: "#F97316", to: "#EA580C", text: "text-orange-300", glow: false, chip: "border-orange-500/35 bg-orange-500/15 text-orange-300", label: "Crushed", Icon: Zap },
-  ahead: { from: "#2563EB", to: "#1D4ED8", text: "text-blue-300", glow: false, chip: "border-blue-500/35 bg-blue-500/15 text-blue-300", label: "Ahead", Icon: TrendingUp },
-  warning: { from: "#EF4444", to: "#DC2626", text: "text-red-300", glow: false, chip: "border-red-500/35 bg-red-500/12 text-red-300", label: "Behind pace", Icon: Clock },
+  ahead: { from: "#2563EB", to: "#1D4ED8", text: "text-blue-300", glow: false, chip: "border-blue-500/35 bg-blue-500/15 text-blue-300", label: "Target met", Icon: TrendingUp },
+  warning: { from: "#EF4444", to: "#DC2626", text: "text-red-300", glow: false, chip: "border-red-500/35 bg-red-500/12 text-red-300", label: "Below target", Icon: Clock },
   idle: { from: "#2563EB", to: "#1D4ED8", text: "text-blue-300", glow: false, chip: "border-blue-500/25 bg-blue-500/10 text-blue-300", label: "No target", Icon: Target },
 };
 
@@ -47,9 +53,21 @@ const R = 78;
 const CENTER = 100;
 const ARC_UNITS = 75; // 270° of the 100-unit pathLength
 
-export default function PaceGauge({ meter, nowMins, wakeMins, hardStopMins, targetMins }: Props) {
-  const pace = useMemo(() => {
-    if (!meter) return null;
+export default function PaceGauge({
+  meter,
+  nowMins = 720,
+  wakeMins = 360,
+  hardStopMins = 1320,
+  targetMins,
+  mode = "day",
+  isToday = true,
+  periodLabel,
+  studiedMins,
+  goalMins,
+}: Props) {
+  // Live mode calculation for today
+  const livePace = useMemo(() => {
+    if (!meter || !isToday) return null;
     return computePace({
       studiedMins: meter.studied_mins,
       goalMins: meter.goal_mins,
@@ -58,13 +76,12 @@ export default function PaceGauge({ meter, nowMins, wakeMins, hardStopMins, targ
       hardStopMins,
       goalSource: meter.goal_source,
     });
-  }, [meter, nowMins, wakeMins, hardStopMins]);
+  }, [meter, nowMins, wakeMins, hardStopMins, isToday]);
 
-  // Where the ambition target sits on the (plan-scaled) arc, when it differs from the goal.
+  // Ambition tick on live arc
   const tick = useMemo(() => {
-    if (!meter || !targetMins || targetMins === meter.goal_mins) return null;
+    if (!isToday || !meter || !targetMins || targetMins === meter.goal_mins) return null;
     const frac = Math.max(0, Math.min(1, targetMins / Math.max(1, meter.goal_mins)));
-    // Arc starts at 135° (after the rotate) and sweeps 270° clockwise.
     const deg = 135 + frac * 270;
     const rad = (deg * Math.PI) / 180;
     const inner = R - 9;
@@ -75,19 +92,56 @@ export default function PaceGauge({ meter, nowMins, wakeMins, hardStopMins, targ
       x2: CENTER + outer * Math.cos(rad),
       y2: CENTER + outer * Math.sin(rad),
     };
-  }, [meter, targetMins]);
+  }, [meter, targetMins, isToday]);
 
-  if (!meter || !pace) {
-    return (
-      <div className="grid min-h-[220px] place-items-center rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-5 backdrop-blur-xl">
-        <span className="text-sm text-white/30">Loading pace…</span>
-      </div>
-    );
-  }
+  // Resolve whether to use live or historical period data
+  const isLive = isToday && meter && livePace;
 
-  const tone = TONES[pace.state];
-  const progress = (pace.fill * ARC_UNITS).toFixed(3);
-  const caption = reconcileCaption(meter.goal_source, meter.goal_mins, targetMins);
+  const resolvedStudied = isLive ? meter.studied_mins : (studiedMins ?? 0);
+  const resolvedGoal = isLive ? meter.goal_mins : (goalMins ?? (targetMins ?? 120));
+  const resolvedPct = isLive
+    ? livePace.pct
+    : resolvedGoal > 0
+      ? Math.round((resolvedStudied / resolvedGoal) * 100)
+      : 0;
+  const resolvedFill = isLive
+    ? livePace.fill
+    : resolvedGoal > 0
+      ? Math.min(1, resolvedStudied / resolvedGoal)
+      : 0;
+
+  const resolvedState: PaceState = isLive
+    ? livePace.state
+    : resolvedPct >= 110
+      ? "crushed"
+      : resolvedPct >= 100
+        ? "ahead"
+        : resolvedGoal === 0
+          ? "idle"
+          : "warning";
+
+  const tone = TONES[resolvedState];
+  const progress = (resolvedFill * ARC_UNITS).toFixed(3);
+
+  const titleText = periodLabel
+    ? `Target pace · ${periodLabel}`
+    : isToday
+      ? "Target pace · today"
+      : `Target pace · ${mode}`;
+
+  const messageText = isLive
+    ? livePace.message
+    : mode === "day"
+      ? resolvedStudied >= resolvedGoal
+        ? `Goal reached · ${fmtHM(resolvedStudied - resolvedGoal)} above target`
+        : `Ended at ${fmtHM(resolvedStudied)} · ${fmtHM(resolvedGoal - resolvedStudied)} short of target`
+      : mode === "week"
+        ? `${fmtHM(resolvedStudied)} studied of ${fmtHM(resolvedGoal)} weekly ambition (${resolvedPct}%)`
+        : `${fmtHM(resolvedStudied)} studied of ${fmtHM(resolvedGoal)} monthly ambition (${resolvedPct}%)`;
+
+  const captionText = isLive
+    ? reconcileCaption(meter.goal_source, meter.goal_mins, targetMins ?? null)
+    : `Target: ${fmtHM(resolvedGoal)} · Final study: ${fmtHM(resolvedStudied)}`;
 
   return (
     <div
@@ -97,7 +151,7 @@ export default function PaceGauge({ meter, nowMins, wakeMins, hardStopMins, targ
       <div className="mb-1 flex items-center justify-between">
         <span className="flex items-center gap-1.5 text-[0.62rem] font-medium uppercase tracking-wide text-white/40">
           <Target size={13} strokeWidth={2.25} className="shrink-0 text-lime" aria-hidden />
-          Target pace · today
+          {titleText}
         </span>
         <span className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.62rem] font-semibold", tone.chip)}>
           <tone.Icon size={11} strokeWidth={2.5} aria-hidden />
@@ -106,7 +160,7 @@ export default function PaceGauge({ meter, nowMins, wakeMins, hardStopMins, targ
       </div>
 
       <div className="relative mx-auto w-full max-w-[240px]">
-        <svg viewBox="0 0 200 200" className="w-full" role="img" aria-label={`${pace.pct}% of today's goal`}>
+        <svg viewBox="0 0 200 200" className="w-full" role="img" aria-label={`${resolvedPct}% of goal`}>
           <defs>
             <linearGradient id="paceArc" x1="0%" y1="0%" x2="100%" y2="100%">
               <stop offset="0%" stopColor={tone.from} />
@@ -161,19 +215,19 @@ export default function PaceGauge({ meter, nowMins, wakeMins, hardStopMins, targ
         <div className="pointer-events-none absolute inset-0 grid place-items-center">
           <div className="text-center">
             <div className={cn("text-3xl font-bold leading-none tabular-nums", tone.text)}>
-              {pace.pct}%
+              {resolvedPct}%
             </div>
             <div className="mt-1 text-[0.72rem] tabular-nums text-white/45">
-              {fmtHM(meter.studied_mins)} / {fmtHM(meter.goal_mins)}
+              {fmtHM(resolvedStudied)} / {fmtHM(resolvedGoal)}
             </div>
           </div>
         </div>
       </div>
 
       <p className={cn("mt-2 text-center text-[0.78rem] font-medium leading-snug", tone.text)}>
-        {pace.message}
+        {messageText}
       </p>
-      <p className="mt-1 text-center text-[0.66rem] leading-snug text-white/35">{caption}</p>
+      <p className="mt-1 text-center text-[0.66rem] leading-snug text-white/35">{captionText}</p>
     </div>
   );
 }

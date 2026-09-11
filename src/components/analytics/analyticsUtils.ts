@@ -383,6 +383,55 @@ export function goldenWindowFromHourly(hourly: number[]): GoldenWindow | null {
   return goldenWindow(hours);
 }
 
+/** Chronotype buckets (Morning/Afternoon/Evening/Night) from a 24-slot hourly array. */
+export function chronotypeFromHourly(hourly: number[]): { buckets: ChronoBucket[]; total: number } {
+  const hours = hourly.map((total_mins, hour) => ({ hour, total_mins, days: 1 }));
+  return chronotype(hours);
+}
+
+/** Parse retention days setting string ("90", "180", "365", ""/null). */
+export function parseRetentionDays(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Earliest allowed date given today and retentionDays (null = keep forever). */
+export function retentionEarliestDate(today: string, retentionDays: number | null): string | null {
+  if (retentionDays == null) return null;
+  return dayOffset(today, -retentionDays);
+}
+
+/** Slice in-memory daily studies for a given granularity + index step (DST-safe). */
+export function slicePeriodDays(
+  daily: DayStudy[],
+  gran: Granularity,
+  index: number,
+  today: string,
+): { cur: DayStudy[]; prev: DayStudy[]; label: string; sub: string } {
+  const pCur = comparePeriod(gran, index, today);
+  const pPrev = comparePeriod(gran, index - 1, today);
+
+  const byDate = new Map(daily.map((d) => [d.date, d]));
+  const getRange = (start: string, end: string): DayStudy[] => {
+    const list: DayStudy[] = [];
+    const sDate = parseLocalDay(start);
+    const eDate = parseLocalDay(end);
+    for (let d = new Date(sDate); d <= eDate; d.setDate(d.getDate() + 1)) {
+      const ds = localDay(d);
+      list.push(byDate.get(ds) ?? { date: ds, work_mins: 0 });
+    }
+    return list;
+  };
+
+  return {
+    cur: getRange(pCur.start, pCur.end),
+    prev: getRange(pPrev.start, pPrev.end),
+    label: pCur.label,
+    sub: pCur.sub,
+  };
+}
+
 /** Seconds → `"2h 43m"` / `"54m"`. */
 export function fmtHMFromSecs(secs: number): string {
   return fmtHM(secs / 60);

@@ -16,7 +16,9 @@ import { fmtHMFromSecs, daysMetTarget } from "./analyticsUtils";
 import { cn } from "../../lib/utils";
 
 interface Props {
-  daily: DayStudy[];
+  daily?: DayStudy[];
+  periodDays?: DayStudy[];
+  periodLabel?: string;
   focusSessions: number;
   avgSessionSecs: number;
   longestSessionSecs: number;
@@ -25,30 +27,48 @@ interface Props {
 
 const PANEL = "flex h-full flex-col gap-3 rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-4 backdrop-blur-xl";
 
-export default function FocusQualityBento({ daily, focusSessions, avgSessionSecs, longestSessionSecs, targetMins }: Props) {
-  const last30 = daily.slice(Math.max(0, daily.length - 30));
-  const totalDays = last30.length || 30;
-  const met = daysMetTarget(last30, targetMins ?? 0);
+export default function FocusQualityBento({
+  daily = [],
+  periodDays,
+  periodLabel,
+  focusSessions,
+  avgSessionSecs,
+  longestSessionSecs,
+  targetMins,
+}: Props) {
+  const activeDays = periodDays ?? daily.slice(Math.max(0, daily.length - 30));
+  const totalDays = activeDays.length || 1;
+  const met = daysMetTarget(activeDays, targetMins ?? 0);
   const pct = totalDays > 0 ? Math.round((met / totalDays) * 100) : 0;
+
+  const titleText = periodLabel ? `Focus quality · ${periodLabel}` : "Focus quality · 30 days";
+  const isSingleDay = activeDays.length === 1;
 
   return (
     <div className={PANEL} style={{ boxShadow: "inset 0 1px 1px rgba(255,255,255,0.05)" }}>
-      <div className="text-[0.62rem] font-medium uppercase tracking-wide text-white/40">Focus quality · 30 days</div>
+      <div className="text-[0.62rem] font-medium uppercase tracking-wide text-white/40">{titleText}</div>
 
       {/* Target met ratio */}
       <div className="rounded-[14px] border border-white/[0.05] bg-white/[0.02] p-3">
         <div className="flex items-center gap-1.5 text-[0.66rem] text-white/45">
           <Target size={12} strokeWidth={2.25} className="text-[#38BDF8]" aria-hidden />
-          Days on target
+          {isSingleDay ? "Day target status" : "Days on target"}
         </div>
         <div className="mt-1 flex items-baseline gap-1.5">
-          <span className="text-xl font-bold tabular-nums text-content-primary">{met}</span>
-          <span className="text-[0.72rem] text-white/35">/ {totalDays} days · {pct}%</span>
+          <span className="text-xl font-bold tabular-nums text-content-primary">
+            {isSingleDay ? (met > 0 ? "Target met" : "Below target") : met}
+          </span>
+          {!isSingleDay && (
+            <span className="text-[0.72rem] text-white/35">/ {totalDays} days · {pct}%</span>
+          )}
         </div>
         <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
           <div
             className="h-full rounded-full transition-[width] duration-500"
-            style={{ width: `${pct}%`, background: "linear-gradient(90deg, #0e7490, #00D2FF)" }}
+            style={{
+              width: `${isSingleDay ? (met > 0 ? 100 : 35) : pct}%`,
+              background: met > 0 ? "linear-gradient(90deg, #0e7490, #00D2FF)" : "rgba(239, 68, 68, 0.5)",
+            }}
           />
         </div>
       </div>

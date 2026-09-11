@@ -20,9 +20,13 @@ import {
 import { cn } from "../../lib/utils";
 
 interface Props {
-  /** The full 60-day series (oldest first). */
-  daily: DayStudy[];
-  /** Sessionized focus-quality stats over the last 30 days (from the backend payload). */
+  /** The daily series for the active period, or fallback 60-day series. */
+  daily?: DayStudy[];
+  periodDays?: DayStudy[];
+  prevDays?: DayStudy[];
+  periodLabel?: string;
+  subLabel?: string;
+  /** Sessionized focus-quality stats for the period. */
   focusSessions: number;
   avgSessionSecs: number;
 }
@@ -90,30 +94,40 @@ function Card({
   );
 }
 
-export default function KpiCards({ daily, focusSessions, avgSessionSecs }: Props) {
+export default function KpiCards({
+  daily = [],
+  periodDays,
+  prevDays,
+  periodLabel,
+  subLabel,
+  focusSessions,
+  avgSessionSecs,
+}: Props) {
+  // Use explicit period slice if provided; otherwise fallback to last 30 vs prior 30.
   const n = daily.length;
-  const last30 = daily.slice(Math.max(0, n - 30));
-  const prev30 = daily.slice(Math.max(0, n - 60), Math.max(0, n - 30));
+  const curSlice = periodDays ?? daily.slice(Math.max(0, n - 30));
+  const prevSlice = prevDays ?? daily.slice(Math.max(0, n - 60), Math.max(0, n - 30));
 
-  const totalCur = sumMins(last30);
-  const totalPrev = sumMins(prev30);
+  const totalCur = sumMins(curSlice);
+  const totalPrev = sumMins(prevSlice);
   const totalDelta = delta(totalCur, totalPrev);
 
-  const avgPerDay = last30.length ? totalCur / last30.length : 0;
-  const avgDelta = delta(
-    avgPerDay,
-    prev30.length ? totalPrev / prev30.length : 0,
-  );
+  const avgPerDay = curSlice.length ? totalCur / curSlice.length : 0;
+  const avgPrev = prevSlice.length ? totalPrev / prevSlice.length : 0;
+  const avgDelta = delta(avgPerDay, avgPrev);
 
-  const peak = peakDay(last30);
+  const peak = peakDay(curSlice);
+
+  const label = periodLabel ?? "Total · 30 days";
+  const vsSub = subLabel ?? "vs previous period";
 
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Card
         icon={Clock}
-        label="Total · 30 days"
+        label={label}
         value={totalCur > 0 ? fmtHM(totalCur) : "0h"}
-        sub="vs the previous 30 days"
+        sub={vsSub}
         chip={<DeltaChip d={totalDelta} />}
         tone="lime"
       />

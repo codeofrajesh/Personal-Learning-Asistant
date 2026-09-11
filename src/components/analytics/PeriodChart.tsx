@@ -12,7 +12,7 @@
  */
 
 import type { DayStudy } from "../../lib/types";
-import { useScheduleClock } from "../../lib/scheduleClock";
+import { useScheduleClock, dayOffset } from "../../lib/scheduleClock";
 import { currentTier } from "../../lib/perfStore";
 import {
   fmtHM,
@@ -32,9 +32,16 @@ export type Period = "day" | "week" | "month";
 
 interface Props {
   daily: DayStudy[];
-  hourlyToday: number[];
+  hourlyToday?: number[];
   period: Period;
   targetMins: number | null;
+  /** Active period selections for dynamic navigation */
+  selectedDate?: string;
+  selectedHourly?: number[];
+  selectedWeekDays?: DayStudy[];
+  prevWeekDays?: DayStudy[];
+  selectedMonthDays?: DayStudy[];
+  periodLabel?: string;
 }
 
 const PANEL = "flex h-full flex-col justify-between rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-5 backdrop-blur-xl";
@@ -45,14 +52,47 @@ function barGlow(color: string | null): string | undefined {
   return `0 0 10px -1px ${color}`;
 }
 
-export default function PeriodChart({ daily, hourlyToday, period, targetMins }: Props) {
+export default function PeriodChart({
+  daily,
+  hourlyToday,
+  period,
+  targetMins,
+  selectedDate,
+  selectedHourly,
+  selectedWeekDays,
+  prevWeekDays,
+  selectedMonthDays,
+  periodLabel,
+}: Props) {
   const target = targetMins ?? 0;
   return (
     <div className={PANEL}>
       <div className="flex-1">
-        {period === "day" && <DayChart daily={daily} hourlyToday={hourlyToday} target={target} />}
-        {period === "week" && <WeekChart daily={daily} target={target} />}
-        {period === "month" && <MonthChart daily={daily} target={target} />}
+        {period === "day" && (
+          <DayChart
+            daily={daily}
+            hourlyToday={selectedHourly ?? hourlyToday ?? []}
+            selectedDate={selectedDate}
+            target={target}
+          />
+        )}
+        {period === "week" && (
+          <WeekChart
+            daily={daily}
+            selectedWeekDays={selectedWeekDays}
+            prevWeekDays={prevWeekDays}
+            weekLabel={periodLabel}
+            target={target}
+          />
+        )}
+        {period === "month" && (
+          <MonthChart
+            daily={daily}
+            selectedMonthDays={selectedMonthDays}
+            monthLabel={periodLabel}
+            target={target}
+          />
+        )}
       </div>
 
       {/* Derived study insights placed inside the card below the chart */}
@@ -65,17 +105,28 @@ export default function PeriodChart({ daily, hourlyToday, period, targetMins }: 
 
 // ── Month ─────────────────────────────────────────────────────────────────────
 
-function MonthChart({ daily, target }: { daily: DayStudy[]; target: number }) {
-  const days = daily.slice(Math.max(0, daily.length - 30));
+function MonthChart({
+  daily,
+  selectedMonthDays,
+  monthLabel,
+  target,
+}: {
+  daily: DayStudy[];
+  selectedMonthDays?: DayStudy[];
+  monthLabel?: string;
+  target: number;
+}) {
+  const days = selectedMonthDays ?? daily.slice(Math.max(0, daily.length - 30));
   const peak = peakDay(days);
   const total = sumMins(days);
   const scaleMax = Math.max(1, ...days.map((d) => d.work_mins), target);
   const targetPct = target > 0 ? Math.min(100, (target / scaleMax) * 100) : null;
+  const title = monthLabel ?? "Last 30 days";
 
   return (
     <div className="flex h-full flex-col">
       <ChartHeader
-        title="Last 30 days"
+        title={title}
         primary={fmtHM(total)}
         note={peak ? `Peak ${fmtHM(peak.work_mins)} · ${fmtDateShort(peak.date)}` : "No study logged yet"}
       />
@@ -126,19 +177,32 @@ function monthAxis(days: DayStudy[]): string[] {
 
 // ── Week ──────────────────────────────────────────────────────────────────────
 
-function WeekChart({ daily, target }: { daily: DayStudy[]; target: number }) {
+function WeekChart({
+  daily,
+  selectedWeekDays,
+  prevWeekDays,
+  weekLabel,
+  target,
+}: {
+  daily: DayStudy[];
+  selectedWeekDays?: DayStudy[];
+  prevWeekDays?: DayStudy[];
+  weekLabel?: string;
+  target: number;
+}) {
   const n = daily.length;
-  const thisWeek = daily.slice(Math.max(0, n - 7));
-  const lastWeek = daily.slice(Math.max(0, n - 14), Math.max(0, n - 7));
+  const thisWeek = selectedWeekDays ?? daily.slice(Math.max(0, n - 7));
+  const lastWeek = prevWeekDays ?? daily.slice(Math.max(0, n - 14), Math.max(0, n - 7));
   const thisTotal = sumMins(thisWeek);
   const lastTotal = sumMins(lastWeek);
   const d = delta(thisTotal, lastTotal);
   const scaleMax = Math.max(1, ...thisWeek.map((x) => x.work_mins), ...lastWeek.map((x) => x.work_mins), target);
+  const title = weekLabel ? `Week: ${weekLabel}` : "This week vs last";
 
   return (
     <div className="flex h-full flex-col">
       <ChartHeader
-        title="This week vs last"
+        title={title}
         primary={fmtHM(thisTotal)}
         note={
           d.isNew
@@ -183,14 +247,31 @@ function WeekChart({ daily, target }: { daily: DayStudy[]; target: number }) {
 
 // ── Day ─────────────────────────────────────────────────────────────────────
 
-function DayChart({ daily, hourlyToday, target }: { daily: DayStudy[]; hourlyToday: number[]; target: number }) {
+function DayChart({
+  daily,
+  hourlyToday,
+  selectedDate,
+  target,
+}: {
+  daily: DayStudy[];
+  hourlyToday: number[];
+  selectedDate?: string;
+  target: number;
+}) {
+  const clockDay = useScheduleClock((s) => s.day);
   const nowMins = useScheduleClock((s) => s.minutes);
   const currentHour = Math.floor(nowMins / 60);
-  const n = daily.length;
-  const today = daily[n - 1];
-  const yesterday = daily[n - 2];
-  const todayMins = today?.work_mins ?? 0;
-  const yMins = yesterday?.work_mins ?? 0;
+
+  const activeDay = selectedDate ?? clockDay;
+  const isToday = activeDay === clockDay;
+
+  const byDate = new Map(daily.map((d) => [d.date, d]));
+  const today = byDate.get(activeDay) ?? { date: activeDay, work_mins: 0 };
+  const prevDate = dayOffset(activeDay, -1);
+  const yesterday = byDate.get(prevDate) ?? { date: prevDate, work_mins: 0 };
+
+  const todayMins = today.work_mins;
+  const yMins = yesterday.work_mins;
   const d = delta(todayMins, yMins);
   const tone = performanceTone(todayMins, target);
   const hours = hourlyToday.length === 24 ? hourlyToday : new Array(24).fill(0);
@@ -200,22 +281,26 @@ function DayChart({ daily, hourlyToday, target }: { daily: DayStudy[]; hourlyTod
     <div className="flex h-full flex-col">
       <div className="grid grid-cols-2 gap-3">
         <div className={cn("rounded-[14px] border p-3", tone.chip)}>
-          <div className="text-[0.6rem] font-medium uppercase tracking-wide opacity-70">Today</div>
+          <div className="text-[0.6rem] font-medium uppercase tracking-wide opacity-70">
+            {isToday ? "Today" : fmtDateShort(activeDay)}
+          </div>
           <div className={cn("mt-1 text-2xl font-bold tabular-nums", tone.text)}>{fmtHM(todayMins)}</div>
           <div className="mt-0.5 text-[0.66rem] opacity-80">{tone.label}</div>
         </div>
         <div className="rounded-[14px] border border-white/[0.06] bg-white/[0.02] p-3">
-          <div className="text-[0.6rem] font-medium uppercase tracking-wide text-white/40">Yesterday</div>
+          <div className="text-[0.6rem] font-medium uppercase tracking-wide text-white/40">
+            {isToday ? "Yesterday" : fmtDateShort(prevDate)}
+          </div>
           <div className="mt-1 text-2xl font-bold tabular-nums text-content-secondary">{fmtHM(yMins)}</div>
           <div className="mt-0.5 text-[0.66rem] text-white/35">
-            {d.isNew ? "your first day" : d.pct == null ? "—" : `${d.up ? "+" : ""}${d.pct}% today`}
+            {d.isNew ? "your first day" : d.pct == null ? "—" : `${d.up ? "+" : ""}${d.pct}% vs prior day`}
           </div>
         </div>
       </div>
 
       <div className="mt-5">
         <div className="mb-2 text-[0.62rem] font-medium uppercase tracking-wide text-white/40">
-          When you studied today
+          {isToday ? "When you studied today" : `When you studied on ${fmtDateShort(activeDay)}`}
         </div>
         <div className="flex h-28 items-end gap-[2px]">
           {hours.map((mins, h) => {

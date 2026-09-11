@@ -23,6 +23,10 @@ import { cn } from "../../lib/utils";
 interface Props {
   daily: DayStudy[];
   targetMins: number | null;
+  periodDays?: DayStudy[];
+  periodMode?: "day" | "week" | "month";
+  periodLabel?: string;
+  totalDaysInPeriod?: number;
 }
 
 const W = 100;
@@ -47,7 +51,14 @@ function smoothPath(pts: { x: number; y: number }[]): string {
   return d;
 }
 
-export default function CumulativeVelocity({ daily, targetMins }: Props) {
+export default function CumulativeVelocity({
+  daily,
+  targetMins,
+  periodDays,
+  periodMode = "month",
+  periodLabel,
+  totalDaysInPeriod,
+}: Props) {
   const lineRef = useRef<SVGPathElement>(null);
   const today = useScheduleClock((s) => s.day);
   const target = targetMins && targetMins > 0 ? targetMins : DEFAULT_TARGET_MINS;
@@ -56,10 +67,14 @@ export default function CumulativeVelocity({ daily, targetMins }: Props) {
   const base = parseLocalDay(today);
   const daysInMonth = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
   const firstOfMonth = `${today.slice(0, 7)}-01`;
-  const monthDays = daily.filter((d) => d.date >= firstOfMonth && d.date <= today);
-  const points = cumulative(monthDays, target);
+
+  // Use periodDays if provided, else fallback to current month up to today
+  const activeDays = periodDays ?? daily.filter((d) => d.date >= firstOfMonth && d.date <= today);
+  const points = cumulative(activeDays, target);
   const n = points.length;
   const daysElapsed = Math.max(1, n);
+
+  const spanDays = totalDaysInPeriod ?? (periodMode === "week" ? 7 : (periodMode === "month" ? (periodDays?.length ?? daysInMonth) : daysInMonth));
 
   const actualTotal = n ? points[n - 1].cum : 0;
   const expectedToday = target * daysElapsed;
@@ -75,12 +90,16 @@ export default function CumulativeVelocity({ daily, targetMins }: Props) {
 
   const ahead = actualTotal >= expectedToday;
   const paceMins = actualTotal / daysElapsed;
-  const projected = paceMins * daysInMonth;
-  const monthlyTarget = target * daysInMonth;
-  const progressPct = Math.max(0, Math.min(100, Math.round((actualTotal / Math.max(1, monthlyTarget)) * 100)));
+  const projected = paceMins * spanDays;
+  const periodTarget = target * spanDays;
+  const progressPct = Math.max(0, Math.min(100, Math.round((actualTotal / Math.max(1, periodTarget)) * 100)));
   const catchUp = Math.max(0, target * (daysElapsed + 1) - actualTotal);
   const best = bestWeek(daily);
   const stroke = ahead ? "#34D399" : "#38BDF8";
+
+  const titleText = periodLabel
+    ? `Study velocity · ${periodLabel}`
+    : "Study velocity · this month";
 
   const coach = ahead
     ? `Pacing at ${fmtHM(paceMins)}/day · ${fmtHM(actualTotal - expectedToday)} ahead of your target pace.`
@@ -91,22 +110,16 @@ export default function CumulativeVelocity({ daily, targetMins }: Props) {
   // Glowing anchor dots on days with study, positioned as HTML % overlay so they stay round
   // (an SVG <circle> would distort under preserveAspectRatio="none").
   const dots = points
-    .map((p, i) => (monthDays[i].work_mins > 0 ? { xPct: x(i), yPct: (y(p.cum) / H) * 100 } : null))
+    .map((p, i) => (activeDays[i]?.work_mins > 0 ? { xPct: x(i), yPct: (y(p.cum) / H) * 100 } : null))
     .filter((d): d is { xPct: number; yPct: number } => d !== null);
 
   const ticks = [1, 5, 10, 15, 20, 25, daysElapsed].filter((d, i, a) => d <= daysElapsed && a.indexOf(d) === i);
 
   useLayoutEffect(() => {
     const path = lineRef.current;
-    if (!path) return;
-    if (currentTier() !== "high" || !motionAllowed()) {
-      path.style.strokeDashoffset = "0";
-      return;
-    }
-    const ctx = gsap.context(() => {
-      gsap.fromTo(path, { strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 1.1, ease: "power2.out" });
-    });
-    return () => ctx.revert();
+    if (!path || !motionAllowed() || currentTier() !== "high") return;
+    const len = path.getTotalLength();
+    gsap.fromTo(path, { strokeDasharray: len, strokeDashoffset: len }, { strokeDashoffset: 0, duration: 1, ease: "power2.out" });
   }, [linePath]);
 
   return (
@@ -115,7 +128,7 @@ export default function CumulativeVelocity({ daily, targetMins }: Props) {
         <div>
           <div className="flex items-center gap-1.5 text-[0.62rem] font-medium uppercase tracking-wide text-white/40">
             <TrendingUp size={13} strokeWidth={2.25} className="text-lime" aria-hidden />
-            Study velocity · this month
+            {titleText}
           </div>
           <div className="mt-0.5 text-2xl font-bold tabular-nums text-content-primary">{fmtHM(actualTotal)}</div>
         </div>
@@ -137,7 +150,7 @@ export default function CumulativeVelocity({ daily, targetMins }: Props) {
         </Badge>
         <Badge icon={Target} tint="text-[#38BDF8]">
           <div className="text-[0.62rem] tabular-nums text-white/50">
-            {fmtHM(actualTotal)} / {fmtHM(monthlyTarget)} · {progressPct}%
+            {fmtHM(actualTotal)} / {fmtHM(periodTarget)} · {progressPct}%
           </div>
           <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
             <div

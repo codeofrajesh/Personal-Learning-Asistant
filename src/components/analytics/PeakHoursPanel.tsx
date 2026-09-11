@@ -9,8 +9,20 @@
 
 import { Sparkles, Sunrise, Sun, Sunset, Moon } from "lucide-react";
 import { usePeakHours } from "../planning/usePeakHours";
-import { chronotype, goldenWindow, fmtHour12, fmtHM } from "./analyticsUtils";
+import {
+  chronotype,
+  goldenWindow,
+  goldenWindowFromHourly,
+  chronotypeFromHourly,
+  fmtHour12,
+  fmtHM,
+} from "./analyticsUtils";
 import { cn } from "../../lib/utils";
+
+interface Props {
+  hourly?: number[];
+  periodLabel?: string;
+}
 
 const PANEL = "h-full rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-5 backdrop-blur-xl";
 
@@ -21,16 +33,36 @@ const CHRONO_ICON: Record<string, typeof Sun> = {
   night: Moon,
 };
 
-export default function PeakHoursPanel() {
-  const { hours, confident, totalMins, loaded } = usePeakHours(60);
-  const golden = goldenWindow(hours);
-  const { buckets } = chronotype(hours);
+export default function PeakHoursPanel({ hourly, periodLabel }: Props) {
+  const hookData = usePeakHours(60);
+
+  // If period-specific hourly distribution is provided and has data, use it.
+  const hasPeriodHourly = hourly && hourly.length === 24 && hourly.some((m) => m > 0);
+
+  const golden = hasPeriodHourly
+    ? goldenWindowFromHourly(hourly)
+    : goldenWindow(hookData.hours);
+
+  const { buckets } = hasPeriodHourly
+    ? chronotypeFromHourly(hourly)
+    : chronotype(hookData.hours);
+
+  const totalMins = hasPeriodHourly
+    ? hourly.reduce((a, b) => a + b, 0)
+    : hookData.totalMins;
+
+  const confident = hasPeriodHourly ? totalMins > 0 : hookData.confident;
+  const loaded = hasPeriodHourly ? true : hookData.loaded;
+
+  const titleText = periodLabel
+    ? `Peak focus hours · ${periodLabel}`
+    : "Peak focus hours · 60 days";
 
   return (
     <div className={PANEL} style={{ boxShadow: "inset 0 1px 1px rgba(255,255,255,0.05)" }}>
       <div className="mb-3 flex items-center gap-1.5 text-[0.62rem] font-medium uppercase tracking-wide text-white/40">
         <Sparkles size={13} strokeWidth={2.25} className="shrink-0 text-lime" aria-hidden />
-        Peak focus hours · 60 days
+        {titleText}
       </div>
 
       {!confident ? (

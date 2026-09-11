@@ -16,7 +16,12 @@ import { ipc, isTauri } from "../../lib/ipc";
 import { useScheduleClock, hhmmToMins } from "../../lib/scheduleClock";
 import { usePlanRevision, bumpPlanRevision } from "../../lib/planRevision";
 import { localUtcOffsetMins } from "../planning/usePeakHours";
-import { SETTING_DAILY_GOAL } from "./analyticsUtils";
+import {
+  SETTING_DAILY_GOAL,
+  SETTING_RETENTION_DAYS,
+  parseRetentionDays,
+  retentionEarliestDate,
+} from "./analyticsUtils";
 import type { StudyAnalytics, StudyRange } from "../../lib/types";
 
 /** The rolling window we fetch: 366 days covers a full calendar year for the 12-month
@@ -174,3 +179,40 @@ export function useStudyRange(
 
   return { data, loaded };
 }
+
+/**
+ * The student's data retention setting (`study.retention_days`).
+ * Returns retentionDays (e.g. 90, 180, 365, or null for keep-forever) and earliestDate.
+ */
+export function useRetentionSetting(): {
+  retentionDays: number | null;
+  earliestDate: string | null;
+  loaded: boolean;
+} {
+  const [retentionDays, setRetentionDays] = useState<number | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const today = useScheduleClock((s) => s.day);
+
+  useEffect(() => {
+    if (!isTauri()) {
+      setLoaded(true);
+      return;
+    }
+    let alive = true;
+    void ipc
+      .getSetting(SETTING_RETENTION_DAYS)
+      .then((v) => {
+        if (!alive) return;
+        setRetentionDays(parseRetentionDays(v));
+        setLoaded(true);
+      })
+      .catch(() => alive && setLoaded(true));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const earliestDate = retentionEarliestDate(today, retentionDays);
+  return { retentionDays, earliestDate, loaded };
+}
+

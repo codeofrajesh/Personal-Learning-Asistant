@@ -26,6 +26,7 @@ import { useScheduleClock } from "../../lib/scheduleClock";
 import { motionAllowed } from "../../lib/perfStore";
 import { ipc, isTauri } from "../../lib/ipc";
 import { localUtcOffsetMins } from "../planning/usePeakHours";
+import { useRetentionSetting } from "./useStudyAnalytics";
 import {
   performanceTone,
   fmtDateShort,
@@ -41,14 +42,30 @@ interface Props {
   daily: DayStudy[];
   targetMins: number | null;
   onPickDay?: (date: string) => void;
+  onSelectDay?: (date: string) => void;
   selectedDays?: string[];
+  activeDate?: string;
 }
 
 const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"];
 
-export default function CalendarHeatmap({ daily, targetMins, onPickDay, selectedDays }: Props) {
+function windowEndDate(year: number, winIdx: number): string {
+  if (winIdx === 0) return `${year}-04-30`;
+  if (winIdx === 1) return `${year}-08-31`;
+  return `${year}-12-31`;
+}
+
+export default function CalendarHeatmap({
+  daily,
+  targetMins,
+  onPickDay,
+  onSelectDay,
+  selectedDays,
+  activeDate,
+}: Props) {
   const today = useScheduleClock((s) => s.day);
   const target = targetMins ?? 0;
+  const { earliestDate } = useRetentionSetting();
 
   const baseDate = parseLocalDay(today);
   const currentYear = baseDate.getFullYear();
@@ -89,17 +106,24 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
   const gridRef = useRef<HTMLDivElement>(null);
   const months = useMemo(() => calendarMonthsOfWindow(selectedYear, windowIndex), [selectedYear, windowIndex]);
 
-  // Year choices: browsable up to 4 years back
-  const years = useMemo(() => Array.from({ length: 4 }, (_, i) => currentYear - i), [currentYear]);
+  // Year choices: bounded by data retention setting
+  const earliestYear = earliestDate ? parseLocalDay(earliestDate).getFullYear() : currentYear - 3;
+  const minYear = Math.max(currentYear - 3, earliestYear);
+  const years = useMemo(() => {
+    const count = Math.max(1, currentYear - minYear + 1);
+    return Array.from({ length: Math.min(4, count) }, (_, i) => currentYear - i);
+  }, [currentYear, minYear]);
 
-  // Prev / Next limits
-  const cannotGoPrev = selectedYear <= currentYear - 3 && windowIndex === 0;
+  // Prev / Next limits (account for data retention)
+  const cannotGoPrev =
+    (selectedYear <= minYear && windowIndex === 0) ||
+    (earliestDate != null && windowEndDate(selectedYear, windowIndex) <= earliestDate);
   const cannotGoNext = selectedYear === currentYear && windowIndex >= currentWindowIndex;
 
   function goPrev() {
     if (windowIndex > 0) {
       setWindowIndex(windowIndex - 1);
-    } else if (selectedYear > currentYear - 3) {
+    } else if (selectedYear > minYear) {
       setSelectedYear(selectedYear - 1);
       setWindowIndex(2); // Go to Sep–Dec of previous year
     }
@@ -307,6 +331,7 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                   const isToday = date === today;
                   const isFuture = date > today;
                   const selected = selectedDays?.includes(date) ?? false;
+                  const isActive = activeDate === date;
 
                   // Future day: completely hollow dashed stencil, unmistakably distinct from rest days
                   if (isFuture) {
@@ -328,15 +353,19 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                       <button
                         key={date}
                         type="button"
-                        onClick={() => onPickDay?.(date)}
-                        disabled={!onPickDay}
+                        onClick={() => {
+                          onSelectDay?.(date);
+                          onPickDay?.(date);
+                        }}
+                        disabled={!onPickDay && !onSelectDay}
                         title={`${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · ${tone.label}`}
                         className={cn(
                           "relative grid aspect-square place-items-center rounded-[7px] text-[0.66rem] font-semibold tabular-nums transition-transform duration-150 active:scale-95",
                           tone.cellText,
-                          onPickDay && "hover:scale-[1.08] hover:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60",
+                          (onPickDay || onSelectDay) && "hover:scale-[1.08] hover:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60",
                           selected && "ring-2 ring-white/90 ring-offset-1 ring-offset-[#0d0d12]",
-                          isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12]",
+                          isActive && "ring-2 ring-lime ring-offset-2 ring-offset-[#0d0d12]",
+                          !isActive && isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12]",
                         )}
                         style={{
                           backgroundColor: tone.cellBg,
@@ -352,14 +381,18 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                     <button
                       key={date}
                       type="button"
-                      onClick={() => onPickDay?.(date)}
-                      disabled={!onPickDay}
+                      onClick={() => {
+                        onSelectDay?.(date);
+                        onPickDay?.(date);
+                      }}
+                      disabled={!onPickDay && !onSelectDay}
                       title={`${fmtDateShort(date)} · Rest day`}
                       className={cn(
                         "grid aspect-square place-items-center rounded-[7px] bg-[#181820] text-[0.62rem] font-medium text-white/35 tabular-nums transition-colors duration-150",
-                        onPickDay && "hover:bg-[#23232c] hover:text-white/70 active:scale-95",
+                        (onPickDay || onSelectDay) && "hover:bg-[#23232c] hover:text-white/70 active:scale-95",
                         selected && "ring-2 ring-white/80 ring-offset-1 ring-offset-[#0d0d12]",
-                        isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12] text-white font-semibold",
+                        isActive && "ring-2 ring-lime ring-offset-2 ring-offset-[#0d0d12]",
+                        !isActive && isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12] text-white font-semibold",
                       )}
                     >
                       {dom}

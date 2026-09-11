@@ -13,9 +13,21 @@
  * CSS/SVG — no canvas, no chart library, no polling — so it stays light behind the 60fps player.
  */
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState, useMemo } from "react";
 import { gsap } from "gsap";
-import { Activity, CalendarClock, CalendarRange, CalendarDays, Columns2, Target, Settings2, Info } from "lucide-react";
+import {
+  Activity,
+  CalendarClock,
+  CalendarRange,
+  CalendarDays,
+  Columns2,
+  Target,
+  Settings2,
+  Info,
+  ChevronLeft,
+  ChevronRight,
+  RotateCcw,
+} from "lucide-react";
 import Breadcrumb from "../components/layout/Breadcrumb";
 import KpiCards from "../components/analytics/KpiCards";
 import PaceGauge from "../components/analytics/PaceGauge";
@@ -28,10 +40,24 @@ import CompareView from "../components/analytics/CompareView";
 import TargetSettings from "../components/analytics/TargetSettings";
 import DataPrivacySheet from "../components/analytics/DataPrivacySheet";
 import HelpModal from "../components/analytics/HelpModal";
-import { useStudyAnalytics, useTargetSetting, useDayWindow } from "../components/analytics/useStudyAnalytics";
-import { parseLocalDay, type Granularity } from "../components/analytics/analyticsUtils";
+import PeriodPicker from "../components/analytics/PeriodPicker";
+import {
+  useStudyAnalytics,
+  useTargetSetting,
+  useDayWindow,
+  useRetentionSetting,
+  useStudyRange,
+} from "../components/analytics/useStudyAnalytics";
+import {
+  parseLocalDay,
+  comparePeriod,
+  slicePeriodDays,
+  monthOffset,
+  sumMins,
+  type Granularity,
+} from "../components/analytics/analyticsUtils";
 import { useStudyMeter } from "../components/layout/useStudyMeter";
-import { useScheduleClock } from "../lib/scheduleClock";
+import { useScheduleClock, dayOffset } from "../lib/scheduleClock";
 import { motionAllowed } from "../lib/perfStore";
 import { cn } from "../lib/utils";
 
@@ -50,11 +76,19 @@ function dayIndex(date: string, today: string): number {
 }
 
 export default function AnalyticsHub() {
-  const [view, setView] = useState<ViewMode>("month");
+  // Default to Day view so arrival shows Current Month overview + Today's detailed stats
+  const [view, setView] = useState<ViewMode>("day");
   const [targetOpen, setTargetOpen] = useState(false);
   const [dataOpen, setDataOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  // Compare-mode state, owned here so the heatmap can seed a Day-vs-Day comparison.
+  const [periodPickerOpen, setPeriodPickerOpen] = useState(false);
+
+  // Period navigation offsets (0 = current, negative = past)
+  const [dayIdx, setDayIdx] = useState(0);
+  const [weekIdx, setWeekIdx] = useState(0);
+  const [monthIdx, setMonthIdx] = useState(0);
+
+  // Compare-mode state
   const [gran, setGran] = useState<Granularity>("month");
   const [idxA, setIdxA] = useState(-1);
   const [idxB, setIdxB] = useState(0);
@@ -67,9 +101,68 @@ export default function AnalyticsHub() {
   const dayWindow = useDayWindow();
   const nowMins = useScheduleClock((s) => s.minutes);
   const today = useScheduleClock((s) => s.day);
+  const { earliestDate } = useRetentionSetting();
 
   const daily = data?.daily ?? [];
   const hourly = data?.hourly_today ?? [];
+  const byDate = useMemo(() => new Map(daily.map((d) => [d.date, d])), [daily]);
+
+  // Current granularity and index for period navigation
+  const currentGran: Granularity = view === "week" ? "week" : view === "month" ? "month" : "day";
+  const currentIdx = view === "week" ? weekIdx : view === "month" ? monthIdx : dayIdx;
+
+  // Resolve active period
+  const activePeriod = useMemo(
+    () => comparePeriod(currentGran, currentIdx, today),
+    [currentGran, currentIdx, today],
+  );
+
+  // Retention boundary checks for steppers
+  const canStepBack = useMemo(() => {
+    if (!earliestDate) return true;
+    if (view === "day") {
+      const prevDate = dayOffset(today, dayIdx - 1);
+      return prevDate >= earliestDate;
+    }
+    if (view === "week") {
+      const prevWeekEnd = comparePeriod("week", weekIdx - 1, today).end;
+      return prevWeekEnd >= earliestDate;
+    }
+    if (view === "month") {
+      const prevMonthEnd = comparePeriod("month", monthIdx - 1, today).end;
+      return prevMonthEnd >= earliestDate;
+    }
+    return true;
+  }, [earliestDate, view, dayIdx, weekIdx, monthIdx, today]);
+
+  const canStepForward = currentIdx < 0;
+  const isBrowsingPast = currentIdx < 0;
+
+  function stepPeriod(delta: number) {
+    if (view === "day") setDayIdx((i) => Math.min(0, i + delta));
+    else if (view === "week") setWeekIdx((i) => Math.min(0, i + delta));
+    else if (view === "month") setMonthIdx((i) => Math.min(0, i + delta));
+  }
+
+  function resetPeriod() {
+    if (view === "day") setDayIdx(0);
+    else if (view === "week") setWeekIdx(0);
+    else if (view === "month") setMonthIdx(0);
+  }
+
+  // Fetch range data on demand for historical days/weeks/months
+  const historicalDayRange = useStudyRange(
+    view === "day" && dayIdx < 0 ? activePeriod.start : null,
+    view === "day" && dayIdx < 0 ? activePeriod.end : null,
+  );
+  const weekRange = useStudyRange(
+    view === "week" ? activePeriod.start : null,
+    view === "week" ? activePeriod.end : null,
+  );
+  const monthRange = useStudyRange(
+    view === "month" && monthIdx < 0 ? activePeriod.start : null,
+    view === "month" && monthIdx < 0 ? activePeriod.end : null,
+  );
 
   // Heatmap click → accumulate two days, then kick off a Day-vs-Day compare.
   function onPickDay(date: string) {
@@ -89,9 +182,7 @@ export default function AnalyticsHub() {
     });
   }
 
-  // Tiered entrance: stagger the panels once data settles. `motionAllowed()` is false on lite and
-  // under reduced-motion, so those render final-state instantly. Re-runs on view switch so the
-  // freshly-shown panels animate in too.
+  // Tiered entrance: stagger the panels once data settles.
   useLayoutEffect(() => {
     if (!loaded || !motionAllowed()) return;
     const ctx = gsap.context(() => {
@@ -103,12 +194,172 @@ export default function AnalyticsHub() {
     return () => ctx.revert();
   }, [loaded, view]);
 
+  // Derive dynamic slices for Top KPI row and lower cards based on current mode
+  const {
+    kpiTitle,
+    kpiSub,
+    kpiDays,
+    kpiPrevDays,
+    kpiSessions,
+    kpiAvgSecs,
+    chartHourly,
+    selectedWeekDays,
+    prevWeekDays,
+    selectedMonthDays,
+    paceStudiedMins,
+    paceGoalMins,
+    velocityDays,
+    velocityMode,
+    velocityTotalDays,
+    focusQualityDays,
+    focusSessionsCount,
+    focusAvgSecs,
+    focusLongestSecs,
+  } = useMemo(() => {
+    const dailyTarget = target.targetMins ?? 120;
+
+    if (view === "day") {
+      const isToday = dayIdx === 0;
+      const selDate = activePeriod.start;
+      const selDateObj = parseLocalDay(selDate);
+      const mOffset = monthOffset(selDateObj.getFullYear(), selDateObj.getMonth(), today);
+      const monthSlice = slicePeriodDays(daily, "month", mOffset, today);
+
+      // Top row shows the month containing this day
+      const kpiTitle = isToday ? "Total · This Month" : `Total · ${monthSlice.label}`;
+      const kpiSub = "vs the previous month";
+      const kpiDays = monthSlice.cur;
+      const kpiPrevDays = monthSlice.prev;
+
+      // When today, use overall month sessions; when past day, use range sessions
+      const kpiSessions = isToday ? (data?.focus_sessions ?? 0) : (historicalDayRange.data?.focus_sessions ?? 0);
+      const kpiAvgSecs = isToday ? (data?.avg_session_secs ?? 0) : (historicalDayRange.data?.avg_session_secs ?? 0);
+
+      // Hourly data for the 24-hour graph
+      const chartHourly = isToday ? hourly : (historicalDayRange.data?.hourly ?? []);
+
+      // Day study minutes for the pace gauge
+      const dayStudied = isToday
+        ? (meter?.studied_mins ?? (daily[daily.length - 1]?.work_mins ?? 0))
+        : (historicalDayRange.data?.daily?.[0]?.work_mins ?? (byDate.get(selDate)?.work_mins ?? 0));
+
+      // Study velocity up to this selected day
+      const velocityDays = monthSlice.cur.filter((d) => d.date <= selDate);
+
+      // Focus quality for this single day
+      const focusQualityDays = isToday
+        ? [daily[daily.length - 1] ?? { date: today, work_mins: meter?.studied_mins ?? 0 }]
+        : (historicalDayRange.data?.daily ?? [{ date: selDate, work_mins: dayStudied }]);
+
+      return {
+        kpiTitle,
+        kpiSub,
+        kpiDays,
+        kpiPrevDays,
+        kpiSessions,
+        kpiAvgSecs,
+        chartHourly,
+        selectedWeekDays: undefined,
+        prevWeekDays: undefined,
+        selectedMonthDays: undefined,
+        paceStudiedMins: dayStudied,
+        paceGoalMins: dailyTarget,
+        velocityDays,
+        velocityMode: "month" as const,
+        velocityTotalDays: monthSlice.cur.length,
+        focusQualityDays,
+        focusSessionsCount: isToday ? (data?.focus_sessions ?? 0) : (historicalDayRange.data?.focus_sessions ?? 0),
+        focusAvgSecs: isToday ? (data?.avg_session_secs ?? 0) : (historicalDayRange.data?.avg_session_secs ?? 0),
+        focusLongestSecs: isToday ? (data?.longest_session_secs ?? 0) : (historicalDayRange.data?.longest_session_secs ?? 0),
+      };
+    }
+
+    if (view === "week") {
+      const weekSlice = slicePeriodDays(daily, "week", weekIdx, today);
+      const weekStudied = sumMins(weekSlice.cur);
+      const weekGoal = dailyTarget * 7;
+
+      const sessions = weekRange.data?.focus_sessions ?? 0;
+      const avgSecs = weekRange.data?.avg_session_secs ?? 0;
+      const longestSecs = weekRange.data?.longest_session_secs ?? 0;
+
+      return {
+        kpiTitle: `Total · ${activePeriod.label}`,
+        kpiSub: "vs the previous week",
+        kpiDays: weekSlice.cur,
+        kpiPrevDays: weekSlice.prev,
+        kpiSessions: sessions,
+        kpiAvgSecs: avgSecs,
+        chartHourly: weekRange.data?.hourly ?? [],
+        selectedWeekDays: weekSlice.cur,
+        prevWeekDays: weekSlice.prev,
+        selectedMonthDays: undefined,
+        paceStudiedMins: weekStudied,
+        paceGoalMins: weekGoal,
+        velocityDays: weekSlice.cur,
+        velocityMode: "week" as const,
+        velocityTotalDays: 7,
+        focusQualityDays: weekSlice.cur,
+        focusSessionsCount: sessions,
+        focusAvgSecs: avgSecs,
+        focusLongestSecs: longestSecs,
+      };
+    }
+
+    // view === "month"
+    const monthSlice = slicePeriodDays(daily, "month", monthIdx, today);
+    const monthStudied = sumMins(monthSlice.cur);
+    const monthGoal = dailyTarget * monthSlice.cur.length;
+
+    const sessions = monthIdx === 0 ? (data?.focus_sessions ?? 0) : (monthRange.data?.focus_sessions ?? 0);
+    const avgSecs = monthIdx === 0 ? (data?.avg_session_secs ?? 0) : (monthRange.data?.avg_session_secs ?? 0);
+    const longestSecs = monthIdx === 0 ? (data?.longest_session_secs ?? 0) : (monthRange.data?.longest_session_secs ?? 0);
+
+    return {
+      kpiTitle: `Total · ${activePeriod.label}`,
+      kpiSub: "vs the previous month",
+      kpiDays: monthSlice.cur,
+      kpiPrevDays: monthSlice.prev,
+      kpiSessions: sessions,
+      kpiAvgSecs: avgSecs,
+      chartHourly: monthIdx === 0 ? [] : (monthRange.data?.hourly ?? []),
+      selectedWeekDays: undefined,
+      prevWeekDays: undefined,
+      selectedMonthDays: monthSlice.cur,
+      paceStudiedMins: monthStudied,
+      paceGoalMins: monthGoal,
+      velocityDays: monthSlice.cur,
+      velocityMode: "month" as const,
+      velocityTotalDays: monthSlice.cur.length,
+      focusQualityDays: monthSlice.cur,
+      focusSessionsCount: sessions,
+      focusAvgSecs: avgSecs,
+      focusLongestSecs: longestSecs,
+    };
+  }, [
+    view,
+    dayIdx,
+    weekIdx,
+    monthIdx,
+    activePeriod,
+    today,
+    daily,
+    hourly,
+    meter,
+    data,
+    target.targetMins,
+    historicalDayRange.data,
+    weekRange.data,
+    monthRange.data,
+    byDate,
+  ]);
+
   return (
     <div className="min-h-full p-6 lg:p-8">
       <div ref={rootRef} className="w-full max-w-none px-4 lg:px-10">
         <Breadcrumb items={[{ label: "Analytics" }]} />
 
-        <header className="mb-6 mt-3 flex flex-wrap items-end justify-between gap-4">
+        <header className="mb-4 mt-3 flex flex-wrap items-end justify-between gap-4">
           <div>
             <h1 className="flex items-center gap-2 font-display text-2xl font-bold text-content-primary lg:text-3xl">
               <Activity size={26} strokeWidth={2.25} className="text-lime" aria-hidden />
@@ -169,6 +420,58 @@ export default function AnalyticsHub() {
           </div>
         </header>
 
+        {/* Period Navigation Stepper Bar (for Day, Week, Month modes) */}
+        {view !== "compare" && (
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-[16px] border border-white/[0.06] bg-white/[0.02] px-4 py-2.5 backdrop-blur-xl">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => stepPeriod(-1)}
+                disabled={!canStepBack}
+                aria-label="Previous period"
+                title={canStepBack ? "Previous period" : "Data retention limit reached"}
+                className="grid h-8 w-8 place-items-center rounded-full border border-white/[0.08] bg-white/[0.02] text-content-secondary transition-colors hover:bg-white/[0.06] hover:text-content-primary disabled:opacity-25"
+              >
+                <ChevronLeft size={16} strokeWidth={2} aria-hidden />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setPeriodPickerOpen(true)}
+                title="Click to pick a specific date or period"
+                className="flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.04] px-3.5 py-1.5 text-sm font-medium text-content-primary transition-colors hover:border-lime/30 hover:bg-white/[0.08]"
+              >
+                <CalendarDays size={15} strokeWidth={2} className="text-lime" aria-hidden />
+                <span>{activePeriod.label}</span>
+                <span className="text-[0.7rem] text-white/40">({activePeriod.sub})</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => stepPeriod(1)}
+                disabled={!canStepForward}
+                aria-label="Next period"
+                title="Next period"
+                className="grid h-8 w-8 place-items-center rounded-full border border-white/[0.08] bg-white/[0.02] text-content-secondary transition-colors hover:bg-white/[0.06] hover:text-content-primary disabled:opacity-25"
+              >
+                <ChevronRight size={16} strokeWidth={2} aria-hidden />
+              </button>
+            </div>
+
+            {/* Jump to current button when surfing the past */}
+            {isBrowsingPast && (
+              <button
+                type="button"
+                onClick={resetPeriod}
+                className="flex items-center gap-1.5 rounded-full border border-lime/30 bg-lime/10 px-3 py-1 text-xs font-semibold text-lime transition-colors hover:bg-lime/20"
+              >
+                <RotateCcw size={12} strokeWidth={2.25} aria-hidden />
+                {view === "day" ? "Jump to Today" : view === "week" ? "This Week" : "This Month"}
+              </button>
+            )}
+          </div>
+        )}
+
         {view === "compare" ? (
           <div className="analytics-panel">
             <CompareView
@@ -183,60 +486,114 @@ export default function AnalyticsHub() {
           </div>
         ) : (
           <>
-            {/* KPI overview */}
+            {/* Dynamic KPI Overview */}
             <div className="analytics-panel">
               <KpiCards
                 daily={daily}
-                focusSessions={data?.focus_sessions ?? 0}
-                avgSessionSecs={data?.avg_session_secs ?? 0}
+                periodDays={kpiDays}
+                prevDays={kpiPrevDays}
+                periodLabel={kpiTitle}
+                subLabel={kpiSub}
+                focusSessions={kpiSessions}
+                avgSessionSecs={kpiAvgSecs}
               />
             </div>
 
-            {/* Chart + pace/peak */}
+            {/* Dynamic Chart + Pace/Peak */}
             <div className="mt-4 grid items-stretch gap-4 lg:grid-cols-3">
               <div className="analytics-panel lg:col-span-2">
-                <PeriodChart daily={daily} hourlyToday={hourly} period={view} targetMins={target.targetMins} />
+                <PeriodChart
+                  daily={daily}
+                  hourlyToday={hourly}
+                  period={view}
+                  targetMins={target.targetMins}
+                  selectedDate={view === "day" ? activePeriod.start : undefined}
+                  selectedHourly={chartHourly}
+                  selectedWeekDays={selectedWeekDays}
+                  prevWeekDays={prevWeekDays}
+                  selectedMonthDays={selectedMonthDays}
+                  periodLabel={activePeriod.label}
+                />
               </div>
               <div className="flex h-full flex-col gap-4">
                 <div className="analytics-panel flex-1">
                   <PaceGauge
-                    meter={meter}
+                    meter={view === "day" && dayIdx === 0 ? meter : null}
                     nowMins={nowMins}
                     wakeMins={dayWindow.wakeMins}
                     hardStopMins={dayWindow.hardStopMins}
                     targetMins={target.targetMins}
+                    mode={view === "week" ? "week" : view === "month" ? "month" : "day"}
+                    isToday={view === "day" && dayIdx === 0}
+                    periodLabel={activePeriod.label}
+                    studiedMins={paceStudiedMins}
+                    goalMins={paceGoalMins}
                   />
                 </div>
                 <div className="analytics-panel flex-1">
-                  <PeakHoursPanel />
+                  <PeakHoursPanel
+                    hourly={chartHourly}
+                    periodLabel={activePeriod.label}
+                  />
                 </div>
               </div>
             </div>
 
-
-            {/* Tier 3: study velocity (wide) + focus quality */}
+            {/* Tier 3: Study velocity (wide) + Focus quality */}
             <div className="mt-4 grid items-stretch gap-4 lg:grid-cols-3">
               <div className="analytics-panel h-full lg:col-span-2">
-                <CumulativeVelocity daily={daily} targetMins={target.targetMins} />
+                <CumulativeVelocity
+                  daily={daily}
+                  targetMins={target.targetMins}
+                  periodDays={velocityDays}
+                  periodMode={velocityMode}
+                  periodLabel={activePeriod.label}
+                  totalDaysInPeriod={velocityTotalDays}
+                />
               </div>
               <div className="analytics-panel h-full">
                 <FocusQualityBento
                   daily={daily}
-                  focusSessions={data?.focus_sessions ?? 0}
-                  avgSessionSecs={data?.avg_session_secs ?? 0}
-                  longestSessionSecs={data?.longest_session_secs ?? 0}
+                  periodDays={focusQualityDays}
+                  periodLabel={activePeriod.label}
+                  focusSessions={focusSessionsCount}
+                  avgSessionSecs={focusAvgSecs}
+                  longestSessionSecs={focusLongestSecs}
                   targetMins={target.targetMins}
                 />
               </div>
             </div>
 
-            {/* Tier 4: multi-month consistency tracker (full width) */}
+            {/* Tier 4: Multi-month consistency tracker with single-click Day inspect */}
             <div className="analytics-panel mt-4">
-              <CalendarHeatmap daily={daily} targetMins={target.targetMins} onPickDay={onPickDay} selectedDays={picks} />
+              <CalendarHeatmap
+                daily={daily}
+                targetMins={target.targetMins}
+                onPickDay={onPickDay}
+                onSelectDay={(date) => {
+                  setView("day");
+                  setDayIdx(dayIndex(date, today));
+                }}
+                selectedDays={picks}
+                activeDate={view === "day" ? activePeriod.start : undefined}
+              />
             </div>
           </>
         )}
       </div>
+
+      <PeriodPicker
+        open={periodPickerOpen}
+        onClose={() => setPeriodPickerOpen(false)}
+        gran={currentGran}
+        today={today}
+        currentIndex={currentIdx}
+        onSelect={(idx) => {
+          if (view === "day") setDayIdx(idx);
+          else if (view === "week") setWeekIdx(idx);
+          else if (view === "month") setMonthIdx(idx);
+        }}
+      />
 
       <TargetSettings open={targetOpen} onClose={() => setTargetOpen(false)} targetMins={target.targetMins} onSave={target.save} />
       <DataPrivacySheet open={dataOpen} onClose={() => setDataOpen(false)} />
