@@ -36,6 +36,7 @@ interface Props {
   studiedMins?: number;
   goalMins?: number;
   streakDays?: number;
+  restDays?: number;
 }
 
 /** Gradient stops + accent per pace state using the unified color system:
@@ -67,6 +68,7 @@ export default function PaceGauge({
   studiedMins,
   goalMins,
   streakDays,
+  restDays,
 }: Props) {
   // Live mode calculation for today
   const livePace = useMemo(() => {
@@ -158,7 +160,7 @@ export default function PaceGauge({
         </span>
         <div className="flex items-center gap-2">
           {streakDays != null && streakDays > 0 && (
-            <StreakBadge streak={streakDays} variant="pace" />
+            <StreakBadge streak={streakDays} restDays={restDays} variant="pace" />
           )}
           <span className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.62rem] font-semibold", tone.chip)}>
             <tone.Icon size={11} strokeWidth={2.5} aria-hidden />

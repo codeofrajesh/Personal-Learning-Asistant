@@ -670,12 +670,18 @@ export function calendarWindowLabel(months: MonthGrid[]): string {
 // ── Study streaks ──────────────────────────────────────────────────────────────
 
 export interface StudyStreaks {
-  /** Current consecutive days (from today going back) where the student studied > 0 mins. */
+  /** Current consecutive active study days (from today going back). */
   current: number;
   /** Longest-ever consecutive-day streak in the data. */
   longest: number;
   /** Whether today counts (the student has studied today). */
   activeToday: boolean;
+  /** Whether today is marked as a Rest Day. */
+  isRestToday: boolean;
+  /** Number of rest days taken inside the active streak. */
+  restDaysInStreak: number;
+  /** List of rest day dates (YYYY-MM-DD) inside the active streak. */
+  restDatesInStreak: string[];
   /** Date when the longest streak started (YYYY-MM-DD). */
   longestStartDate: string | null;
   /** Date when the longest streak ended (YYYY-MM-DD). */
@@ -686,13 +692,24 @@ export interface StudyStreaks {
   currentEndDate: string | null;
 }
 
-/** Count current and longest streaks from the daily array (must be OLDEST-first, contiguous). */
-export function studyStreaks(daily: DayStudy[], today: string): StudyStreaks {
+/**
+ * Count current and longest streaks from the daily array (must be OLDEST-first, contiguous).
+ * Supports student Rest Days (Path B relaxation engine): rest days bridge the consecutive
+ * run without penalty, preserving the streak while keeping study stats honest.
+ */
+export function studyStreaks(
+  daily: DayStudy[],
+  today: string,
+  restDays: Set<string> = new Set()
+): StudyStreaks {
   if (!daily.length) {
     return {
       current: 0,
       longest: 0,
       activeToday: false,
+      isRestToday: restDays.has(today),
+      restDaysInStreak: 0,
+      restDatesInStreak: [],
       longestStartDate: null,
       longestEndDate: null,
       currentStartDate: null,
@@ -708,7 +725,8 @@ export function studyStreaks(daily: DayStudy[], today: string): StudyStreaks {
 
   for (let i = 0; i < daily.length; i++) {
     const d = daily[i];
-    if (d.work_mins > 0) {
+    const isRest = restDays.has(d.date);
+    if (d.work_mins > 0 || isRest) {
       if (run === 0) runStart = d.date;
       run++;
       if (run > longest) {
@@ -728,31 +746,52 @@ export function studyStreaks(daily: DayStudy[], today: string): StudyStreaks {
 
   const todayEntry = daily.find((d) => d.date === today);
   const activeToday = Boolean(todayEntry && todayEntry.work_mins > 0);
+  const isRestToday = restDays.has(today);
 
   let current = 0;
   let currentStart: string | null = null;
   let currentEnd: string | null = null;
+  const restDatesInStreak: string[] = [];
 
   let scanFrom = endScanIdx;
-  if (daily[endScanIdx]?.date === today && daily[endScanIdx]?.work_mins === 0) {
-    // Today has no study yet: streak is alive if yesterday was studied
+  if (
+    daily[endScanIdx]?.date === today &&
+    daily[endScanIdx]?.work_mins === 0 &&
+    !isRestToday
+  ) {
+    // Today has no study yet and is not marked as rest:
+    // streak is alive if yesterday was studied or marked rest
     scanFrom = endScanIdx - 1;
   }
 
   for (let i = scanFrom; i >= 0; i--) {
-    if (daily[i]?.work_mins > 0) {
-      if (current === 0) currentEnd = daily[i].date;
+    const entry = daily[i];
+    if (!entry) continue;
+    const isRest = restDays.has(entry.date);
+    const hasStudy = entry.work_mins > 0;
+
+    if (hasStudy) {
+      if (current === 0 && restDatesInStreak.length === 0) currentEnd = entry.date;
       current++;
-      currentStart = daily[i].date;
+      currentStart = entry.date;
+    } else if (isRest) {
+      // Rest day: bridges the streak without breaking!
+      if (current === 0 && restDatesInStreak.length === 0) currentEnd = entry.date;
+      restDatesInStreak.push(entry.date);
+      currentStart = entry.date;
     } else {
+      // 0 study and not a rest day: STRICT BREAK!
       break;
     }
   }
 
   return {
     current,
-    longest,
+    longest: Math.max(longest, current),
     activeToday,
+    isRestToday,
+    restDaysInStreak: restDatesInStreak.length,
+    restDatesInStreak,
     longestStartDate: longestStart,
     longestEndDate: longestEnd,
     currentStartDate: currentStart,

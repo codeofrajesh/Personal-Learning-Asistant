@@ -42,7 +42,7 @@ import DataPrivacySheet from "../components/analytics/DataPrivacySheet";
 import HelpModal from "../components/analytics/HelpModal";
 import PeriodPicker from "../components/analytics/PeriodPicker";
 import StreakBadge from "../components/analytics/StreakBadge";
-import { useCurrentStreak } from "../components/analytics/useCurrentStreak";
+import { useRestDayStore } from "../lib/restDayStore";
 import {
   useStudyAnalytics,
   useTargetSetting,
@@ -110,10 +110,11 @@ export default function AnalyticsHub() {
   const hourly = data?.hourly_today ?? [];
   const byDate = useMemo(() => new Map(daily.map((d) => [d.date, d])), [daily]);
 
-  // Compute active consistency streak across ambient sources + daily history
-  const ambientStreak = useCurrentStreak();
-  const streaks = useMemo(() => studyStreaks(daily, today), [daily, today]);
-  const effectiveStreak = Math.max(ambientStreak, streaks.current);
+  // Compute active study streak with Rest Day preservation (Path B relaxation engine)
+  const restDaysMap = useRestDayStore((s) => s.restDays);
+  const restDaysSet = useMemo(() => new Set(Object.keys(restDaysMap)), [restDaysMap]);
+  const streaks = useMemo(() => studyStreaks(daily, today, restDaysSet), [daily, today, restDaysSet]);
+  const effectiveStreak = streaks.current;
 
   // Current granularity and index for period navigation
   const currentGran: Granularity = view === "week" ? "week" : view === "month" ? "month" : "day";
@@ -474,7 +475,12 @@ export default function AnalyticsHub() {
 
               {/* Streak Badge right of date, month or week selected (hidden if streak <= 0) */}
               {effectiveStreak > 0 && (
-                <StreakBadge streak={effectiveStreak} variant="header" className="ml-1" />
+                <StreakBadge
+                  streak={effectiveStreak}
+                  restDays={streaks.restDaysInStreak}
+                  variant="header"
+                  className="ml-1"
+                />
               )}
             </div>
 
@@ -549,6 +555,7 @@ export default function AnalyticsHub() {
                     studiedMins={paceStudiedMins}
                     goalMins={paceGoalMins}
                     streakDays={effectiveStreak}
+                    restDays={streaks.restDaysInStreak}
                   />
                 </div>
                 <div className="analytics-panel flex-1">
@@ -599,6 +606,8 @@ export default function AnalyticsHub() {
                 selectedDays={picks}
                 activeDate={view === "day" ? activePeriod.start : undefined}
                 streakDays={effectiveStreak}
+                restDays={streaks.restDaysInStreak}
+                restDaysSet={restDaysSet}
               />
             </div>
           </>

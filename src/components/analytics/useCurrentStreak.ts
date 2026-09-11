@@ -1,66 +1,69 @@
 /**
  * useCurrentStreak — ambient hook that computes the active consecutive study streak count.
  *
- * Checks:
- *   1. ipc.streakStatus(day) — official streak (with earned bad days bridged)
- *   2. ipc.dashboardData()   — active_days array
- *   3. ipc.studyAnalytics()  — consecutive active study days from daily log
+ * Grounded in real study watch time (Path B):
+ *   - Each consecutive active study day increments the streak count.
+ *   - Any day with 0 study time that is NOT marked as a Rest Day breaks the streak to 0.
+ *   - Marked Rest Days (fever, illness, busy schedules) bridge the streak without penalty.
  *
- * Returns the maximum valid streak number so whichever system logged consistency is respected.
- * Returns 0 if there is no active streak.
+ * Exports:
+ *   - `useCurrentStreak()`: returns the raw streak number (0 if broken).
+ *   - `useStreakDetails()`: returns full streak stats including rest days taken inside the run.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
-import { useScheduleClock, localDay } from "../../lib/scheduleClock";
+import { useScheduleClock } from "../../lib/scheduleClock";
 import { usePlanRevision } from "../../lib/planRevision";
 import { localUtcOffsetMins } from "../planning/usePeakHours";
 import { studyStreaks } from "./analyticsUtils";
+import { useRestDayStore } from "../../lib/restDayStore";
 
-function calcActiveDaysStreak(activeDays: string[]): number {
-  if (!activeDays || activeDays.length === 0) return 0;
-  const active = new Set(activeDays);
-  const cursor = new Date();
-  if (!active.has(localDay(cursor))) cursor.setDate(cursor.getDate() - 1);
-  let streak = 0;
-  while (active.has(localDay(cursor))) {
-    streak += 1;
-    cursor.setDate(cursor.getDate() - 1);
-  }
-  return streak;
+export interface StreakDetails {
+  streak: number;
+  restDaysInStreak: number;
+  restDatesInStreak: string[];
+  isRestToday: boolean;
+  activeToday: boolean;
+  startDate: string | null;
+  endDate: string | null;
 }
 
-export function useCurrentStreak(): number {
+const DEFAULT_DETAILS: StreakDetails = {
+  streak: 0,
+  restDaysInStreak: 0,
+  restDatesInStreak: [],
+  isRestToday: false,
+  activeToday: false,
+  startDate: null,
+  endDate: null,
+};
+
+export function useStreakDetails(): StreakDetails {
   const day = useScheduleClock((s) => s.day);
   const revision = usePlanRevision((s) => s.revision);
-  const [streak, setStreak] = useState(0);
+  const restDaysMap = useRestDayStore((s) => s.restDays);
+  const [details, setDetails] = useState<StreakDetails>(DEFAULT_DETAILS);
+
+  const restDaysSet = useMemo(() => new Set(Object.keys(restDaysMap)), [restDaysMap]);
 
   useEffect(() => {
     if (!isTauri()) return;
     let alive = true;
 
-    Promise.allSettled([
-      ipc.streakStatus(day),
-      ipc.dashboardData(),
-      ipc.studyAnalytics(day, localUtcOffsetMins(), 60),
-    ])
-      .then(([streakRes, dashRes, analyticsRes]) => {
-        if (!alive) return;
-        let maxStreak = 0;
-
-        if (streakRes.status === "fulfilled" && streakRes.value?.streak) {
-          maxStreak = Math.max(maxStreak, streakRes.value.streak);
-        }
-        if (dashRes.status === "fulfilled" && dashRes.value?.active_days) {
-          const dStreak = calcActiveDaysStreak(dashRes.value.active_days);
-          maxStreak = Math.max(maxStreak, dStreak);
-        }
-        if (analyticsRes.status === "fulfilled" && analyticsRes.value?.daily) {
-          const st = studyStreaks(analyticsRes.value.daily, day);
-          maxStreak = Math.max(maxStreak, st.current);
-        }
-
-        setStreak(maxStreak);
+    ipc.studyAnalytics(day, localUtcOffsetMins(), 60)
+      .then((analytics) => {
+        if (!alive || !analytics?.daily) return;
+        const st = studyStreaks(analytics.daily, day, restDaysSet);
+        setDetails({
+          streak: st.current,
+          restDaysInStreak: st.restDaysInStreak,
+          restDatesInStreak: st.restDatesInStreak,
+          isRestToday: st.isRestToday,
+          activeToday: st.activeToday,
+          startDate: st.currentStartDate,
+          endDate: st.currentEndDate,
+        });
       })
       .catch(() => {
         /* silently ignore */
@@ -69,7 +72,11 @@ export function useCurrentStreak(): number {
     return () => {
       alive = false;
     };
-  }, [day, revision]);
+  }, [day, revision, restDaysSet]);
 
-  return streak;
+  return details;
+}
+
+export function useCurrentStreak(): number {
+  return useStreakDetails().streak;
 }

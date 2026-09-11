@@ -27,6 +27,7 @@ export type StreakBadgeVariant = "header" | "pace" | "calendar" | "sidebar";
 
 interface Props {
   streak: number;
+  restDays?: number;
   variant?: StreakBadgeVariant;
   collapsed?: boolean;
   className?: string;
@@ -34,6 +35,7 @@ interface Props {
 
 export default function StreakBadge({
   streak,
+  restDays = 0,
   variant = "header",
   collapsed = false,
   className,
@@ -183,7 +185,7 @@ export default function StreakBadge({
     return (
       <div
         ref={rootRef}
-        title={`${streak} consecutive study days streak`}
+        title={`${streak} consecutive study days${restDays > 0 ? ` (${restDays} rest ${restDays === 1 ? "day" : "days"} taken)` : ""}`}
         className={cn(
           "inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-transparent px-2.5 py-1 text-[0.68rem] shadow-[0_0_10px_rgba(245,158,11,0.2)] backdrop-blur-sm transition-transform hover:scale-105",
           className,
@@ -194,6 +196,11 @@ export default function StreakBadge({
         </div>
         <span className="font-black tabular-nums text-amber-300">{streak}d</span>
         <span className="font-semibold text-amber-200/90">streak</span>
+        {restDays > 0 && (
+          <span className="ml-0.5 rounded bg-indigo-500/25 px-1 py-0.2 text-[9px] font-bold text-indigo-300 border border-indigo-500/30">
+            {restDays}r
+          </span>
+        )}
       </div>
     );
   }
@@ -203,7 +210,7 @@ export default function StreakBadge({
     return (
       <div
         ref={rootRef}
-        title={`${streak} consecutive study days consistency`}
+        title={`${streak} consecutive study days${restDays > 0 ? ` (${restDays} rest ${restDays === 1 ? "day" : "days"} taken)` : ""}`}
         className={cn(
           "inline-flex items-center gap-2 rounded-full border border-amber-500/35 bg-gradient-to-r from-amber-500/20 via-orange-500/15 to-amber-500/5 px-3 py-1 text-[0.72rem] shadow-[0_0_14px_rgba(245,158,11,0.25)] backdrop-blur-md transition-all hover:border-amber-500/50 hover:scale-105",
           className,
@@ -218,6 +225,11 @@ export default function StreakBadge({
         <span className="font-semibold text-amber-200/90">
           {streak === 1 ? "day streak" : "days streak"}
         </span>
+        {restDays > 0 && (
+          <span className="ml-0.5 rounded bg-indigo-500/25 px-1.5 py-0.2 text-[9px] font-bold text-indigo-300 border border-indigo-500/30">
+            {restDays} {restDays === 1 ? "rest" : "rest days"}
+          </span>
+        )}
       </div>
     );
   }
@@ -226,7 +238,7 @@ export default function StreakBadge({
   return (
     <div
       ref={rootRef}
-      title={`${streak} consecutive study days`}
+      title={`${streak} consecutive study days${restDays > 0 ? ` (${restDays} rest ${restDays === 1 ? "day" : "days"} taken)` : ""}`}
       className={cn(
         "inline-flex items-center gap-2 rounded-full border border-amber-500/35 bg-gradient-to-r from-amber-500/20 via-orange-500/15 to-amber-500/5 px-3 py-1 shadow-[0_0_16px_rgba(245,158,11,0.25)] backdrop-blur-md transition-all duration-200 hover:border-amber-500/50 hover:scale-105",
         className,
@@ -247,6 +259,11 @@ export default function StreakBadge({
         <span className="text-xs font-semibold text-amber-200/90">
           {streak === 1 ? "day streak" : "days streak"}
         </span>
+        {restDays > 0 && (
+          <span className="ml-1 rounded bg-indigo-500/20 px-1.5 py-0.2 text-[9px] font-bold text-indigo-300 border border-indigo-500/30" title={`${restDays} rest ${restDays === 1 ? "day" : "days"} taken during this streak`}>
+            {restDays} {restDays === 1 ? "rest" : "rest days"}
+          </span>
+        )}
       </div>
     </div>
   );

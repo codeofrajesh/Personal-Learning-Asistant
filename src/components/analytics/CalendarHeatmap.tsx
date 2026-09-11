@@ -47,6 +47,8 @@ interface Props {
   selectedDays?: string[];
   activeDate?: string;
   streakDays?: number;
+  restDays?: number;
+  restDaysSet?: Set<string>;
 }
 
 const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"];
@@ -65,6 +67,8 @@ export default function CalendarHeatmap({
   selectedDays,
   activeDate,
   streakDays,
+  restDays = 0,
+  restDaysSet = new Set(),
 }: Props) {
   const today = useScheduleClock((s) => s.day);
   const target = targetMins ?? 0;
@@ -276,7 +280,7 @@ export default function CalendarHeatmap({
 
         <div className="flex items-center gap-3">
           {streakDays != null && streakDays > 0 && (
-            <StreakBadge streak={streakDays} variant="calendar" />
+            <StreakBadge streak={streakDays} restDays={restDays} variant="calendar" />
           )}
 
           {onPickDay && (
@@ -386,7 +390,34 @@ export default function CalendarHeatmap({
                     );
                   }
 
-                  // Rest day: smooth quiet solid dark tile (zero white border lines)
+                  // Designated Rest day (Path B relaxation: preserves streak!)
+                  const isRest = restDaysSet?.has(date) ?? false;
+                  if (isRest) {
+                    return (
+                      <button
+                        key={date}
+                        type="button"
+                        onClick={() => {
+                          onSelectDay?.(date);
+                          onPickDay?.(date);
+                        }}
+                        disabled={!onPickDay && !onSelectDay}
+                        title={`${fmtDateShort(date)} · Rest day (Streak preserved) ☕`}
+                        className={cn(
+                          "relative grid aspect-square place-items-center rounded-[7px] border border-indigo-500/40 bg-indigo-950/45 text-[0.62rem] font-semibold text-indigo-200 tabular-nums transition-colors duration-150 shadow-[inset_0_0_8px_rgba(99,102,241,0.2)]",
+                          (onPickDay || onSelectDay) && "hover:bg-indigo-900/60 hover:text-white active:scale-95",
+                          selected && "ring-2 ring-white/80 ring-offset-1 ring-offset-[#0d0d12]",
+                          isActive && "ring-2 ring-lime ring-offset-2 ring-offset-[#0d0d12]",
+                          !isActive && isToday && "ring-2 ring-indigo-400 ring-offset-2 ring-offset-[#0d0d12]",
+                        )}
+                      >
+                        <span>{dom}</span>
+                        <span className="absolute bottom-0.5 right-0.5 h-1 w-1 rounded-full bg-indigo-400 shadow-[0_0_3px_#818cf8]" />
+                      </button>
+                    );
+                  }
+
+                  // Neutral / Untracked idle day: smooth quiet solid dark tile
                   return (
                     <button
                       key={date}
@@ -396,7 +427,7 @@ export default function CalendarHeatmap({
                         onPickDay?.(date);
                       }}
                       disabled={!onPickDay && !onSelectDay}
-                      title={`${fmtDateShort(date)} · Rest day`}
+                      title={`${fmtDateShort(date)} · 0m study`}
                       className={cn(
                         "grid aspect-square place-items-center rounded-[7px] bg-[#181820] text-[0.62rem] font-medium text-white/35 tabular-nums transition-colors duration-150",
                         (onPickDay || onSelectDay) && "hover:bg-[#23232c] hover:text-white/70 active:scale-95",
@@ -431,8 +462,14 @@ export default function CalendarHeatmap({
             Over target
           </span>
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/60">
+            <span className="flex h-3 w-3 items-center justify-center rounded-[4px] border border-indigo-500/40 bg-indigo-950/60" aria-hidden>
+              <span className="h-1 w-1 rounded-full bg-indigo-400" />
+            </span>
+            Rest day (Preserved)
+          </span>
+          <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/60">
             <span className="h-3 w-3 rounded-[4px] bg-[#181820]" aria-hidden />
-            Rest day
+            Idle
           </span>
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/40">
             <span className="h-3 w-3 rounded-[4px] border border-dashed border-white/20 bg-transparent" aria-hidden />

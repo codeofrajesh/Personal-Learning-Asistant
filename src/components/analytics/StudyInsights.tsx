@@ -20,6 +20,7 @@ import {
   CheckCircle2,
   Award,
   CircleDot,
+  Coffee,
 } from "lucide-react";
 import type { DayStudy } from "../../lib/types";
 import { useScheduleClock } from "../../lib/scheduleClock";
@@ -31,6 +32,7 @@ import {
   activeDays,
   fmtDateRange,
 } from "./analyticsUtils";
+import { useRestDayStore } from "../../lib/restDayStore";
 import { cn } from "../../lib/utils";
 
 interface Props {
@@ -45,8 +47,12 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const flameRef = useRef<HTMLDivElement>(null);
 
+  const restDaysMap = useRestDayStore((s) => s.restDays);
+  const toggleRestDay = useRestDayStore((s) => s.toggleRestDay);
+  const restDaysSet = useMemo(() => new Set(Object.keys(restDaysMap)), [restDaysMap]);
+
   const last30 = useMemo(() => daily.slice(Math.max(0, daily.length - 30)), [daily]);
-  const streaks = useMemo(() => studyStreaks(daily, today), [daily, today]);
+  const streaks = useMemo(() => studyStreaks(daily, today, restDaysSet), [daily, today, restDaysSet]);
   const rhythm = useMemo(() => weekdayRhythm(last30), [last30]);
   const active = useMemo(() => activeDays(last30), [last30]);
   const consistencyPct = last30.length > 0 ? Math.round((active / last30.length) * 100) : 0;
@@ -146,7 +152,12 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
               </span>
             </div>
 
-            {streaks.activeToday ? (
+            {streaks.isRestToday ? (
+              <span className="inline-flex items-center gap-1 rounded-full border border-indigo-500/35 bg-indigo-500/15 px-2 py-0.5 text-[0.62rem] font-semibold text-indigo-300">
+                <Coffee size={10} className="text-indigo-300" />
+                Rest Day Active
+              </span>
+            ) : streaks.activeToday ? (
               <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 text-[0.62rem] font-semibold text-emerald-400">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 Active Today
@@ -172,15 +183,52 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
             </span>
           </div>
 
-          {/* Current streak timeline info */}
-          <div className="mt-1 flex items-center gap-1.5 text-[0.7rem] text-white/50">
-            <CalendarRange size={12} className="shrink-0 text-white/40" aria-hidden />
-            <span className="truncate">
-              {streaks.current > 0
-                ? `Run: ${fmtDateRange(streaks.currentStartDate, streaks.currentEndDate)}`
-                : "No active consecutive streak"}
-            </span>
+          {/* Current streak timeline info & rest days taken */}
+          <div className="mt-1.5 flex flex-wrap items-center justify-between gap-1 text-[0.7rem] text-white/50">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <CalendarRange size={12} className="shrink-0 text-white/40" aria-hidden />
+              <span className="truncate">
+                {streaks.current > 0
+                  ? `Run: ${fmtDateRange(streaks.currentStartDate, streaks.currentEndDate)}`
+                  : "No active consecutive streak"}
+              </span>
+            </div>
+            {streaks.current > 0 && (
+              <span
+                className={cn(
+                  "rounded px-1.5 py-0.5 text-[0.64rem] font-semibold tracking-wide border",
+                  streaks.restDaysInStreak > 0
+                    ? "bg-indigo-500/15 text-indigo-300 border-indigo-500/30"
+                    : "bg-white/[0.04] text-white/45 border-white/[0.06]"
+                )}
+                title={`${streaks.restDaysInStreak} rest ${streaks.restDaysInStreak === 1 ? "day" : "days"} taken during this streak`}
+              >
+                {streaks.restDaysInStreak === 0
+                  ? "0 rest days taken"
+                  : `${streaks.restDaysInStreak} rest ${streaks.restDaysInStreak === 1 ? "day" : "days"} taken`}
+              </span>
+            )}
           </div>
+
+          {/* Quick Rest Day Action Toggle (Path B relaxation) */}
+          <button
+            type="button"
+            onClick={() => toggleRestDay(today)}
+            className={cn(
+              "mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border px-3 py-1.5 text-[0.7rem] font-semibold transition-all duration-150 active:scale-[0.98]",
+              streaks.isRestToday
+                ? "border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25 shadow-[0_0_12px_rgba(99,102,241,0.2)]"
+                : "border-white/[0.08] bg-white/[0.03] text-white/60 hover:border-indigo-400/30 hover:bg-white/[0.06] hover:text-white"
+            )}
+            title={
+              streaks.isRestToday
+                ? "Click to resume normal tracking for today"
+                : "Pause your streak for today if you have a fever, illness, or busy schedule"
+            }
+          >
+            <Coffee size={13} className={streaks.isRestToday ? "text-indigo-300" : "text-white/40"} />
+            {streaks.isRestToday ? "Cancel Rest Day (Resume Streak)" : "Take Rest Day Today ☕"}
+          </button>
         </div>
 
         {/* Bottom Details: Longest Streak Ever */}
