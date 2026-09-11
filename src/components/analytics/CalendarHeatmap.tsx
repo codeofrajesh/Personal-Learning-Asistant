@@ -308,20 +308,20 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                   const isFuture = date > today;
                   const selected = selectedDays?.includes(date) ?? false;
 
-                  // Future day: completely hollow dashed wireframe slot, unmistakably distinct from rest days
+                  // Future day: completely hollow dashed stencil, unmistakably distinct from rest days
                   if (isFuture) {
                     return (
                       <div
                         key={date}
                         title={`${fmtDateShort(date)} · Future date`}
-                        className="grid aspect-square place-items-center rounded-[7px] border border-dashed border-white/[0.08] bg-transparent text-[0.62rem] font-normal text-white/20 select-none cursor-default"
+                        className="grid aspect-square place-items-center rounded-[7px] border border-dashed border-white/[0.07] bg-transparent text-[0.62rem] font-normal text-white/20 select-none cursor-default"
                       >
                         {dom}
                       </div>
                     );
                   }
 
-                  // Active study day: rich beveled tactile keycap tile
+                  // Active study day: smooth, consistent, satisfying solid color box
                   if (entry && entry.work_mins > 0) {
                     const tone = performanceTone(entry.work_mins, target);
                     return (
@@ -332,16 +332,14 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                         disabled={!onPickDay}
                         title={`${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · ${tone.label}`}
                         className={cn(
-                          "relative grid aspect-square place-items-center rounded-[7px] border text-[0.64rem] font-bold tabular-nums transition-all duration-150 active:scale-95",
+                          "relative grid aspect-square place-items-center rounded-[7px] text-[0.66rem] font-semibold tabular-nums transition-transform duration-150 active:scale-95",
                           tone.cellText,
-                          onPickDay && "hover:scale-[1.10] hover:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60",
+                          onPickDay && "hover:scale-[1.08] hover:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60",
                           selected && "ring-2 ring-white/90 ring-offset-1 ring-offset-[#0d0d12]",
                           isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12]",
                         )}
                         style={{
-                          background: tone.cellBg,
-                          borderColor: tone.cellBorder,
-                          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.35), inset 0 -1px 1px rgba(0,0,0,0.35), 0 2px 4px rgba(0,0,0,0.25)",
+                          backgroundColor: tone.cellBg,
                         }}
                       >
                         {dom}
@@ -349,7 +347,7 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                     );
                   }
 
-                  // Rest day: solid dark slate tile (distinct from dashed hollow future slots)
+                  // Rest day: smooth quiet solid dark tile (zero white border lines)
                   return (
                     <button
                       key={date}
@@ -358,10 +356,10 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                       disabled={!onPickDay}
                       title={`${fmtDateShort(date)} · Rest day`}
                       className={cn(
-                        "grid aspect-square place-items-center rounded-[7px] border border-white/[0.08] bg-[#171722] text-[0.62rem] font-medium text-white/45 tabular-nums transition-colors duration-150 shadow-sm",
-                        onPickDay && "hover:bg-[#222230] hover:text-white/80 hover:border-white/20 active:scale-95",
+                        "grid aspect-square place-items-center rounded-[7px] bg-[#181820] text-[0.62rem] font-medium text-white/35 tabular-nums transition-colors duration-150",
+                        onPickDay && "hover:bg-[#23232c] hover:text-white/70 active:scale-95",
                         selected && "ring-2 ring-white/80 ring-offset-1 ring-offset-[#0d0d12]",
-                        isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12] text-white font-bold bg-[#1e1e2d]",
+                        isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12] text-white font-semibold",
                       )}
                     >
                       {dom}
@@ -378,50 +376,23 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
       <div className="mt-6 flex flex-wrap items-center justify-between gap-y-3 border-t border-white/[0.06] pt-4.5">
         <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/60">
-            <span
-              className="h-3 w-3 rounded-[4px] border border-white/20 shadow-sm"
-              style={{
-                background: "linear-gradient(180deg, #F87171 0%, #EF4444 35%, #DC2626 70%, #B91C1C 100%)",
-                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.35), inset 0 -1px 1px rgba(0,0,0,0.3)",
-              }}
-              aria-hidden
-            />
+            <span className="h-3 w-3 rounded-[4px] bg-[#EF4444]" aria-hidden />
             Below target
           </span>
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/60">
-            <span
-              className="h-3 w-3 rounded-[4px] border border-white/20 shadow-sm"
-              style={{
-                background: "linear-gradient(180deg, #60A5FA 0%, #3B82F6 35%, #2563EB 70%, #1D4ED8 100%)",
-                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.35), inset 0 -1px 1px rgba(0,0,0,0.3)",
-              }}
-              aria-hidden
-            />
+            <span className="h-3 w-3 rounded-[4px] bg-[#2563EB]" aria-hidden />
             Target met
           </span>
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/60">
-            <span
-              className="h-3 w-3 rounded-[4px] border border-white/20 shadow-sm"
-              style={{
-                background: "linear-gradient(180deg, #FDE68A 0%, #FBBF24 35%, #F59E0B 70%, #D97706 100%)",
-                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.45), inset 0 -1px 1px rgba(0,0,0,0.2)",
-              }}
-              aria-hidden
-            />
+            <span className="h-3 w-3 rounded-[4px] bg-[#F97316]" aria-hidden />
             Over target
           </span>
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/60">
-            <span
-              className="h-3 w-3 rounded-[4px] border border-white/[0.08] bg-[#171722] shadow-sm"
-              aria-hidden
-            />
+            <span className="h-3 w-3 rounded-[4px] bg-[#181820]" aria-hidden />
             Rest day
           </span>
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/40">
-            <span
-              className="h-3 w-3 rounded-[4px] border border-dashed border-white/20 bg-transparent"
-              aria-hidden
-            />
+            <span className="h-3 w-3 rounded-[4px] border border-dashed border-white/20 bg-transparent" aria-hidden />
             Future date
           </span>
         </div>

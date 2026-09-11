@@ -120,11 +120,11 @@ export default function HelpModal({ open, onClose }: Props) {
             <span className="font-medium text-content-primary">Royal Azure Blue:</span> Target met — you reached 100% of your daily goal.
           </p>
           <p className="flex items-center gap-2">
-            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#F59E0B]" />
-            <span className="font-medium text-content-primary">Radiant Gold:</span> Over target — you exceeded your daily goal (110%+).
+            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#F97316]" />
+            <span className="font-medium text-content-primary">Vibrant Orange:</span> Over target — you exceeded your daily goal (110%+).
           </p>
           <p className="flex items-center gap-2">
-            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#171722] border border-white/20" />
+            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#181820]" />
             <span className="font-medium text-content-primary">Solid Slate:</span> Rest day — past day with intentional recovery.
           </p>
           <p className="flex items-center gap-2">

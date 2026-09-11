@@ -31,12 +31,12 @@ interface Props {
 }
 
 /** Gradient stops + accent per pace state using the unified color system:
- *  - behind pace: Textured Pure Red (#EF4444 -> #DC2626)
+ *  - behind pace: Pure Red (#EF4444 -> #DC2626)
  *  - on pace / ahead: Royal Azure Blue (#2563EB -> #1D4ED8)
- *  - goal crushed / over target: Radiant Sun Gold (#F59E0B -> #D97706)
+ *  - goal crushed / over target: Vibrant Orange (#F97316 -> #EA580C)
  */
 const TONES: Record<PaceState, { from: string; to: string; text: string; glow: boolean; chip: string; label: string; Icon: typeof Target }> = {
-  crushed: { from: "#F59E0B", to: "#D97706", text: "text-amber-300", glow: false, chip: "border-amber-400/35 bg-amber-400/15 text-amber-300", label: "Crushed", Icon: Zap },
+  crushed: { from: "#F97316", to: "#EA580C", text: "text-orange-300", glow: false, chip: "border-orange-500/35 bg-orange-500/15 text-orange-300", label: "Crushed", Icon: Zap },
   ahead: { from: "#2563EB", to: "#1D4ED8", text: "text-blue-300", glow: false, chip: "border-blue-500/35 bg-blue-500/15 text-blue-300", label: "Ahead", Icon: TrendingUp },
   warning: { from: "#EF4444", to: "#DC2626", text: "text-red-300", glow: false, chip: "border-red-500/35 bg-red-500/12 text-red-300", label: "Behind pace", Icon: Clock },
   idle: { from: "#2563EB", to: "#1D4ED8", text: "text-blue-300", glow: false, chip: "border-blue-500/25 bg-blue-500/10 text-blue-300", label: "No target", Icon: Target },

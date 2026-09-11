@@ -290,60 +290,60 @@ export interface PerfTone {
   cellText: string;
 }
 
-// Under target — TEXTURED VIBRANT CRIMSON RED BOX. Rich dimensional gradient with specular highlight.
+// Under target — SMOOTH SOLID PURE RED BOX. Clean, consistent, flat and satisfying.
 const TONE_UNDER: PerfTone = {
   key: "under",
   label: "Below target",
   solid: "#EF4444",
-  bar: "linear-gradient(to top, #B91C1C, #EF4444)",
+  bar: "#EF4444",
   glow: null,
   text: "text-red-400",
   chip: "border-red-500/35 bg-red-500/15 text-red-300",
-  cellBg: "linear-gradient(180deg, #F87171 0%, #EF4444 35%, #DC2626 70%, #B91C1C 100%)",
-  cellBorder: "rgba(255,255,255,0.24)",
+  cellBg: "#EF4444",
+  cellBorder: "transparent",
   cellGlow: null,
-  cellText: "text-white font-bold",
+  cellText: "text-white font-semibold",
 };
-// Target met — ROYAL AZURE / SAPPHIRE BLUE BOX. Satisfying, crisp, and deep.
+// Target met — SMOOTH SOLID ROYAL AZURE BLUE BOX. Clean, consistent, flat and satisfying.
 const TONE_MET: PerfTone = {
   key: "met",
   label: "Target met",
   solid: "#2563EB",
-  bar: "linear-gradient(to top, #1D4ED8, #2563EB)",
+  bar: "#2563EB",
   glow: null,
   text: "text-blue-400",
   chip: "border-blue-500/35 bg-blue-500/15 text-blue-300",
-  cellBg: "linear-gradient(180deg, #60A5FA 0%, #3B82F6 35%, #2563EB 70%, #1D4ED8 100%)",
-  cellBorder: "rgba(255,255,255,0.24)",
+  cellBg: "#2563EB",
+  cellBorder: "transparent",
   cellGlow: null,
-  cellText: "text-white font-bold",
+  cellText: "text-white font-semibold",
 };
-// Over target — RADIANT SUN GOLD / AMBER BOX. Supercharged trophy day, replacing green.
+// Over target — SMOOTH SOLID VIBRANT ORANGE BOX. High contrast, white numbers razor-sharp legible.
 const TONE_OVER: PerfTone = {
   key: "over",
   label: "Over target",
-  solid: "#F59E0B",
-  bar: "linear-gradient(to top, #B45309, #F59E0B)",
+  solid: "#F97316",
+  bar: "#F97316",
   glow: null,
-  text: "text-amber-300",
-  chip: "border-amber-400/35 bg-amber-400/15 text-amber-300",
-  cellBg: "linear-gradient(180deg, #FDE68A 0%, #FBBF24 35%, #F59E0B 70%, #D97706 100%)",
-  cellBorder: "rgba(255,255,255,0.26)",
+  text: "text-orange-400",
+  chip: "border-orange-500/35 bg-orange-500/15 text-orange-300",
+  cellBg: "#F97316",
+  cellBorder: "transparent",
   cellGlow: null,
-  cellText: "text-white font-bold",
+  cellText: "text-white font-semibold",
 };
 const TONE_NONE: PerfTone = {
   key: "none",
   label: "Rest day",
-  solid: "#27272A",
-  bar: "linear-gradient(to top, #18181b, #27272a)",
+  solid: "#191922",
+  bar: "#191922",
   glow: null,
   text: "text-white/40",
   chip: "border-white/10 bg-white/[0.04] text-white/40",
-  cellBg: "#171720",
-  cellBorder: "rgba(255,255,255,0.08)",
+  cellBg: "#191922",
+  cellBorder: "transparent",
   cellGlow: null,
-  cellText: "text-white/45 font-medium",
+  cellText: "text-white/40 font-medium",
 };
 
 /** Classify a day's study against the daily target and return its color treatment. */
