@@ -20,6 +20,7 @@ import { useMemo } from "react";
 import { Target, Zap, Clock, TrendingUp } from "lucide-react";
 import type { StudyMeter } from "../../lib/types";
 import { computePace, reconcileCaption, fmtHM, type PaceState } from "./analyticsUtils";
+import StreakBadge from "./StreakBadge";
 import { cn } from "../../lib/utils";
 
 interface Props {
@@ -34,6 +35,7 @@ interface Props {
   periodLabel?: string;
   studiedMins?: number;
   goalMins?: number;
+  streakDays?: number;
 }
 
 /** Gradient stops + accent per pace state using the unified color system:
@@ -64,6 +66,7 @@ export default function PaceGauge({
   periodLabel,
   studiedMins,
   goalMins,
+  streakDays,
 }: Props) {
   // Live mode calculation for today
   const livePace = useMemo(() => {
@@ -148,15 +151,20 @@ export default function PaceGauge({
       className="relative flex h-full flex-col rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-5 backdrop-blur-xl"
       style={{ boxShadow: "inset 0 1px 1px rgba(255,255,255,0.05)" }}
     >
-      <div className="mb-1 flex items-center justify-between">
+      <div className="mb-1 flex items-center justify-between gap-2">
         <span className="flex items-center gap-1.5 text-[0.62rem] font-medium uppercase tracking-wide text-white/40">
           <Target size={13} strokeWidth={2.25} className="shrink-0 text-lime" aria-hidden />
           {titleText}
         </span>
-        <span className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.62rem] font-semibold", tone.chip)}>
-          <tone.Icon size={11} strokeWidth={2.5} aria-hidden />
-          {tone.label}
-        </span>
+        <div className="flex items-center gap-2">
+          {streakDays != null && streakDays > 0 && (
+            <StreakBadge streak={streakDays} variant="pace" />
+          )}
+          <span className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.62rem] font-semibold", tone.chip)}>
+            <tone.Icon size={11} strokeWidth={2.5} aria-hidden />
+            {tone.label}
+          </span>
+        </div>
       </div>
 
       <div className="relative mx-auto w-full max-w-[240px]">

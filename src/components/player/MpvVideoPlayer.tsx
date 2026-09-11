@@ -1319,6 +1319,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     setVolume(v);
     void setProperty("volume", v).catch(() => {});
     if (isMuted && v > 0) {
+      setIsMuted(false); // optimistic — icon and bar clear immediately
       void setProperty("mute", false).catch(() => {});
     }
   };
@@ -1580,7 +1581,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
           <div className="group/vol flex items-center gap-1.5">
             <button
               type="button"
-              onClick={() => void setProperty("mute", !isMuted).catch(() => {})}
+              onClick={() => {
+                setIsMuted(!isMuted); // optimistic — icon flips instantly
+                void setProperty("mute", !isMuted).catch(() => {});
+              }}
               className="shrink-0 rounded-full p-2 text-content-secondary transition-colors hover:bg-white/[0.1] hover:text-content-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20"
               aria-label="Mute"
             >
@@ -1593,7 +1597,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               step={1}
               value={isMuted ? 0 : volume}
               onChange={changeVolume}
-              className="h-1 w-0 cursor-pointer appearance-none rounded-full bg-white/[0.15] opacity-0 transition-all duration-200 group-hover/vol:w-20 group-hover/vol:opacity-100"
+              style={{
+                background: `linear-gradient(to right, rgba(255,255,255,0.85) ${isMuted ? 0 : volume}%, rgba(255,255,255,0.15) ${isMuted ? 0 : volume}%)`
+              }}
+              className="h-1 w-0 cursor-pointer appearance-none rounded-full opacity-0 transition-all duration-200 group-hover/vol:w-20 group-hover/vol:opacity-100"
               aria-label="Volume"
             />
           </div>

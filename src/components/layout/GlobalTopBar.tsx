@@ -34,7 +34,7 @@ export default function GlobalTopBar({
   onOpenSearch,
 }: GlobalTopBarProps) {
   return (
-    <header className="z-30 flex h-16 shrink-0 items-center justify-between gap-3 bg-transparent px-4 pt-3">
+    <header className="relative z-40 flex h-16 shrink-0 items-center justify-between gap-3 bg-transparent px-4 pt-3">
       {/* 1 — Left pill: sidebar toggle + app title */}
       <div className="flex min-w-0 items-center gap-1.5 rounded-full border border-white/[0.05] bg-white/[0.02] py-1.5 pl-1.5 pr-4 shadow-2xl backdrop-blur-xl [box-shadow:0_16px_40px_-12px_rgba(0,0,0,0.55),inset_0_1px_1px_rgba(255,255,255,0.06)]">
         <button

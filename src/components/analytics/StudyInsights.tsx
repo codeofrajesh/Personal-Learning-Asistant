@@ -70,11 +70,14 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
 
   const maxAvg = Math.max(1, ...rhythm.map((r) => r.avgMins));
 
-  // GSAP entrance for the insights strip
+  // GSAP entrance for the insights strip (high & balanced only)
   useLayoutEffect(() => {
-    if (!motionAllowed()) return;
     const el = rootRef.current;
     if (!el) return;
+    if (!motionAllowed()) {
+      gsap.set(el.children, { y: 0, opacity: 1, clearProps: "all" });
+      return;
+    }
     const ctx = gsap.context(() => {
       gsap.from(el.children, {
         y: 10,
@@ -87,22 +90,22 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
     return () => ctx.revert();
   }, []);
 
-  // GSAP subtle breathing flame on active days (high tier only)
+  // GSAP subtle breathing flame on active days — preserved across all modes
   useLayoutEffect(() => {
-    if (!motionAllowed() || tier !== "high" || !streaks.activeToday) return;
+    if (!streaks.activeToday) return;
     const el = flameRef.current;
     if (!el) return;
     const ctx = gsap.context(() => {
       gsap.to(el, {
-        scale: 1.12,
-        duration: 1.1,
+        scale: 1.15,
+        duration: 1.0,
         repeat: -1,
         yoyo: true,
         ease: "sine.inOut",
       });
     }, el);
     return () => ctx.revert();
-  }, [tier, streaks.activeToday]);
+  }, [streaks.activeToday]);
 
   // Donut SVG parameters
   const donutR = 15;
@@ -122,6 +125,7 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
             <div className="flex items-center gap-2">
               <div
                 ref={flameRef}
+                data-flame="true"
                 className={cn(
                   "grid h-7 w-7 place-items-center rounded-lg transition-transform",
                   streaks.activeToday

@@ -13,8 +13,33 @@ import { dayOffset, localDay } from "../../lib/scheduleClock";
 
 /** Settings keys shared with the Rust backend (see `db::plan`). */
 export const SETTING_DAILY_GOAL = "study.daily_goal_mins";
+export const SETTING_WEEKLY_DAYS = "study.weekly_days";
+export const SETTING_MONTHLY_DAYS = "study.monthly_days";
 export const SETTING_TRACKING_PAUSED = "study.tracking_paused";
 export const SETTING_RETENTION_DAYS = "study.retention_days";
+
+/** Compute effective weekly goal in minutes with strict cap (cannot exceed dailyGoalMins * 7). */
+export function computeWeeklyGoalMins(dailyGoalMins: number, weeklyDays = 7): number {
+  const safeDaily = Math.max(0, dailyGoalMins);
+  const clampedDays = Math.max(1, Math.min(7, weeklyDays || 7));
+  return safeDaily * clampedDays;
+}
+
+/** Compute effective monthly goal in minutes with strict cap (cannot exceed dailyGoalMins * totalMonthDays). */
+export function computeMonthlyGoalMins(
+  dailyGoalMins: number,
+  monthlyDays: number | null,
+  totalMonthDays: number,
+  weeklyDays = 7,
+): number {
+  const safeDaily = Math.max(0, dailyGoalMins);
+  const safeTotalDays = Math.max(1, totalMonthDays);
+  // If no explicit monthly days specified, scale proportionally from weekly study rhythm
+  const effectiveDays = monthlyDays != null && monthlyDays > 0
+    ? Math.min(safeTotalDays, monthlyDays)
+    : Math.min(safeTotalDays, Math.round((Math.max(1, Math.min(7, weeklyDays)) / 7) * safeTotalDays));
+  return safeDaily * effectiveDays;
+}
 
 // ── Formatting ────────────────────────────────────────────────────────────────
 
@@ -767,3 +792,4 @@ export function weekdayRhythm(daily: DayStudy[]): WeekdayBucket[] {
     pct: total > 0 ? Math.round((sums[i] / total) * 100) : 0,
   }));
 }
+

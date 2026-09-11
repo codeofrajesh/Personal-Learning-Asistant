@@ -31,6 +31,7 @@ interface Props {
   periodMode?: "day" | "week" | "month";
   periodLabel?: string;
   totalDaysInPeriod?: number;
+  periodGoalMins?: number;
 }
 
 const W = 100;
@@ -42,10 +43,10 @@ function smoothPath(pts: { x: number; y: number }[]): string {
   if (pts.length === 1) return `M ${pts[0].x} ${pts[0].y}`;
   let d = `M ${pts[0].x} ${pts[0].y}`;
   for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[i - 1] ?? pts[i];
+    const p0 = i > 0 ? pts[i - 1] : pts[0];
     const p1 = pts[i];
     const p2 = pts[i + 1];
-    const p3 = pts[i + 2] ?? p2;
+    const p3 = i < pts.length - 2 ? pts[i + 2] : p2;
     const cp1x = p1.x + (p2.x - p0.x) / 6;
     const cp1y = p1.y + (p2.y - p0.y) / 6;
     const cp2x = p2.x - (p3.x - p1.x) / 6;
@@ -62,6 +63,7 @@ export default function CumulativeVelocity({
   periodMode = "month",
   periodLabel,
   totalDaysInPeriod,
+  periodGoalMins,
 }: Props) {
   const lineRef = useRef<SVGPathElement>(null);
   const today = useScheduleClock((s) => s.day);
@@ -74,19 +76,22 @@ export default function CumulativeVelocity({
   const daysInMonth = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
   const firstOfMonth = `${today.slice(0, 7)}-01`;
 
-  // Use periodDays if provided, else fallback to current month up to today
-  const activeDays = periodDays ?? daily.filter((d) => d.date >= firstOfMonth && d.date <= today);
-  const points = cumulative(activeDays, target);
-  const n = points.length;
-  const daysElapsed = Math.max(1, n);
-
   const spanDays =
     totalDaysInPeriod ??
     (periodMode === "week" ? 7 : periodMode === "month" ? (periodDays?.length ?? daysInMonth) : daysInMonth);
 
+  const periodTarget = periodGoalMins && periodGoalMins > 0 ? periodGoalMins : target * spanDays;
+  const idealDailyRate = periodTarget / Math.max(1, spanDays);
+
+  // Use periodDays if provided, else fallback to current month up to today
+  const activeDays = periodDays ?? daily.filter((d) => d.date >= firstOfMonth && d.date <= today);
+  const points = cumulative(activeDays, idealDailyRate);
+  const n = points.length;
+  const daysElapsed = Math.max(1, n);
+
   const actualTotal = n ? points[n - 1].cum : 0;
-  const expectedToday = target * daysElapsed;
-  const maxY = Math.max(1, actualTotal, expectedToday) * 1.15;
+  const expectedToday = idealDailyRate * daysElapsed;
+  const maxY = Math.max(1, actualTotal, expectedToday, periodTarget) * 1.15;
 
   const x = (i: number) => (n > 1 ? (i / (n - 1)) * W : 50);
   const y = (v: number) => H - (v / maxY) * H;
@@ -99,9 +104,8 @@ export default function CumulativeVelocity({
   const ahead = actualTotal >= expectedToday;
   const paceMins = actualTotal / daysElapsed;
   const projected = paceMins * spanDays;
-  const periodTarget = target * spanDays;
   const progressPct = Math.max(0, Math.min(100, Math.round((actualTotal / Math.max(1, periodTarget)) * 100)));
-  const catchUp = Math.max(0, target * (daysElapsed + 1) - actualTotal);
+  const catchUp = Math.max(0, idealDailyRate * (daysElapsed + 1) - actualTotal);
   const best = bestWeek(daily);
   const stroke = ahead ? "#34D399" : "#38BDF8";
 

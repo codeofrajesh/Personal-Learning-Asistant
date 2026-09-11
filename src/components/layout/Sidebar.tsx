@@ -22,6 +22,8 @@ import { GraduationIcon, SearchIcon } from "../ui/icons";
 import { usePins } from "../../lib/plugins/pinStore";
 import { useNavItems } from "../../lib/plugins/nav";
 import { navSource } from "../../lib/navigation";
+import StreakBadge from "../analytics/StreakBadge";
+import { useCurrentStreak } from "../analytics/useCurrentStreak";
 import { cn } from "../../lib/utils";
 
 interface SidebarProps {
@@ -41,6 +43,7 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
   const location = useLocation();
   const navItems = useNavItems();
   const hydrate = usePins((s) => s.hydrate);
+  const streak = useCurrentStreak();
 
   // Hydrate plugin pin state once on mount (the store dedupes); keeps the nav in sync
   // with the persisted settings table after a restart.
@@ -184,13 +187,16 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
         </ul>
       </nav>
 
-      {/* Study meter + footer.
+      {/* Study meter + streak badge + footer.
           Pinned to the bottom (`mt-auto`) and BELOW the nav on purpose: it is ambient feedback,
           not a destination, so it must never push navigation off-centre or compete with it for
-          the eye. It adapts to `collapsed` itself — see StudyMeter. */}
-      <div className="mt-auto">
+          the eye. It adapts to `collapsed` itself — see StudyMeter and StreakBadge. */}
+      <div className="mt-auto flex flex-col gap-1.5">
+        {streak > 0 && (
+          <StreakBadge streak={streak} variant="sidebar" collapsed={collapsed} />
+        )}
         <StudyMeter collapsed={collapsed} />
-        <div className="px-2 pb-1 pt-3">
+        <div className="px-2 pb-1 pt-2">
           {!collapsed && (
             <div className="text-[11px] text-content-faint">v0.1.0 · local-first</div>
           )}

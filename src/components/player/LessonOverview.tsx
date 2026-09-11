@@ -19,6 +19,8 @@ import { gsap } from "gsap";
 import { useGSAP } from "@gsap/react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
+import { useCourseFilterStore } from "../../lib/courseFilterStore";
+
 gsap.registerPlugin(useGSAP);
 
 function formatTime(secs: number | null): string {
@@ -48,8 +50,7 @@ function LessonOverviewView({ siblings, currentId, source, embedded = false }: P
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<number | null>(null);
 
-  const [activeTab, setActiveTab] = useState<"all" | "lectures" | "notes">("all");
-  const [activeFilter, setActiveFilter] = useState<"all" | "cloud" | "offline">("all");
+  const { activeTab, activeFilter, setActiveTab, setActiveFilter } = useCourseFilterStore();
   const [isFilterOpen, setIsFilterOpen] = useState(false);
 
   const filteredSiblings = useMemo(() => {

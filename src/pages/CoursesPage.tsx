@@ -39,6 +39,7 @@ import ProgressRing from "../components/courses/ProgressRing";
 import CoverArt from "../components/ui/CoverArt";
 import { DEPTH_CAP } from "../components/wizard/FolderPreview";
 import { useMaterialManager } from "../lib/materialManagerStore";
+import { useCourseFilterStore } from "../lib/courseFilterStore";
 import { motionAllowed } from "../lib/perfStore";
 import { ipc, isTauri, NotInTauriError, onLibraryChanged } from "../lib/ipc";
 import { useToastStore } from "../lib/toastStore";
@@ -94,8 +95,7 @@ export default function CoursesPage() {
   const [boot, setBoot] = useState<Boot>({ kind: "loading" });
   const [children, setChildren] = useState<NodeCard[] | null>(null);
   const [materials, setMaterials] = useState<MaterialRowData[] | null>(null);
-  const [activeTab, setActiveTab] = useState<"all" | "lectures" | "notes">("all");
-  const [activeFilter, setActiveFilter] = useState<"all" | "cloud" | "offline">("all");
+  const { activeTab, activeFilter, setActiveTab, setActiveFilter } = useCourseFilterStore();
   const [isFilterOpen, setIsFilterOpen] = useState(false);
 
   const [crumbs, setCrumbs] = useState<NodeCrumb[]>([]);

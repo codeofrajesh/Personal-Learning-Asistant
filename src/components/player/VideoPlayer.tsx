@@ -430,7 +430,10 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
           step={0.05}
           value={volume}
           onChange={changeVolume}
-          className="hidden h-1.5 w-20 cursor-pointer appearance-none rounded-full bg-white/[0.08] sm:block"
+          style={{
+            background: `linear-gradient(to right, rgba(255,255,255,0.85) ${volume * 100}%, rgba(255,255,255,0.08) ${volume * 100}%)`
+          }}
+          className="hidden h-1.5 w-20 cursor-pointer appearance-none rounded-full sm:block"
           aria-label="Volume"
         />
 

@@ -36,6 +36,7 @@ import {
   parseLocalDay,
   DEFAULT_TARGET_MINS,
 } from "./analyticsUtils";
+import StreakBadge from "./StreakBadge";
 import { cn } from "../../lib/utils";
 
 interface Props {
@@ -45,6 +46,7 @@ interface Props {
   onSelectDay?: (date: string) => void;
   selectedDays?: string[];
   activeDate?: string;
+  streakDays?: number;
 }
 
 const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"];
@@ -62,6 +64,7 @@ export default function CalendarHeatmap({
   onSelectDay,
   selectedDays,
   activeDate,
+  streakDays,
 }: Props) {
   const today = useScheduleClock((s) => s.day);
   const target = targetMins ?? 0;
@@ -139,11 +142,14 @@ export default function CalendarHeatmap({
     }
   }
 
-  // GSAP entrance for the month grid when navigating
+  // GSAP entrance for the month grid when navigating (high & balanced only)
   useLayoutEffect(() => {
-    if (!motionAllowed()) return;
     const el = gridRef.current;
     if (!el) return;
+    if (!motionAllowed()) {
+      gsap.set(el.children, { y: 0, opacity: 1, clearProps: "all" });
+      return;
+    }
     const ctx = gsap.context(() => {
       gsap.from(el.children, {
         y: 12,
@@ -269,6 +275,10 @@ export default function CalendarHeatmap({
         </div>
 
         <div className="flex items-center gap-3">
+          {streakDays != null && streakDays > 0 && (
+            <StreakBadge streak={streakDays} variant="calendar" />
+          )}
+
           {onPickDay && (
             <span className="text-[0.64rem] font-medium text-white/35">
               Click two days to compare

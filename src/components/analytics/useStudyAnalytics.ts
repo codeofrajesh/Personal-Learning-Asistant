@@ -18,7 +18,11 @@ import { usePlanRevision, bumpPlanRevision } from "../../lib/planRevision";
 import { localUtcOffsetMins } from "../planning/usePeakHours";
 import {
   SETTING_DAILY_GOAL,
+  SETTING_WEEKLY_DAYS,
+  SETTING_MONTHLY_DAYS,
   SETTING_RETENTION_DAYS,
+  computeWeeklyGoalMins,
+  computeMonthlyGoalMins,
   parseRetentionDays,
   retentionEarliestDate,
 } from "./analyticsUtils";
@@ -64,16 +68,27 @@ export function useStudyAnalytics(days = ANALYTICS_WINDOW_DAYS): {
 }
 
 /**
- * The student's ambition target, backed by the SHARED `study.daily_goal_mins` setting — the same
- * key the sidebar Study Meter falls back to on unplanned days. Saving bumps the plan revision so
- * the meter + pace gauge re-read at once. `null` = no target set (falls back to the 2h default).
+ * The student's ambition target and study rhythm, backed by:
+ * - `study.daily_goal_mins` (daily ambition in minutes, default 120)
+ * - `study.weekly_days` (active study days per week, 1..7, default 7)
+ * - `study.monthly_days` (active study days per month, null = auto-scaled from weekly rhythm)
+ *
+ * Enforces strict mathematical upper bounds:
+ * Weekly target <= daily target * 7
+ * Monthly target <= daily target * totalDaysInMonth
  */
 export function useTargetSetting(): {
   targetMins: number | null;
+  weeklyDays: number;
+  monthlyDays: number | null;
+  weeklyTargetMins: number;
+  monthlyTargetMins: (daysInMonth: number) => number;
   loaded: boolean;
-  save: (mins: number | null) => Promise<void>;
+  save: (dailyMins: number | null, weeklyDays?: number, monthlyDays?: number | null) => Promise<void>;
 } {
   const [targetMins, setTargetMins] = useState<number | null>(null);
+  const [weeklyDays, setWeeklyDays] = useState<number>(7);
+  const [monthlyDays, setMonthlyDays] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
@@ -82,12 +97,22 @@ export function useTargetSetting(): {
       return;
     }
     let alive = true;
-    void ipc
-      .getSetting(SETTING_DAILY_GOAL)
-      .then((v) => {
+    void Promise.all([
+      ipc.getSetting(SETTING_DAILY_GOAL),
+      ipc.getSetting(SETTING_WEEKLY_DAYS),
+      ipc.getSetting(SETTING_MONTHLY_DAYS),
+    ])
+      .then(([dailyVal, weeklyVal, monthlyVal]) => {
         if (!alive) return;
-        const n = v ? parseInt(v, 10) : NaN;
-        setTargetMins(Number.isFinite(n) && n > 0 ? n : null);
+        const dailyParsed = dailyVal ? parseInt(dailyVal, 10) : NaN;
+        setTargetMins(Number.isFinite(dailyParsed) && dailyParsed > 0 ? dailyParsed : null);
+
+        const weeklyParsed = weeklyVal ? parseInt(weeklyVal, 10) : NaN;
+        setWeeklyDays(Number.isFinite(weeklyParsed) && weeklyParsed >= 1 && weeklyParsed <= 7 ? weeklyParsed : 7);
+
+        const monthlyParsed = monthlyVal ? parseInt(monthlyVal, 10) : NaN;
+        setMonthlyDays(Number.isFinite(monthlyParsed) && monthlyParsed >= 1 && monthlyParsed <= 31 ? monthlyParsed : null);
+
         setLoaded(true);
       })
       .catch(() => alive && setLoaded(true));
@@ -96,16 +121,49 @@ export function useTargetSetting(): {
     };
   }, []);
 
-  const save = useCallback(async (mins: number | null) => {
-    const clean = mins && mins > 0 ? Math.round(mins) : null;
-    setTargetMins(clean);
-    if (!isTauri()) return;
-    // "" clears it: the backend parse fails and falls back to the default, without a delete IPC.
-    await ipc.setSetting(SETTING_DAILY_GOAL, clean == null ? "" : String(clean));
-    bumpPlanRevision();
-  }, []);
+  const save = useCallback(
+    async (dailyMins: number | null, newWeeklyDays?: number, newMonthlyDays?: number | null) => {
+      const cleanDaily = dailyMins && dailyMins > 0 ? Math.round(dailyMins) : null;
+      const cleanWeekly =
+        typeof newWeeklyDays === "number" && newWeeklyDays >= 1 && newWeeklyDays <= 7
+          ? Math.round(newWeeklyDays)
+          : 7;
+      const cleanMonthly =
+        typeof newMonthlyDays === "number" && newMonthlyDays >= 1 && newMonthlyDays <= 31
+          ? Math.round(newMonthlyDays)
+          : null;
 
-  return { targetMins, loaded, save };
+      setTargetMins(cleanDaily);
+      setWeeklyDays(cleanWeekly);
+      setMonthlyDays(cleanMonthly);
+
+      if (!isTauri()) return;
+      await Promise.all([
+        ipc.setSetting(SETTING_DAILY_GOAL, cleanDaily == null ? "" : String(cleanDaily)),
+        ipc.setSetting(SETTING_WEEKLY_DAYS, cleanWeekly === 7 ? "7" : String(cleanWeekly)),
+        ipc.setSetting(SETTING_MONTHLY_DAYS, cleanMonthly == null ? "" : String(cleanMonthly)),
+      ]);
+      bumpPlanRevision();
+    },
+    [],
+  );
+
+  const effectiveDaily = targetMins ?? 120;
+  const weeklyTargetMins = computeWeeklyGoalMins(effectiveDaily, weeklyDays);
+  const monthlyTargetMins = useCallback(
+    (daysInMonth: number) => computeMonthlyGoalMins(effectiveDaily, monthlyDays, daysInMonth, weeklyDays),
+    [effectiveDaily, monthlyDays, weeklyDays],
+  );
+
+  return {
+    targetMins,
+    weeklyDays,
+    monthlyDays,
+    weeklyTargetMins,
+    monthlyTargetMins,
+    loaded,
+    save,
+  };
 }
 
 /**

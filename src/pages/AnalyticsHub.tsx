@@ -41,6 +41,8 @@ import TargetSettings from "../components/analytics/TargetSettings";
 import DataPrivacySheet from "../components/analytics/DataPrivacySheet";
 import HelpModal from "../components/analytics/HelpModal";
 import PeriodPicker from "../components/analytics/PeriodPicker";
+import StreakBadge from "../components/analytics/StreakBadge";
+import { useCurrentStreak } from "../components/analytics/useCurrentStreak";
 import {
   useStudyAnalytics,
   useTargetSetting,
@@ -54,6 +56,7 @@ import {
   slicePeriodDays,
   monthOffset,
   sumMins,
+  studyStreaks,
   type Granularity,
 } from "../components/analytics/analyticsUtils";
 import { useStudyMeter } from "../components/layout/useStudyMeter";
@@ -106,6 +109,11 @@ export default function AnalyticsHub() {
   const daily = data?.daily ?? [];
   const hourly = data?.hourly_today ?? [];
   const byDate = useMemo(() => new Map(daily.map((d) => [d.date, d])), [daily]);
+
+  // Compute active consistency streak across ambient sources + daily history
+  const ambientStreak = useCurrentStreak();
+  const streaks = useMemo(() => studyStreaks(daily, today), [daily, today]);
+  const effectiveStreak = Math.max(ambientStreak, streaks.current);
 
   // Current granularity and index for period navigation
   const currentGran: Granularity = view === "week" ? "week" : view === "month" ? "month" : "day";
@@ -182,14 +190,19 @@ export default function AnalyticsHub() {
     });
   }
 
-  // Tiered entrance: stagger the panels once data settles.
+  // Tiered entrance: stagger the panels once data settles (high & balanced only).
   useLayoutEffect(() => {
-    if (!loaded || !motionAllowed()) return;
+    if (!loaded) return;
+    const targets = rootRef.current?.querySelectorAll(".analytics-panel");
+    if (!targets || targets.length === 0) return;
+
+    if (!motionAllowed()) {
+      // In lite mode, instantly set all cards at rest with zero transform and zero delay
+      gsap.set(targets, { y: 0, opacity: 1, clearProps: "all" });
+      return;
+    }
     const ctx = gsap.context(() => {
-      const targets = rootRef.current?.querySelectorAll(".analytics-panel");
-      if (targets && targets.length > 0) {
-        gsap.from(targets, { y: 18, opacity: 0, duration: 0.5, ease: "power2.out", stagger: 0.07 });
-      }
+      gsap.from(targets, { y: 18, opacity: 0, duration: 0.5, ease: "power2.out", stagger: 0.07 });
     }, rootRef);
     return () => ctx.revert();
   }, [loaded, view]);
@@ -277,7 +290,7 @@ export default function AnalyticsHub() {
     if (view === "week") {
       const weekSlice = slicePeriodDays(daily, "week", weekIdx, today);
       const weekStudied = sumMins(weekSlice.cur);
-      const weekGoal = dailyTarget * 7;
+      const weekGoal = target.weeklyTargetMins;
 
       const sessions = weekRange.data?.focus_sessions ?? 0;
       const avgSecs = weekRange.data?.avg_session_secs ?? 0;
@@ -309,7 +322,7 @@ export default function AnalyticsHub() {
     // view === "month"
     const monthSlice = slicePeriodDays(daily, "month", monthIdx, today);
     const monthStudied = sumMins(monthSlice.cur);
-    const monthGoal = dailyTarget * monthSlice.cur.length;
+    const monthGoal = target.monthlyTargetMins(monthSlice.cur.length);
 
     const sessions = monthIdx === 0 ? (data?.focus_sessions ?? 0) : (monthRange.data?.focus_sessions ?? 0);
     const avgSecs = monthIdx === 0 ? (data?.avg_session_secs ?? 0) : (monthRange.data?.avg_session_secs ?? 0);
@@ -348,6 +361,8 @@ export default function AnalyticsHub() {
     meter,
     data,
     target.targetMins,
+    target.weeklyTargetMins,
+    target.monthlyTargetMins,
     historicalDayRange.data,
     weekRange.data,
     monthRange.data,
@@ -456,6 +471,11 @@ export default function AnalyticsHub() {
               >
                 <ChevronRight size={16} strokeWidth={2} aria-hidden />
               </button>
+
+              {/* Streak Badge right of date, month or week selected (hidden if streak <= 0) */}
+              {effectiveStreak > 0 && (
+                <StreakBadge streak={effectiveStreak} variant="header" className="ml-1" />
+              )}
             </div>
 
             {/* Jump to current button when surfing the past */}
@@ -528,6 +548,7 @@ export default function AnalyticsHub() {
                     periodLabel={activePeriod.label}
                     studiedMins={paceStudiedMins}
                     goalMins={paceGoalMins}
+                    streakDays={effectiveStreak}
                   />
                 </div>
                 <div className="analytics-panel flex-1">
@@ -549,6 +570,7 @@ export default function AnalyticsHub() {
                   periodMode={velocityMode}
                   periodLabel={activePeriod.label}
                   totalDaysInPeriod={velocityTotalDays}
+                  periodGoalMins={paceGoalMins}
                 />
               </div>
               <div className="analytics-panel h-full">
@@ -576,6 +598,7 @@ export default function AnalyticsHub() {
                 }}
                 selectedDays={picks}
                 activeDate={view === "day" ? activePeriod.start : undefined}
+                streakDays={effectiveStreak}
               />
             </div>
           </>
@@ -595,7 +618,14 @@ export default function AnalyticsHub() {
         }}
       />
 
-      <TargetSettings open={targetOpen} onClose={() => setTargetOpen(false)} targetMins={target.targetMins} onSave={target.save} />
+      <TargetSettings
+        open={targetOpen}
+        onClose={() => setTargetOpen(false)}
+        targetMins={target.targetMins}
+        weeklyDays={target.weeklyDays}
+        monthlyDays={target.monthlyDays}
+        onSave={target.save}
+      />
       <DataPrivacySheet open={dataOpen} onClose={() => setDataOpen(false)} />
       <HelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
