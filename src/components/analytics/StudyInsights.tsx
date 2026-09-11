@@ -316,9 +316,14 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
               </span>
             </div>
 
-            <span className="rounded-full bg-white/[0.05] px-2 py-0.5 text-[0.62rem] font-medium text-white/50">
-              {consistencyPct >= 70 ? "Consistent" : consistencyPct >= 40 ? "Building" : "Developing"}
-            </span>
+            <div className="flex items-center gap-1.5">
+              <span className="rounded-full border border-white/10 bg-white/[0.05] px-2 py-0.5 text-[0.62rem] font-semibold text-white/70">
+                {last30.length > 0 ? fmtDateRange(last30[0].date, last30[last30.length - 1].date) : "30 Days"}
+              </span>
+              <span className="rounded-full bg-white/[0.05] px-2 py-0.5 text-[0.62rem] font-medium text-white/50">
+                {consistencyPct >= 70 ? "Consistent" : consistencyPct >= 40 ? "Building" : "Developing"}
+              </span>
+            </div>
           </div>
 
           {/* Hero: Gauge Ring + Big Percentage */}
@@ -338,7 +343,7 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
                   cy={19}
                   r={donutR}
                   fill="none"
-                  stroke={consistencyPct >= 70 ? "#F97316" : consistencyPct >= 40 ? "#2563EB" : "#EF4444"}
+                  stroke={consistencyPct >= 70 ? "#10B981" : consistencyPct >= 40 ? "#2563EB" : "#EF4444"}
                   strokeWidth={3.8}
                   strokeLinecap="round"
                   strokeDasharray={`${donutFill} ${donutC}`}
