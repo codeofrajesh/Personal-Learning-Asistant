@@ -104,10 +104,10 @@ export default function StudyMeter({ collapsed }: Props) {
     // otherwise, so only crossing the goal earns the reward.
     const tone = met
       ? {
-          from: "#10B981",
-          to: "#059669",
-          text: "text-emerald-400",
-          ring: "border-emerald-500/30",
+          from: "#F59E0B",
+          to: "#D97706",
+          text: "text-amber-300",
+          ring: "border-amber-400/30",
           glow: null as string | null,
         }
       : fill >= 0.5

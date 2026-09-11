@@ -290,21 +290,21 @@ export interface PerfTone {
   cellText: string;
 }
 
-// Under target — PURE VIBRANT RED BOX. Striking, crisp, and high-contrast without muddy magenta/wine tint.
+// Under target — TEXTURED VIBRANT CRIMSON RED BOX. Rich dimensional gradient with specular highlight.
 const TONE_UNDER: PerfTone = {
   key: "under",
   label: "Below target",
   solid: "#EF4444",
-  bar: "linear-gradient(to top, #DC2626, #EF4444)",
+  bar: "linear-gradient(to top, #B91C1C, #EF4444)",
   glow: null,
   text: "text-red-400",
   chip: "border-red-500/35 bg-red-500/15 text-red-300",
-  cellBg: "linear-gradient(180deg, #EF4444 0%, #DC2626 100%)",
-  cellBorder: "rgba(255,255,255,0.22)",
+  cellBg: "linear-gradient(180deg, #F87171 0%, #EF4444 35%, #DC2626 70%, #B91C1C 100%)",
+  cellBorder: "rgba(255,255,255,0.24)",
   cellGlow: null,
-  cellText: "text-white font-semibold",
+  cellText: "text-white font-bold",
 };
-// Target met — ROYAL AZURE / SAPPHIRE BLUE BOX. Confident, crisp, satisfying (reverting yellow).
+// Target met — ROYAL AZURE / SAPPHIRE BLUE BOX. Satisfying, crisp, and deep.
 const TONE_MET: PerfTone = {
   key: "met",
   label: "Target met",
@@ -313,24 +313,24 @@ const TONE_MET: PerfTone = {
   glow: null,
   text: "text-blue-400",
   chip: "border-blue-500/35 bg-blue-500/15 text-blue-300",
-  cellBg: "linear-gradient(180deg, #2563EB 0%, #1D4ED8 100%)",
-  cellBorder: "rgba(255,255,255,0.2)",
+  cellBg: "linear-gradient(180deg, #60A5FA 0%, #3B82F6 35%, #2563EB 70%, #1D4ED8 100%)",
+  cellBorder: "rgba(255,255,255,0.24)",
   cellGlow: null,
-  cellText: "text-white font-semibold",
+  cellText: "text-white font-bold",
 };
-// Over target — LUSH EMERALD / JADE GREEN BOX. Rewarding, botanical, zero eye strain.
+// Over target — RADIANT SUN GOLD / AMBER BOX. Supercharged trophy day, replacing green.
 const TONE_OVER: PerfTone = {
   key: "over",
   label: "Over target",
-  solid: "#10B981",
-  bar: "linear-gradient(to top, #047857, #10B981)",
+  solid: "#F59E0B",
+  bar: "linear-gradient(to top, #B45309, #F59E0B)",
   glow: null,
-  text: "text-emerald-400",
-  chip: "border-emerald-500/35 bg-emerald-500/15 text-emerald-300",
-  cellBg: "linear-gradient(180deg, #10B981 0%, #059669 100%)",
-  cellBorder: "rgba(255,255,255,0.2)",
+  text: "text-amber-300",
+  chip: "border-amber-400/35 bg-amber-400/15 text-amber-300",
+  cellBg: "linear-gradient(180deg, #FDE68A 0%, #FBBF24 35%, #F59E0B 70%, #D97706 100%)",
+  cellBorder: "rgba(255,255,255,0.26)",
   cellGlow: null,
-  cellText: "text-white font-semibold",
+  cellText: "text-white font-bold",
 };
 const TONE_NONE: PerfTone = {
   key: "none",
@@ -338,12 +338,12 @@ const TONE_NONE: PerfTone = {
   solid: "#27272A",
   bar: "linear-gradient(to top, #18181b, #27272a)",
   glow: null,
-  text: "text-white/35",
+  text: "text-white/40",
   chip: "border-white/10 bg-white/[0.04] text-white/40",
-  cellBg: "rgba(255,255,255,0.035)",
-  cellBorder: "rgba(255,255,255,0.06)",
+  cellBg: "#171720",
+  cellBorder: "rgba(255,255,255,0.08)",
   cellGlow: null,
-  cellText: "text-white/40 font-medium",
+  cellText: "text-white/45 font-medium",
 };
 
 /** Classify a day's study against the daily target and return its color treatment. */
