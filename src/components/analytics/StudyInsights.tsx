@@ -224,7 +224,19 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
               {bestDay && bestDay.avgMins > 0 ? fmtHM(bestDay.avgMins) : "0m"}
             </span>
             <span className="text-xs font-semibold text-white/60">
-              {bestDay && bestDay.avgMins > 0 ? `avg on ${bestDay.label}s` : "no weekly signal"}
+              {bestDay && bestDay.avgMins > 0
+                ? `avg on ${
+                    {
+                      Sun: "Sundays",
+                      Mon: "Mondays",
+                      Tue: "Tuesdays",
+                      Wed: "Wednesdays",
+                      Thu: "Thursdays",
+                      Fri: "Fridays",
+                      Sat: "Saturdays",
+                    }[bestDay.label] ?? `${bestDay.label}s`
+                  }`
+                : "no weekly signal"}
             </span>
           </div>
 
