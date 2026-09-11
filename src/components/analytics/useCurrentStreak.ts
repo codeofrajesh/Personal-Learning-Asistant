@@ -11,7 +11,7 @@
  *   - `useStreakDetails()`: returns full streak stats including rest days taken inside the run.
  */
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
 import { useScheduleClock } from "../../lib/scheduleClock";
 import { usePlanRevision } from "../../lib/planRevision";
@@ -45,8 +45,6 @@ export function useStreakDetails(): StreakDetails {
   const restDaysMap = useRestDayStore((s) => s.restDays);
   const [details, setDetails] = useState<StreakDetails>(DEFAULT_DETAILS);
 
-  const restDaysSet = useMemo(() => new Set(Object.keys(restDaysMap)), [restDaysMap]);
-
   useEffect(() => {
     if (!isTauri()) return;
     let alive = true;
@@ -54,7 +52,7 @@ export function useStreakDetails(): StreakDetails {
     ipc.studyAnalytics(day, localUtcOffsetMins(), 60)
       .then((analytics) => {
         if (!alive || !analytics?.daily) return;
-        const st = studyStreaks(analytics.daily, day, restDaysSet);
+        const st = studyStreaks(analytics.daily, day, restDaysMap);
         setDetails({
           streak: st.current,
           restDaysInStreak: st.restDaysInStreak,
@@ -72,7 +70,7 @@ export function useStreakDetails(): StreakDetails {
     return () => {
       alive = false;
     };
-  }, [day, revision, restDaysSet]);
+  }, [day, revision, restDaysMap]);
 
   return details;
 }

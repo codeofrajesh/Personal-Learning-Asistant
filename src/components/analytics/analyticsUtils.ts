@@ -700,14 +700,21 @@ export interface StudyStreaks {
 export function studyStreaks(
   daily: DayStudy[],
   today: string,
-  restDays: Set<string> = new Set()
+  restDays: Set<string> | Record<string, any> = new Set()
 ): StudyStreaks {
+  const hasRest = (date: string): boolean => {
+    if (!restDays) return false;
+    if (restDays instanceof Set) return restDays.has(date);
+    if (typeof restDays === "object") return Boolean(restDays[date]);
+    return false;
+  };
+
   if (!daily.length) {
     return {
       current: 0,
       longest: 0,
       activeToday: false,
-      isRestToday: restDays.has(today),
+      isRestToday: hasRest(today),
       restDaysInStreak: 0,
       restDatesInStreak: [],
       longestStartDate: null,
@@ -725,7 +732,7 @@ export function studyStreaks(
 
   for (let i = 0; i < daily.length; i++) {
     const d = daily[i];
-    const isRest = restDays.has(d.date);
+    const isRest = hasRest(d.date);
     if (d.work_mins > 0 || isRest) {
       if (run === 0) runStart = d.date;
       run++;
@@ -746,7 +753,7 @@ export function studyStreaks(
 
   const todayEntry = daily.find((d) => d.date === today);
   const activeToday = Boolean(todayEntry && todayEntry.work_mins > 0);
-  const isRestToday = restDays.has(today);
+  const isRestToday = hasRest(today);
 
   let current = 0;
   let currentStart: string | null = null;
@@ -767,7 +774,7 @@ export function studyStreaks(
   for (let i = scanFrom; i >= 0; i--) {
     const entry = daily[i];
     if (!entry) continue;
-    const isRest = restDays.has(entry.date);
+    const isRest = hasRest(entry.date);
     const hasStudy = entry.work_mins > 0;
 
     if (hasStudy) {

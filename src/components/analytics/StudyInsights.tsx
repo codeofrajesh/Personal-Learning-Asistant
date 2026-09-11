@@ -49,10 +49,10 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
 
   const restDaysMap = useRestDayStore((s) => s.restDays);
   const toggleRestDay = useRestDayStore((s) => s.toggleRestDay);
-  const restDaysSet = useMemo(() => new Set(Object.keys(restDaysMap)), [restDaysMap]);
+  const isRestToday = Boolean(restDaysMap[today]);
 
   const last30 = useMemo(() => daily.slice(Math.max(0, daily.length - 30)), [daily]);
-  const streaks = useMemo(() => studyStreaks(daily, today, restDaysSet), [daily, today, restDaysSet]);
+  const streaks = useMemo(() => studyStreaks(daily, today, restDaysMap), [daily, today, restDaysMap]);
   const rhythm = useMemo(() => weekdayRhythm(last30), [last30]);
   const active = useMemo(() => activeDays(last30), [last30]);
   const consistencyPct = last30.length > 0 ? Math.round((active / last30.length) * 100) : 0;
@@ -152,7 +152,7 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
               </span>
             </div>
 
-            {streaks.isRestToday ? (
+            {isRestToday ? (
               <span className="inline-flex items-center gap-1 rounded-full border border-indigo-500/35 bg-indigo-500/15 px-2 py-0.5 text-[0.62rem] font-semibold text-indigo-300">
                 <Coffee size={10} className="text-indigo-300" />
                 Rest Day Active
@@ -216,18 +216,18 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
             onClick={() => toggleRestDay(today)}
             className={cn(
               "mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border px-3 py-1.5 text-[0.7rem] font-semibold transition-all duration-150 active:scale-[0.98]",
-              streaks.isRestToday
+              isRestToday
                 ? "border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25 shadow-[0_0_12px_rgba(99,102,241,0.2)]"
                 : "border-white/[0.08] bg-white/[0.03] text-white/60 hover:border-indigo-400/30 hover:bg-white/[0.06] hover:text-white"
             )}
             title={
-              streaks.isRestToday
+              isRestToday
                 ? "Click to resume normal tracking for today"
                 : "Pause your streak for today if you have a fever, illness, or busy schedule"
             }
           >
-            <Coffee size={13} className={streaks.isRestToday ? "text-indigo-300" : "text-white/40"} />
-            {streaks.isRestToday ? "Cancel Rest Day (Resume Streak)" : "Take Rest Day Today ☕"}
+            <Coffee size={13} className={isRestToday ? "text-indigo-300" : "text-white/40"} />
+            {isRestToday ? "Cancel Rest Day (Resume Streak)" : "Take Rest Day Today ☕"}
           </button>
         </div>
 

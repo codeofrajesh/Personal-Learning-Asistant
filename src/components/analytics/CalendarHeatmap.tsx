@@ -20,7 +20,7 @@
 
 import { useLayoutEffect, useRef, useState, useMemo, useEffect } from "react";
 import { gsap } from "gsap";
-import { CalendarDays, ChevronLeft, ChevronRight } from "lucide-react";
+import { CalendarDays, ChevronLeft, ChevronRight, Coffee } from "lucide-react";
 import type { DayStudy } from "../../lib/types";
 import { useScheduleClock } from "../../lib/scheduleClock";
 import { motionAllowed } from "../../lib/perfStore";
@@ -37,6 +37,7 @@ import {
   DEFAULT_TARGET_MINS,
 } from "./analyticsUtils";
 import StreakBadge from "./StreakBadge";
+import { useRestDayStore } from "../../lib/restDayStore";
 import { cn } from "../../lib/utils";
 
 interface Props {
@@ -49,7 +50,6 @@ interface Props {
   streakDays?: number;
   restDays?: number;
   restDaysSet?: Set<string>;
-  onToggleRestDay?: (date: string) => void;
 }
 
 const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"];
@@ -69,12 +69,20 @@ export default function CalendarHeatmap({
   activeDate,
   streakDays,
   restDays = 0,
-  restDaysSet = new Set(),
-  onToggleRestDay,
+  restDaysSet,
 }: Props) {
   const today = useScheduleClock((s) => s.day);
   const target = targetMins ?? 0;
   const { earliestDate } = useRetentionSetting();
+
+  // Direct store subscription for instantaneous, single-source-of-truth reactivity
+  const restDaysMap = useRestDayStore((s) => s.restDays);
+  const toggleRestDay = useRestDayStore((s) => s.toggleRestDay);
+  const [restDayMode, setRestDayMode] = useState(false);
+
+  const isDateRest = (date: string): boolean => {
+    return Boolean(restDaysMap[date]) || (restDaysSet?.has(date) ?? false);
+  };
 
   const baseDate = parseLocalDay(today);
   const currentYear = baseDate.getFullYear();
@@ -192,10 +200,19 @@ export default function CalendarHeatmap({
 
   return (
     <div
-      className="relative overflow-hidden rounded-[24px] border border-white/[0.08] p-6 backdrop-blur-2xl shadow-2xl"
+      className={cn(
+        "relative overflow-hidden rounded-[24px] border p-6 backdrop-blur-2xl shadow-2xl transition-all duration-300",
+        restDayMode
+          ? "border-indigo-500/50 shadow-[0_0_35px_rgba(99,102,241,0.2),inset_0_1px_0_rgba(255,255,255,0.1)] ring-1 ring-indigo-500/30"
+          : "border-white/[0.08]"
+      )}
       style={{
-        background: "radial-gradient(ellipse at 50% -15%, rgba(37, 99, 235, 0.07) 0%, transparent 65%), #0d0d12",
-        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.06), 0 20px 40px -15px rgba(0,0,0,0.6)",
+        background: restDayMode
+          ? "radial-gradient(ellipse at 50% -15%, rgba(99, 102, 241, 0.12) 0%, transparent 65%), #0d0d14"
+          : "radial-gradient(ellipse at 50% -15%, rgba(37, 99, 235, 0.07) 0%, transparent 65%), #0d0d12",
+        boxShadow: restDayMode
+          ? "inset 0 1px 0 rgba(255,255,255,0.08), 0 20px 40px -15px rgba(0,0,0,0.7), 0 0 25px rgba(99,102,241,0.15)"
+          : "inset 0 1px 0 rgba(255,255,255,0.06), 0 20px 40px -15px rgba(0,0,0,0.6)",
       }}
     >
       {/* Header with navigation */}
@@ -280,13 +297,33 @@ export default function CalendarHeatmap({
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
           {streakDays != null && streakDays > 0 && (
             <StreakBadge streak={streakDays} restDays={restDays} variant="calendar" />
           )}
 
-          {onPickDay && (
-            <span className="text-[0.64rem] font-medium text-white/35">
+          {/* Dedicated Rest Day Mode Button */}
+          <button
+            type="button"
+            onClick={() => setRestDayMode((v) => !v)}
+            className={cn(
+              "flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[0.68rem] font-semibold transition-all duration-200 active:scale-95",
+              restDayMode
+                ? "border-indigo-500/60 bg-indigo-500/25 text-indigo-200 shadow-[0_0_12px_rgba(99,102,241,0.35)] ring-1 ring-indigo-400/40"
+                : "border-white/[0.08] bg-white/[0.025] text-white/60 hover:border-indigo-500/35 hover:bg-white/[0.05] hover:text-white"
+            )}
+            title={
+              restDayMode
+                ? "Exit Rest Day Mode (Click days to inspect/compare)"
+                : "Enter Rest Day Mode (Click any day cell to toggle rest day status ☕)"
+            }
+          >
+            <Coffee size={12} className={restDayMode ? "text-indigo-300 animate-pulse" : "text-indigo-400/80"} />
+            <span>{restDayMode ? "Exit Rest Day Mode" : "☕ Rest Day Mode"}</span>
+          </button>
+
+          {!restDayMode && onPickDay && (
+            <span className="hidden md:inline text-[0.64rem] font-medium text-white/35">
               Click two days to compare
             </span>
           )}
@@ -316,6 +353,24 @@ export default function CalendarHeatmap({
           </div>
         </div>
       </div>
+
+      {/* Rest Day Mode Active Indicator Banner */}
+      {restDayMode && (
+        <div className="mb-4 flex items-center justify-between rounded-xl border border-indigo-500/40 bg-indigo-950/40 px-3.5 py-2 text-xs text-indigo-200 shadow-[0_0_15px_rgba(99,102,241,0.15)] animate-in fade-in slide-in-from-top-1 duration-200">
+          <div className="flex items-center gap-2">
+            <Coffee size={14} className="text-indigo-300 animate-bounce shrink-0" />
+            <span className="font-semibold">Rest Day Mode Active</span>
+            <span className="text-indigo-300/70 hidden sm:inline">— Click any day cell below to toggle rest day on or off.</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRestDayMode(false)}
+            className="rounded-lg border border-indigo-400/30 bg-indigo-500/25 px-2 py-0.5 text-[0.68rem] font-bold text-indigo-200 hover:bg-indigo-500/40 active:scale-95"
+          >
+            Done
+          </button>
+        </div>
+      )}
 
       {/* Month grids (4 months side-by-side) */}
       <div ref={gridRef} className="grid grid-cols-1 gap-x-6 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
@@ -362,6 +417,47 @@ export default function CalendarHeatmap({
                     );
                   }
 
+                  const isRest = isDateRest(date);
+
+                  // Designated Rest day (Path B relaxation: preserves streak!)
+                  // Renders as a bright crisp white squircle with a vibrant red dot
+                  if (isRest) {
+                    return (
+                      <button
+                        key={date}
+                        type="button"
+                        onClick={() => {
+                          if (restDayMode) {
+                            toggleRestDay(date);
+                          } else {
+                            onSelectDay?.(date);
+                            onPickDay?.(date);
+                          }
+                        }}
+                        disabled={!restDayMode && !onPickDay && !onSelectDay}
+                        title={
+                          restDayMode
+                            ? `${fmtDateShort(date)} · Rest day active · Click to remove rest day ☕`
+                            : `${fmtDateShort(date)} · Rest day (Streak preserved) ☕${entry && entry.work_mins > 0 ? ` · ${fmtHM(entry.work_mins)} focus` : ""}`
+                        }
+                        className={cn(
+                          "relative grid aspect-square place-items-center rounded-[7px] bg-white text-[0.66rem] font-bold text-neutral-900 tabular-nums shadow-[0_0_12px_rgba(255,255,255,0.4)] transition-all duration-150 active:scale-95",
+                          (restDayMode || onPickDay || onSelectDay) && "hover:scale-[1.08] hover:z-10 hover:bg-neutral-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60",
+                          restDayMode && "cursor-pointer ring-2 ring-indigo-400/80 hover:ring-indigo-500",
+                          selected && "ring-2 ring-white ring-offset-2 ring-offset-[#0d0d12]",
+                          isActive && "ring-2 ring-lime ring-offset-2 ring-offset-[#0d0d12]",
+                          !isActive && isToday && "ring-2 ring-blue-500 ring-offset-2 ring-offset-[#0d0d12]",
+                        )}
+                      >
+                        <span className="leading-none">{dom}</span>
+                        <span
+                          className="absolute bottom-1 right-1 h-1.5 w-1.5 rounded-full bg-[#EF4444] shadow-[0_0_4px_#EF4444]"
+                          aria-hidden
+                        />
+                      </button>
+                    );
+                  }
+
                   // Active study day: smooth, consistent, satisfying solid color box
                   if (entry && entry.work_mins > 0) {
                     const tone = performanceTone(entry.work_mins, target);
@@ -370,19 +466,24 @@ export default function CalendarHeatmap({
                         key={date}
                         type="button"
                         onClick={() => {
-                          onSelectDay?.(date);
-                          onPickDay?.(date);
+                          if (restDayMode) {
+                            toggleRestDay(date);
+                          } else {
+                            onSelectDay?.(date);
+                            onPickDay?.(date);
+                          }
                         }}
-                        onContextMenu={(e) => {
-                          e.preventDefault();
-                          onToggleRestDay?.(date);
-                        }}
-                        disabled={!onPickDay && !onSelectDay && !onToggleRestDay}
-                        title={`${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · ${tone.label} (Right-click to toggle rest day ☕)`}
+                        disabled={!restDayMode && !onPickDay && !onSelectDay}
+                        title={
+                          restDayMode
+                            ? `${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · Click to mark rest day ☕`
+                            : `${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · ${tone.label}`
+                        }
                         className={cn(
                           "relative grid aspect-square place-items-center rounded-[7px] text-[0.66rem] font-semibold tabular-nums transition-transform duration-150 active:scale-95",
                           tone.cellText,
-                          (onPickDay || onSelectDay) && "hover:scale-[1.08] hover:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60",
+                          (restDayMode || onPickDay || onSelectDay) && "hover:scale-[1.08] hover:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60",
+                          restDayMode && "cursor-pointer ring-1 ring-indigo-400/40 hover:ring-2 hover:ring-indigo-400",
                           selected && "ring-2 ring-white/90 ring-offset-1 ring-offset-[#0d0d12]",
                           isActive && "ring-2 ring-lime ring-offset-2 ring-offset-[#0d0d12]",
                           !isActive && isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12]",
@@ -391,38 +492,7 @@ export default function CalendarHeatmap({
                           backgroundColor: tone.cellBg,
                         }}
                       >
-                        {dom}
-                      </button>
-                    );
-                  }
-
-                  // Designated Rest day (Path B relaxation: preserves streak!)
-                  const isRest = restDaysSet?.has(date) ?? false;
-                  if (isRest) {
-                    return (
-                      <button
-                        key={date}
-                        type="button"
-                        onClick={() => {
-                          onSelectDay?.(date);
-                          onPickDay?.(date);
-                        }}
-                        onContextMenu={(e) => {
-                          e.preventDefault();
-                          onToggleRestDay?.(date);
-                        }}
-                        disabled={!onPickDay && !onSelectDay && !onToggleRestDay}
-                        title={`${fmtDateShort(date)} · Rest day (Streak preserved) ☕ (Right-click to remove)`}
-                        className={cn(
-                          "relative grid aspect-square place-items-center rounded-[7px] border border-indigo-500/40 bg-indigo-950/45 text-[0.62rem] font-semibold text-indigo-200 tabular-nums transition-colors duration-150 shadow-[inset_0_0_8px_rgba(99,102,241,0.2)]",
-                          (onPickDay || onSelectDay) && "hover:bg-indigo-900/60 hover:text-white active:scale-95",
-                          selected && "ring-2 ring-white/80 ring-offset-1 ring-offset-[#0d0d12]",
-                          isActive && "ring-2 ring-lime ring-offset-2 ring-offset-[#0d0d12]",
-                          !isActive && isToday && "ring-2 ring-indigo-400 ring-offset-2 ring-offset-[#0d0d12]",
-                        )}
-                      >
                         <span>{dom}</span>
-                        <span className="absolute bottom-0.5 right-0.5 h-1 w-1 rounded-full bg-indigo-400 shadow-[0_0_3px_#818cf8]" />
                       </button>
                     );
                   }
@@ -433,18 +503,23 @@ export default function CalendarHeatmap({
                       key={date}
                       type="button"
                       onClick={() => {
-                        onSelectDay?.(date);
-                        onPickDay?.(date);
+                        if (restDayMode) {
+                          toggleRestDay(date);
+                        } else {
+                          onSelectDay?.(date);
+                          onPickDay?.(date);
+                        }
                       }}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        onToggleRestDay?.(date);
-                      }}
-                      disabled={!onPickDay && !onSelectDay && !onToggleRestDay}
-                      title={`${fmtDateShort(date)} · 0m study (Right-click to mark as rest day ☕)`}
+                      disabled={!restDayMode && !onPickDay && !onSelectDay}
+                      title={
+                        restDayMode
+                          ? `${fmtDateShort(date)} · 0m study · Click to mark as rest day ☕`
+                          : `${fmtDateShort(date)} · 0m study`
+                      }
                       className={cn(
                         "grid aspect-square place-items-center rounded-[7px] bg-[#181820] text-[0.62rem] font-medium text-white/35 tabular-nums transition-colors duration-150",
-                        (onPickDay || onSelectDay) && "hover:bg-[#23232c] hover:text-white/70 active:scale-95",
+                        (restDayMode || onPickDay || onSelectDay) && "hover:bg-[#23232c] hover:text-white/70 active:scale-95",
+                        restDayMode && "cursor-pointer ring-1 ring-indigo-400/30 hover:ring-2 hover:ring-indigo-400 hover:scale-[1.08] hover:z-10 hover:border-indigo-500/50",
                         selected && "ring-2 ring-white/80 ring-offset-1 ring-offset-[#0d0d12]",
                         isActive && "ring-2 ring-lime ring-offset-2 ring-offset-[#0d0d12]",
                         !isActive && isToday && "ring-2 ring-blue-400 ring-offset-2 ring-offset-[#0d0d12] text-white font-semibold",
@@ -476,8 +551,11 @@ export default function CalendarHeatmap({
             Over target
           </span>
           <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/60">
-            <span className="flex h-3 w-3 items-center justify-center rounded-[4px] border border-indigo-500/40 bg-indigo-950/60" aria-hidden>
-              <span className="h-1 w-1 rounded-full bg-indigo-400" />
+            <span
+              className="relative flex h-3 w-3 items-center justify-center rounded-[4px] bg-white shadow-[0_0_6px_rgba(255,255,255,0.4)]"
+              aria-hidden
+            >
+              <span className="absolute bottom-0.5 right-0.5 h-1 w-1 rounded-full bg-[#EF4444]" />
             </span>
             Rest day (Preserved)
           </span>
@@ -489,8 +567,9 @@ export default function CalendarHeatmap({
             <span className="h-3 w-3 rounded-[4px] border border-dashed border-white/20 bg-transparent" aria-hidden />
             Future date
           </span>
-          <span className="hidden sm:flex items-center gap-1.5 text-[0.62rem] text-indigo-300/70 border-l border-white/10 pl-3">
-            <span>Tip: Right-click any day to toggle Rest Day ☕</span>
+          <span className="hidden sm:flex items-center gap-1.5 text-[0.62rem] text-indigo-300/80 border-l border-white/10 pl-3">
+            <Coffee size={11} className="text-indigo-400" />
+            <span>Use &quot;☕ Rest Day Mode&quot; button to toggle rest days</span>
           </span>
         </div>
 
