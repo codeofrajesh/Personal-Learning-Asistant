@@ -627,6 +627,36 @@ export interface StudyMeter {
   sessions: number;
 }
 
+/** One local day's study total in the Analytics series (backend `DayStudy`). */
+export interface DayStudy {
+  /** Local `YYYY-MM-DD`. */
+  date: string;
+  /** Minutes of ALL `work` sessions on this LOCAL day (unfiltered — matches the sidebar meter). */
+  work_mins: number;
+}
+
+/** Analytics workspace payload (backend `StudyAnalytics`).
+ *  `daily` is OLDEST-first, fixed length, zero-filled. `hourly_today[h]` is today's `work` minutes
+ *  in local hour `h` (0..23). The `focus_*` fields are the sessionized (gap-based) focus quality
+ *  over the last 30 days — honest sittings, not raw 15s log rows. */
+export interface StudyAnalytics {
+  daily: DayStudy[];
+  hourly_today: number[];
+  focus_sessions: number;
+  avg_session_secs: number;
+  longest_session_secs: number;
+}
+
+/** One arbitrary period for Compare mode (backend `StudyRange`): a zero-filled daily series, an
+ *  hour-of-day distribution across the whole range, and the range's sessionized focus quality. */
+export interface StudyRange {
+  daily: DayStudy[];
+  hourly: number[];
+  focus_sessions: number;
+  avg_session_secs: number;
+  longest_session_secs: number;
+}
+
 // ── Exams & backward planning (v10) ─────────────────────────────────────────
 
 /** A dated exam attached to a course subtree (backend `Exam`). */

@@ -99,6 +99,8 @@ function coreRoute(id: string): string | undefined {
       return "/courses";
     case "planning":
       return "/planning";
+    case "analytics":
+      return "/analytics";
     case "settings":
       return "/settings";
     default:

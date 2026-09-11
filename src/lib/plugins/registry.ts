@@ -15,7 +15,7 @@
 import type { PluginManifest } from "./types";
 import { validateManifest } from "./types";
 import { DashboardIcon, SettingsIcon } from "../../components/ui/icons";
-import { GraduationCap, CalendarCheck } from "lucide-react";
+import { GraduationCap, CalendarCheck, Activity } from "lucide-react";
 import { telegramManifest } from "../../plugins/telegram/manifest";
 
 /** Built-in core nav manifests. These are never pinnable; they always render. */
@@ -51,6 +51,17 @@ function corePlugins(): PluginManifest[] {
       icon: CalendarCheck,
       core: true,
       nav: { defaultPinned: true, order: 2 },
+      routes: [],
+      capabilities: [],
+    },
+    {
+      id: "analytics",
+      name: "Analytics",
+      version: "0.1.0",
+      description: "Study hours over time, pace, and your peak focus windows.",
+      icon: Activity,
+      core: true,
+      nav: { defaultPinned: true, order: 3 },
       routes: [],
       capabilities: [],
     },

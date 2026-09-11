@@ -19,6 +19,7 @@ const Dashboard = lazy(() => import("./pages/Dashboard"));
 const CoursesPage = lazy(() => import("./pages/CoursesPage"));
 const ExploreCategoryPage = lazy(() => import("./pages/ExploreCategoryPage"));
 const PlanningHub = lazy(() => import("./pages/PlanningHub"));
+const AnalyticsHub = lazy(() => import("./pages/AnalyticsHub"));
 const PlayerPage = lazy(() => import("./pages/PlayerPage"));
 const Settings = lazy(() => import("./pages/Settings"));
 const NotFound = lazy(() => import("./pages/NotFound"));
@@ -96,6 +97,14 @@ export default function App() {
             element={
               <Suspense fallback={<PageFallback />}>
                 <PlanningHub />
+              </Suspense>
+            }
+          />
+          <Route
+            path="analytics"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <AnalyticsHub />
               </Suspense>
             }
           />

@@ -47,7 +47,9 @@ import type {
   ScoreWindow,
   SearchResult,
   StreakStatus,
+  StudyAnalytics,
   StudyMeter,
+  StudyRange,
   SubjectView,
   Task,
   TemplateBlockInput,
@@ -472,6 +474,28 @@ export const ipc = {
    *  caveat as `peakHours`: pass `-new Date().getTimezoneOffset()`. */
   studyMeter(day: string, utcOffsetMins: number): Promise<StudyMeter> {
     return call<StudyMeter>("study_meter", { day, utcOffsetMins });
+  },
+
+  /** Per-local-day study totals + today's hour histogram for the Analytics workspace. `days`
+   *  defaults to 60; pass `2 × period` to compare against the previous period. Same SIGN caveat
+   *  as `peakHours`/`studyMeter`: pass `-new Date().getTimezoneOffset()`. */
+  studyAnalytics(day: string, utcOffsetMins: number, days?: number): Promise<StudyAnalytics> {
+    return call<StudyAnalytics>("study_analytics", { day, utcOffsetMins, days });
+  },
+
+  /** Study totals + hour distribution + sessionized focus quality for one arbitrary period
+   *  (Compare mode). `startDay`/`endDay` are LOCAL `YYYY-MM-DD`. Same SIGN caveat as `studyMeter`. */
+  studyRange(startDay: string, endDay: string, utcOffsetMins: number): Promise<StudyRange> {
+    return call<StudyRange>("study_range", { startDay, endDay, utcOffsetMins });
+  },
+
+  /** Delete ALL study sessions (Analytics "Clear study history"). Returns the rows removed and
+   *  bumps the plan revision so the sidebar Study Meter + any open surface re-read immediately. */
+  clearStudyHistory(): Promise<number> {
+    return call<number>("clear_study_history").then((n) => {
+      bumpPlanRevision();
+      return n;
+    });
   },
 
   // ── Exams & backward planning (v10) ─────────────────────────────────────────

@@ -2031,6 +2031,17 @@ pub fn mark_complete(conn: &mut Connection, material_id: i64, completed: bool) -
     Ok(())
 }
 
+/// True when the student has paused study-time tracking (Analytics → Data & Privacy). Checked on
+/// the one write path every session funnels through, so pausing is honoured everywhere at once
+/// (player, media-progress, Pomodoro) from a single setting.
+fn tracking_paused(conn: &Connection) -> bool {
+    get_setting(conn, crate::db::plan::SETTING_TRACKING_PAUSED)
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 /// Log a study session of `seconds` ending now, so the Dashboard activity chart + streak
 /// get genuine data. No-op for non-positive durations (nothing was actually watched).
 ///
@@ -2064,6 +2075,13 @@ pub fn log_study_session(
     session_type: &str,
 ) -> AppResult<()> {
     if seconds <= 0.0 {
+        return Ok(());
+    }
+    // Study-time tracking can be paused by the student (Analytics → Data & Privacy). While paused,
+    // no session row is written and nothing is attributed to the active plan block — but watch
+    // progress / resume (the separate `save_progress` path) keeps working, so pausing analytics
+    // never costs the student their place in a video.
+    if tracking_paused(conn) {
         return Ok(());
     }
     // Server-side sanity cap: reject absurd values (client bug / overflow / runaway timer).
@@ -3393,6 +3411,28 @@ mod tests {
             extension: "mp4".to_string(),
             size_bytes: size,
         }
+    }
+
+    /// Paused tracking makes `log_study_session` a no-op, so a student can stop analytics without
+    /// also losing watch progress (that's the separate `save_progress` path, deliberately not gated).
+    #[test]
+    fn paused_tracking_skips_session_logging() {
+        let conn = test_conn();
+
+        set_setting(&conn, crate::db::plan::SETTING_TRACKING_PAUSED, "true").unwrap();
+        log_study_session(&conn, None, 600.0, "work").unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM study_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "nothing is recorded while tracking is paused");
+
+        // Unpausing resumes recording immediately (no restart needed).
+        set_setting(&conn, crate::db::plan::SETTING_TRACKING_PAUSED, "false").unwrap();
+        log_study_session(&conn, None, 600.0, "work").unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM study_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "recording resumes when unpaused");
     }
 
     // ── Manual lesson order (reorder_materials) ───────────────────────────────

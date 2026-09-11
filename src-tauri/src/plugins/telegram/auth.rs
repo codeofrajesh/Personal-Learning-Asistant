@@ -301,29 +301,20 @@ pub async fn tg_sign_out(app: AppHandle, state: State<'_, TgState>) -> AppResult
 /// The bits the UI needs to render/advance, kept deliberately small across the IPC boundary —
 /// a raw `auth::LoginToken` would leak token bytes and the DC bookkeeping nobody but the
 /// backend should know about.
+/// Result of `tg_request_qr_token`. One tick of the QR-login poll.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
-pub enum QrStatus {
+pub enum QrPollResult {
     /// A fresh (or updated) token to render. `expires_in` is the token's remaining lifetime
     /// in seconds — the QR must be regenerated before it, or the scan will fail.
     Token { base64url: String, expires_in: i32 },
     /// The user scanned and approved with no 2FA; the session is authorized.
     Success,
     /// The user scanned and approved, but the account needs its 2FA password.
-    NeedsPassword,
+    NeedsPassword { password_hint: Option<String> },
     /// Telegram rejected the stored token (expired/invalid). The frontend must stop polling
     /// and let the user tap to get a brand-new QR; the backend token was already cleared.
     Expired,
-}
-
-/// Result of `tg_request_qr_token`. Distinct from `QrStatus` because a scan is one-time:
-/// `NeedsPassword` must surface a hint, and `Success` should clear the in-flight QR login.
-#[derive(Debug, serde::Serialize)]
-pub struct QrPollResult {
-    #[serde(flatten)]
-    pub status: QrStatus,
-    /// Present only when `status == NeedsPassword`.
-    pub password_hint: Option<String>,
 }
 
 /// Handle a single poll tick for QR-code login.
@@ -360,8 +351,7 @@ pub async fn tg_request_qr_token(
     // (the frontend owns the password screen now; it switches to `tg_sign_in_2fa`).
     if let Some(qr) = state.qr_login().await {
         if qr.needs_password {
-            return Ok(QrPollResult {
-                status: QrStatus::NeedsPassword,
+            return Ok(QrPollResult::NeedsPassword {
                 password_hint: None,
             });
         }
@@ -388,8 +378,7 @@ pub async fn tg_request_qr_token(
             let password: tl::types::account::Password = password.into();
             let hint = password.hint.clone();
             state.set_qr_password_token(PasswordToken::new(password)).await;
-            return Ok(QrPollResult {
-                status: QrStatus::NeedsPassword,
+            return Ok(QrPollResult::NeedsPassword {
                 password_hint: hint,
             });
         }
@@ -403,12 +392,9 @@ pub async fn tg_request_qr_token(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i32;
-            Ok(QrPollResult {
-                status: QrStatus::Token {
-                    base64url: base64_url(t.token),
-                    expires_in: 0.max(t.expires - now),
-                },
-                password_hint: None,
+            Ok(QrPollResult::Token {
+                base64url: base64_url(t.token),
+                expires_in: 0.max(t.expires - now),
             })
         }
         tl::enums::auth::LoginToken::MigrateTo(m) => {
@@ -431,8 +417,7 @@ pub async fn tg_request_qr_token(
                     let password: tl::types::account::Password = password.into();
                     let hint = password.hint.clone();
                     state.set_qr_password_token(PasswordToken::new(password)).await;
-                    return Ok(QrPollResult {
-                        status: QrStatus::NeedsPassword,
+                    return Ok(QrPollResult::NeedsPassword {
                         password_hint: hint,
                     });
                 }
@@ -442,21 +427,16 @@ pub async fn tg_request_qr_token(
             if let tl::enums::auth::LoginToken::Success(s) = import {
                 complete_qr_login(&client, s.authorization, &session).await?;
                 state.clear_qr_login().await;
-                Ok(QrPollResult {
-                    status: QrStatus::Success,
-                    password_hint: None,
-                })
+                Ok(QrPollResult::Success)
             } else {
                 Err(AppError::Other("Migration rejected".into()))
             }
         }
         tl::enums::auth::LoginToken::Success(s) => {
+            // Authorized natively (no 2FA required).
             complete_qr_login(&client, s.authorization, &session).await?;
             state.clear_qr_login().await;
-            Ok(QrPollResult {
-                status: QrStatus::Success,
-                password_hint: None,
-            })
+            Ok(QrPollResult::Success)
         }
     }
 }

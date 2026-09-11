@@ -67,6 +67,16 @@ pub fn run() {
                 let today: String = conn.query_row("SELECT date('now')", [], |r| r.get(0))?;
                 let skipped = db::plan::reconcile_plan_days(conn, &today)?;
                 db::queries::backfill_consistency(conn)?;
+                // Opt-in retention: prune study history older than the configured window. Unset or
+                // non-positive means keep everything (the default), so this is a no-op for most
+                // users. One-shot here alongside the other O(days-since-open) boot passes — never a
+                // background loop, so idle CPU stays at zero on the 4 GB target.
+                if let Some(keep) = db::queries::get_setting(conn, db::plan::SETTING_RETENTION_DAYS)?
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .filter(|d| *d > 0)
+                {
+                    let _ = db::plan::prune_study_sessions(conn, keep);
+                }
                 Ok(skipped)
             });
             match boot_reconcile {
@@ -163,6 +173,9 @@ pub fn run() {
             commands::plan::peak_hours,
             commands::plan::streak_status,
             commands::plan::study_meter,
+            commands::plan::study_analytics,
+            commands::plan::study_range,
+            commands::plan::clear_study_history,
             commands::plan::commit_focus,
             commands::plan::resolve_focus,
             commands::plan::focus_contract,

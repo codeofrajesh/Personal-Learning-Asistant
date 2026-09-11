@@ -2346,6 +2346,15 @@ const DEFAULT_GOAL_MINS: i64 = 120;
 /// Settings key for an explicit daily study target, in minutes.
 pub const SETTING_DAILY_GOAL: &str = "study.daily_goal_mins";
 
+/// Settings key: when truthy (`"true"`/`"1"`), study-session logging is paused — the student
+/// turned tracking off in the Analytics workspace. `log_study_session` becomes a no-op; watch
+/// progress/resume (a separate path) is unaffected.
+pub const SETTING_TRACKING_PAUSED: &str = "study.tracking_paused";
+
+/// Settings key: how many days of `study_sessions` history to keep. Unset / non-positive =
+/// keep everything (the default). Enforced by a one-shot [`prune_study_sessions`] on boot.
+pub const SETTING_RETENTION_DAYS: &str = "study.retention_days";
+
 /// Today's time on task, and what it is being measured against.
 #[derive(Debug, Clone, Serialize)]
 pub struct StudyMeter {
@@ -2431,6 +2440,294 @@ pub fn study_meter(conn: &Connection, day: &str, utc_offset_mins: i64) -> AppRes
         goal_source: source.into(),
         sessions,
     })
+}
+
+// ── Analytics workspace (study hours over time) ───────────────────────────────
+
+/// One local day's study total, for the Analytics workspace series.
+#[derive(Debug, Clone, Serialize)]
+pub struct DayStudy {
+    /// Local `YYYY-MM-DD`.
+    pub date: String,
+    /// Minutes of ALL `work` sessions that started on this LOCAL day. Deliberately unfiltered —
+    /// playback is logged in ~15s chunks by `useMediaProgress`, so excluding short rows here would
+    /// undercount real study time and desync from the sidebar `study_meter`.
+    pub work_mins: f64,
+}
+
+/// Sessionized focus quality over a window — honest study *sittings*, not raw log rows.
+struct FocusQuality {
+    /// Distinct study sittings: consecutive `work` sessions less than [`SITTING_GAP_MINS`] apart
+    /// collapse into one. A 30-minute video logs ~120 rows (the 15s flush) but is ONE sitting.
+    sessions: i64,
+    /// Average sitting length, seconds (`total / sessions`).
+    avg_session_secs: f64,
+    /// Longest single uninterrupted sitting, seconds ("deep work sprint").
+    longest_session_secs: f64,
+}
+
+/// The main Analytics workspace payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct StudyAnalytics {
+    /// `days` local days ending on `day`, OLDEST first, zero-filled.
+    pub daily: Vec<DayStudy>,
+    /// Today's `work` minutes per LOCAL hour (0..=23), for the Day-view timeline.
+    pub hourly_today: Vec<f64>,
+    /// Honest sitting count over the last 30 days (the KPI / focus-quality window).
+    pub focus_sessions: i64,
+    /// Average sitting length over the last 30 days, in seconds.
+    pub avg_session_secs: f64,
+    /// Longest single sitting over the last 30 days, in seconds.
+    pub longest_session_secs: f64,
+}
+
+/// A single arbitrary period (Compare mode). Same shape as the main payload minus the "today"
+/// specifics: a zero-filled daily series, an hour-of-day distribution across the whole range, and
+/// the sessionized focus quality for the range.
+#[derive(Debug, Clone, Serialize)]
+pub struct StudyRange {
+    pub daily: Vec<DayStudy>,
+    /// `work` minutes per LOCAL hour (0..=23) across the range — powers the "peak shifted" readout.
+    pub hourly: Vec<f64>,
+    pub focus_sessions: i64,
+    pub avg_session_secs: f64,
+    pub longest_session_secs: f64,
+}
+
+/// Idle minutes between two `work` sessions that split them into separate sittings. 20 minutes:
+/// a short pause (bathroom, a Pomodoro micro-break) keeps one sitting; a real walk-away starts a new
+/// one. This is what turns "2968 sessions" (15s playback flushes) into an honest handful of blocks.
+const SITTING_GAP_MINS: f64 = 20.0;
+
+/// Validate the UTC offset shared by every analytics read and return the SQLite `±N minutes` shift.
+fn offset_shift(utc_offset_mins: i64) -> AppResult<String> {
+    if !(-12 * 60..=14 * 60).contains(&utc_offset_mins) {
+        return Err(AppError::Invalid(format!(
+            "utc_offset_mins {utc_offset_mins} out of range"
+        )));
+    }
+    Ok(format!("{utc_offset_mins} minutes"))
+}
+
+/// `date(day, ±N days)` via SQLite — kept local-correct by operating on the explicit `day`, never
+/// `date('now')`.
+fn add_days(conn: &Connection, day: &str, delta: i64) -> AppResult<String> {
+    Ok(conn.query_row(
+        "SELECT date(?1, ?2)",
+        rusqlite::params![day, format!("{delta} days")],
+        |r| r.get(0),
+    )?)
+}
+
+/// Per-local-day `work` minutes for `[start_day, end_day]`, zero-filled, oldest first.
+///
+/// The zero-fill comes from a recursive date spine LEFT JOINed to the shifted per-day aggregate,
+/// so the chart keeps a stable shape before any sessions exist. The coarse prefilter is bound to
+/// the range (not `datetime('now')`) so it is correct for any reference date.
+fn daily_series(
+    conn: &Connection,
+    start_day: &str,
+    end_day: &str,
+    shift: &str,
+) -> AppResult<Vec<DayStudy>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE spine(d) AS (
+             SELECT date(?1)
+             UNION ALL
+             SELECT date(d, '+1 day') FROM spine WHERE d < ?2
+         ),
+         agg AS (
+             SELECT date(datetime(started_at, ?3)) AS d,
+                    COALESCE(SUM(duration_secs), 0) / 60.0 AS mins
+               FROM study_sessions
+              WHERE COALESCE(session_type, 'work') = 'work'
+                AND started_at >= datetime(?1, '-2 days')
+                AND started_at <  datetime(?2, '+2 days')
+              GROUP BY d
+         )
+         SELECT spine.d, COALESCE(agg.mins, 0.0)
+           FROM spine
+           LEFT JOIN agg ON agg.d = spine.d
+          ORDER BY spine.d",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![start_day, end_day, shift], |r| {
+        Ok(DayStudy {
+            date: r.get(0)?,
+            work_mins: r.get(1)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// `work` minutes per LOCAL hour (0..=23) across `[from_day, to_day]`.
+fn hourly_dist(
+    conn: &Connection,
+    from_day: &str,
+    to_day: &str,
+    shift: &str,
+) -> AppResult<Vec<f64>> {
+    let mut hourly = vec![0.0f64; 24];
+    let mut stmt = conn.prepare(
+        "SELECT CAST(strftime('%H', datetime(started_at, ?1)) AS INTEGER) AS h,
+                COALESCE(SUM(duration_secs), 0) / 60.0
+           FROM study_sessions
+          WHERE COALESCE(session_type, 'work') = 'work'
+            AND date(datetime(started_at, ?1)) BETWEEN ?2 AND ?3
+          GROUP BY h",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![shift, from_day, to_day], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+    })?;
+    for row in rows {
+        let (h, mins) = row?;
+        if (0..24).contains(&h) {
+            hourly[h as usize] = mins;
+        }
+    }
+    Ok(hourly)
+}
+
+/// Sessionize `work` sessions in `[start_day, end_day]` into sittings and report the honest count,
+/// average and longest.
+///
+/// A window function walks the sessions in time order, opening a new sitting whenever the idle gap
+/// from the previous session's END exceeds [`SITTING_GAP_MINS`]. This is what makes the count mean
+/// "focus blocks" rather than "log rows": the 15s playback flushes for one continuous watch all
+/// fall inside a single sitting. Zero/negative-duration rows are excluded outright.
+fn focus_quality(
+    conn: &Connection,
+    start_day: &str,
+    end_day: &str,
+    shift: &str,
+) -> AppResult<FocusQuality> {
+    let (sessions, total_secs, longest_secs): (i64, f64, f64) = conn.query_row(
+        "WITH work AS (
+             SELECT duration_secs, datetime(started_at, ?1) AS ls
+               FROM study_sessions
+              WHERE COALESCE(session_type, 'work') = 'work'
+                AND duration_secs > 0
+                AND date(datetime(started_at, ?1)) BETWEEN ?2 AND ?3
+         ),
+         seq AS (
+             SELECT duration_secs, ls,
+                    LAG(ls) OVER (ORDER BY ls) AS prev_ls,
+                    LAG(duration_secs) OVER (ORDER BY ls) AS prev_dur
+               FROM work
+         ),
+         flagged AS (
+             SELECT duration_secs, ls,
+                    CASE WHEN prev_ls IS NULL
+                              OR (julianday(ls) - julianday(prev_ls)) * 1440.0
+                                 - (COALESCE(prev_dur, 0) / 60.0) > ?4
+                         THEN 1 ELSE 0 END AS is_new
+               FROM seq
+         ),
+         grouped AS (
+             SELECT duration_secs,
+                    SUM(is_new) OVER (ORDER BY ls ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS g
+               FROM flagged
+         ),
+         sittings AS (
+             SELECT SUM(duration_secs) AS secs FROM grouped GROUP BY g
+         )
+         SELECT COUNT(*), COALESCE(SUM(secs), 0.0), COALESCE(MAX(secs), 0.0) FROM sittings",
+        rusqlite::params![shift, start_day, end_day, SITTING_GAP_MINS],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let avg = if sessions > 0 { total_secs / sessions as f64 } else { 0.0 };
+    Ok(FocusQuality {
+        sessions,
+        avg_session_secs: avg,
+        longest_session_secs: longest_secs,
+    })
+}
+
+/// The main Analytics payload: `days` of daily totals, today's hour histogram, and the honest
+/// focus-quality stats over the last 30 days. Read-only; same UTC-offset discipline as
+/// [`peak_hours`] / [`study_meter`].
+pub fn study_analytics(
+    conn: &Connection,
+    day: &str,
+    utc_offset_mins: i64,
+    days: i64,
+) -> AppResult<StudyAnalytics> {
+    let shift = offset_shift(utc_offset_mins)?;
+    let days = days.clamp(1, 366);
+    let start = add_days(conn, day, -(days - 1))?;
+    let start30 = add_days(conn, day, -29)?;
+
+    let daily = daily_series(conn, &start, day, &shift)?;
+    let hourly_today = hourly_dist(conn, day, day, &shift)?;
+    let fq = focus_quality(conn, &start30, day, &shift)?;
+
+    Ok(StudyAnalytics {
+        daily,
+        hourly_today,
+        focus_sessions: fq.sessions,
+        avg_session_secs: fq.avg_session_secs,
+        longest_session_secs: fq.longest_session_secs,
+    })
+}
+
+/// One arbitrary `[start_day, end_day]` period for Compare mode. The span is guarded (0..=400 days)
+/// so a malformed range can't build a runaway date spine.
+pub fn study_range(
+    conn: &Connection,
+    start_day: &str,
+    end_day: &str,
+    utc_offset_mins: i64,
+) -> AppResult<StudyRange> {
+    let shift = offset_shift(utc_offset_mins)?;
+    let span_days: i64 = conn.query_row(
+        "SELECT CAST(julianday(?2) - julianday(?1) AS INTEGER)",
+        rusqlite::params![start_day, end_day],
+        |r| r.get(0),
+    )?;
+    if !(0..=400).contains(&span_days) {
+        return Err(AppError::Invalid(format!(
+            "range span {span_days} days out of bounds (0..=400)"
+        )));
+    }
+
+    let daily = daily_series(conn, start_day, end_day, &shift)?;
+    let hourly = hourly_dist(conn, start_day, end_day, &shift)?;
+    let fq = focus_quality(conn, start_day, end_day, &shift)?;
+
+    Ok(StudyRange {
+        daily,
+        hourly,
+        focus_sessions: fq.sessions,
+        avg_session_secs: fq.avg_session_secs,
+        longest_session_secs: fq.longest_session_secs,
+    })
+}
+
+/// Delete `study_sessions` older than `keep_days` (UTC-coarse; retention is a months-scale policy,
+/// so the local/UTC boundary is irrelevant). Returns how many rows were removed. `keep_days` is
+/// clamped to 1..=3650 so a stray 0 can't wipe today's history. Mirrors [`prune_reminders`].
+///
+/// Safe against the score history: `consistency_log` already captured each past day's
+/// `study_minutes` snapshot, so pruning the raw sessions never rewrites a past score. Only ever
+/// called on boot when the student set a finite retention (default is keep-forever = never called).
+pub fn prune_study_sessions(conn: &Connection, keep_days: i64) -> AppResult<i64> {
+    let keep = keep_days.clamp(1, 3650);
+    let n = conn.execute(
+        "DELETE FROM study_sessions WHERE started_at < datetime('now', ?1)",
+        [format!("-{keep} days")],
+    )?;
+    Ok(n as i64)
+}
+
+/// Delete ALL study sessions (the Analytics "Clear study history" control, behind a confirm).
+/// Returns the number of rows removed. `study_sessions.material_id` has no dependents, so this is
+/// a clean single-statement delete — it does not touch materials, watch progress, or the plan.
+pub fn clear_study_history(conn: &Connection) -> AppResult<i64> {
+    let n = conn.execute("DELETE FROM study_sessions", [])?;
+    Ok(n as i64)
 }
 
 /// Node ids with an active exam still ahead of `today`, including every ancestor of the exam's
@@ -3670,6 +3967,140 @@ mod tests {
         let m = study_meter(&conn, DAY, 0).unwrap();
         assert!((m.studied_mins - 30.0).abs() < 0.01, "only the work session counts");
         assert_eq!(m.sessions, 1);
+    }
+
+    // ── Analytics workspace ────────────────────────────────────────────────────
+
+    /// The analytics series buckets each session onto the student's LOCAL day, returns exactly
+    /// `days` slots (oldest first), zero-fills empty days, and excludes breaks.
+    #[test]
+    fn study_analytics_buckets_local_days_and_zero_fills() {
+        let conn = test_conn();
+        // Two back-to-back work sessions (one sitting) + one break, all 2026-07-31 in UTC.
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES('2026-07-31 02:00:00', 1800, 'work'),
+                   ('2026-07-31 02:30:00', 1800, 'work'),
+                   ('2026-07-31 03:00:00', 3600, 'short_break')",
+            [],
+        )
+        .unwrap();
+
+        // UTC: both work sessions land on DAY; the window is 7 fixed slots, oldest first.
+        let a = study_analytics(&conn, DAY, 0, 7).unwrap();
+        assert_eq!(a.daily.len(), 7, "one slot per requested day");
+        assert_eq!(a.daily[0].date, "2026-07-25", "oldest slot is day-6");
+        assert_eq!(a.daily[6].date, DAY, "newest slot is `day`");
+        assert!((a.daily[6].work_mins - 60.0).abs() < 0.01, "60m of work (break excluded)");
+        assert!(
+            a.daily[..6].iter().all(|d| d.work_mins == 0.0),
+            "empty days are real zeros, not missing"
+        );
+        // Focus quality: the two back-to-back sessions are ONE sitting (60m), break excluded.
+        assert_eq!(a.focus_sessions, 1, "back-to-back sessions collapse into one sitting");
+        assert!((a.longest_session_secs - 3600.0).abs() < 1.0);
+
+        // UTC-5 → 21:00 on the 30th: DAY reads zero and the 30th holds the study.
+        let est = study_analytics(&conn, DAY, -300, 7).unwrap();
+        assert_eq!(est.daily[6].work_mins, 0.0, "not today in New York");
+        let prev = est.daily.iter().find(|d| d.date == "2026-07-30").unwrap();
+        assert!((prev.work_mins - 60.0).abs() < 0.01, "it's yesterday's study there");
+
+        assert!(study_analytics(&conn, DAY, 99_999, 7).is_err(), "a nonsense offset is refused");
+    }
+
+    /// Focus quality sessionizes by idle gap: short gaps merge into one sitting, a long gap splits.
+    /// This is what turns thousands of 15s playback flushes into an honest handful of blocks.
+    #[test]
+    fn focus_quality_sessionizes_by_gap() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES('2026-07-31 10:00:00', 600, 'work'),    -- 10:00–10:10
+                   ('2026-07-31 10:15:00', 600, 'work'),    -- 10:15–10:25  (5m gap → same sitting)
+                   ('2026-07-31 11:05:00', 1200, 'work'),   -- 11:05–11:25  (40m gap → new sitting)
+                   ('2026-07-31 12:00:00', 30, 'short_break')",
+            [],
+        )
+        .unwrap();
+
+        let a = study_analytics(&conn, DAY, 0, 30).unwrap();
+        assert_eq!(a.focus_sessions, 2, "the 5m gap merges, the 40m gap splits");
+        // Sitting 1 = 600 + 600 = 1200s; sitting 2 = 1200s → longest 1200, avg 1200.
+        assert!((a.longest_session_secs - 1200.0).abs() < 1.0);
+        assert!((a.avg_session_secs - 1200.0).abs() < 1.0);
+    }
+
+    /// `study_range` covers an arbitrary window (Compare mode), zero-filled, and rejects a reversed
+    /// or over-long span.
+    #[test]
+    fn study_range_covers_an_arbitrary_window() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES('2026-06-15 09:00:00', 3600, 'work')",
+            [],
+        )
+        .unwrap();
+
+        let r = study_range(&conn, "2026-06-01", "2026-06-30", 0).unwrap();
+        assert_eq!(r.daily.len(), 30, "June has 30 days");
+        let d = r.daily.iter().find(|d| d.date == "2026-06-15").unwrap();
+        assert!((d.work_mins - 60.0).abs() < 0.01);
+        assert_eq!(r.focus_sessions, 1);
+        assert!((r.hourly[9] - 60.0).abs() < 0.01, "09:00 UTC bucket");
+
+        assert!(study_range(&conn, "2026-06-30", "2026-06-01", 0).is_err(), "reversed range rejected");
+    }
+
+    /// `hourly_today` places today's sessions in the right LOCAL hour bucket (24 slots).
+    #[test]
+    fn study_analytics_hourly_today_is_local() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES('2026-07-31 18:00:00', 3600, 'work')",
+            [],
+        )
+        .unwrap();
+
+        let utc = study_analytics(&conn, DAY, 0, 1).unwrap();
+        assert_eq!(utc.hourly_today.len(), 24);
+        assert!((utc.hourly_today[18] - 60.0).abs() < 0.01, "18:00 UTC");
+        assert_eq!(utc.hourly_today.iter().filter(|&&m| m > 0.0).count(), 1);
+
+        // UTC-8 → 10:00 local, same day.
+        let pst = study_analytics(&conn, DAY, -480, 1).unwrap();
+        assert!((pst.hourly_today[10] - 60.0).abs() < 0.01, "10:00 in UTC-8");
+        assert_eq!(pst.hourly_today[18], 0.0);
+    }
+
+    /// Retention prune drops sessions older than the window and keeps recent ones; clear wipes all.
+    #[test]
+    fn prune_and_clear_study_history_behave() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO study_sessions(started_at, duration_secs, session_type)
+             VALUES(datetime('now', '-400 days'), 600, 'work'),
+                   (datetime('now', '-1 days'), 600, 'work'),
+                   (datetime('now'), 600, 'work')",
+            [],
+        )
+        .unwrap();
+
+        // Keep 90 days → only the 400-day-old row is removed.
+        assert_eq!(prune_study_sessions(&conn, 90).unwrap(), 1);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM study_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "the two recent sessions survive");
+
+        // Clear removes everything that remains.
+        assert_eq!(clear_study_history(&conn).unwrap(), 2);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM study_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     /// The goal prefers the day's own commitment, falls back to the setting, then to the default —

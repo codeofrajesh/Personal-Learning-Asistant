@@ -22,8 +22,8 @@ use tauri::State;
 use crate::db::plan::{
     self, BlockInputDto, DayPlan, Exam, ExamInputDto, ExamPlan, FocusContract, FocusRecord,
     PeakHour, PlanBlock, PlanTemplate,
-    PlanTemplateBlock, ReminderState, StreakStatus, StudyMeter, TemplateBlockInputDto,
-    TemplateInputDto,
+    PlanTemplateBlock, ReminderState, StreakStatus, StudyAnalytics, StudyMeter,
+    StudyRange, TemplateBlockInputDto, TemplateInputDto,
 };
 use crate::db::queries::{self, ScoreWindow};
 use crate::db::Db;
@@ -330,6 +330,45 @@ pub fn peak_hours(
 pub fn study_meter(db: State<'_, Db>, day: String, utc_offset_mins: i64) -> AppResult<StudyMeter> {
     validate_day(&day)?;
     db.with(|conn| plan::study_meter(conn, &day, utc_offset_mins))
+}
+
+/// Per-local-day study totals + today's hour histogram for the Analytics workspace. READ-ONLY.
+///
+/// `utc_offset_mins` is required for the same reason as [`peak_hours`] / [`study_meter`]: sessions
+/// are stored in UTC and must be shifted to the caller's local time before bucketing by day/hour.
+/// `days` defaults to 60; callers pass `2 × period` when they want a previous-period comparison.
+#[tauri::command]
+pub fn study_analytics(
+    db: State<'_, Db>,
+    day: String,
+    utc_offset_mins: i64,
+    days: Option<i64>,
+) -> AppResult<StudyAnalytics> {
+    validate_day(&day)?;
+    let window = days.unwrap_or(60);
+    db.with(|conn| plan::study_analytics(conn, &day, utc_offset_mins, window))
+}
+
+/// Delete ALL study sessions (the Analytics "Clear study history" control). Returns rows removed.
+/// The UI gates this behind a confirm dialog; only the study-time history is affected — materials,
+/// watch progress and the plan are untouched.
+#[tauri::command]
+pub fn clear_study_history(db: State<'_, Db>) -> AppResult<i64> {
+    db.with(|conn| plan::clear_study_history(conn))
+}
+
+/// One arbitrary `[start_day, end_day]` period for the Analytics Compare mode. READ-ONLY. Both
+/// days are LOCAL `YYYY-MM-DD`; the span is guarded backend-side (0..=400 days).
+#[tauri::command]
+pub fn study_range(
+    db: State<'_, Db>,
+    start_day: String,
+    end_day: String,
+    utc_offset_mins: i64,
+) -> AppResult<StudyRange> {
+    validate_day(&start_day)?;
+    validate_day(&end_day)?;
+    db.with(|conn| plan::study_range(conn, &start_day, &end_day, utc_offset_mins))
 }
 
 // ── Exams & backward planning (v10) ──────────────────────────────────────────

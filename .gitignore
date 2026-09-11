@@ -25,3 +25,10 @@ npm-debug.log*
 
 # Notes
 Errors.md
+
+# Scratch / Test
+src-tauri/test_qr_login/
+test_updater/
+check_db.py
+test.rs
+test_serde.rs
