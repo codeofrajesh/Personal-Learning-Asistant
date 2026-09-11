@@ -31,15 +31,15 @@ interface Props {
 }
 
 /** Gradient stops + accent per pace state using the unified color system:
- *  - behind pace: Crimson Red (#DC2626 -> #B91C1C)
- *  - on pace / ahead: Sun Yellow / Amber (#F59E0B -> #D97706)
- *  - goal crushed / over target: Neon Green (#22C55E -> #16A34A)
+ *  - behind pace: Calm Ruby / Crimson (#BE123C -> #9F1239)
+ *  - on pace / ahead: Royal Azure Blue (#2563EB -> #1D4ED8)
+ *  - goal crushed / over target: Lush Emerald (#10B981 -> #059669)
  */
 const TONES: Record<PaceState, { from: string; to: string; text: string; glow: boolean; chip: string; label: string; Icon: typeof Target }> = {
-  crushed: { from: "#22C55E", to: "#16A34A", text: "text-green-400", glow: false, chip: "border-green-500/35 bg-green-500/15 text-green-300", label: "Crushed", Icon: Zap },
-  ahead: { from: "#F59E0B", to: "#D97706", text: "text-amber-300", glow: false, chip: "border-amber-400/35 bg-amber-400/12 text-amber-300", label: "Ahead", Icon: TrendingUp },
-  warning: { from: "#DC2626", to: "#B91C1C", text: "text-red-400", glow: false, chip: "border-red-500/35 bg-red-500/12 text-red-300", label: "Behind pace", Icon: Clock },
-  idle: { from: "#F59E0B", to: "#D97706", text: "text-amber-300", glow: false, chip: "border-amber-400/25 bg-amber-400/10 text-amber-300", label: "No target", Icon: Target },
+  crushed: { from: "#10B981", to: "#059669", text: "text-emerald-300", glow: false, chip: "border-emerald-500/35 bg-emerald-500/15 text-emerald-300", label: "Crushed", Icon: Zap },
+  ahead: { from: "#2563EB", to: "#1D4ED8", text: "text-blue-300", glow: false, chip: "border-blue-500/35 bg-blue-500/15 text-blue-300", label: "Ahead", Icon: TrendingUp },
+  warning: { from: "#BE123C", to: "#9F1239", text: "text-rose-300", glow: false, chip: "border-rose-500/35 bg-rose-500/12 text-rose-300", label: "Behind pace", Icon: Clock },
+  idle: { from: "#2563EB", to: "#1D4ED8", text: "text-blue-300", glow: false, chip: "border-blue-500/25 bg-blue-500/10 text-blue-300", label: "No target", Icon: Target },
 };
 
 // Geometry: a 270° arc (gap at the bottom). pathLength=100 makes the dash units read as percent.

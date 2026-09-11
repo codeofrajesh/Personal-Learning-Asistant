@@ -193,7 +193,7 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
               cy={18}
               r={donutR}
               fill="none"
-              stroke={consistencyPct >= 70 ? "#22C55E" : consistencyPct >= 40 ? "#F59E0B" : "#DC2626"}
+              stroke={consistencyPct >= 70 ? "#10B981" : consistencyPct >= 40 ? "#2563EB" : "#BE123C"}
               strokeWidth={3.5}
               strokeLinecap="round"
               strokeDasharray={`${donutFill} ${donutC}`}

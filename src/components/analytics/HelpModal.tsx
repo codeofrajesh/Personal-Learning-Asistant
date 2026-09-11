@@ -112,16 +112,16 @@ export default function HelpModal({ open, onClose }: Props) {
         </p>
         <div className="pt-1.5 space-y-1">
           <p className="flex items-center gap-2">
-            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#DC2626]" />
-            <span className="font-medium text-content-primary">Crimson Red:</span> Below target — logged study time under target; a clear visual cue to stay consistent.
+            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#BE123C]" />
+            <span className="font-medium text-content-primary">Ruby Crimson:</span> Below target — logged study time under target; a clear visual cue to stay consistent.
           </p>
           <p className="flex items-center gap-2">
-            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#F59E0B]" />
-            <span className="font-medium text-content-primary">Sun Yellow:</span> Target met — you reached 100% of your daily goal.
+            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#2563EB]" />
+            <span className="font-medium text-content-primary">Royal Azure Blue:</span> Target met — you reached 100% of your daily goal.
           </p>
           <p className="flex items-center gap-2">
-            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#22C55E]" />
-            <span className="font-medium text-content-primary">Neon Green:</span> Over target — you exceeded your daily goal (110%+).
+            <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#10B981]" />
+            <span className="font-medium text-content-primary">Lush Emerald:</span> Over target — you exceeded your daily goal (110%+).
           </p>
           <p className="flex items-center gap-2">
             <span className="inline-block h-2.5 w-2.5 rounded-[3px] bg-[#27272A]" />

@@ -299,9 +299,9 @@ function AxisRow({ labels }: { labels: string[] }) {
 /** The performance-color key (+ optional weekend / last-week / target markers). */
 function PerfLegend({ target, weekend = false, lastWeek = false }: { target: boolean; weekend?: boolean; lastWeek?: boolean }) {
   const items: { color: string; label: string }[] = [
-    { color: "#DC2626", label: "Below" },
-    { color: "#F59E0B", label: "Met" },
-    { color: "#22C55E", label: "Over" },
+    { color: "#BE123C", label: "Below" },
+    { color: "#2563EB", label: "Met" },
+    { color: "#10B981", label: "Over" },
   ];
   return (
     <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1">

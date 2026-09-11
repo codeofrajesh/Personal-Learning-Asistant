@@ -104,25 +104,25 @@ export default function StudyMeter({ collapsed }: Props) {
     // otherwise, so only crossing the goal earns the reward.
     const tone = met
       ? {
-          from: "#22C55E",
-          to: "#16A34A",
-          text: "text-green-400",
-          ring: "border-green-500/30",
+          from: "#10B981",
+          to: "#059669",
+          text: "text-emerald-400",
+          ring: "border-emerald-500/30",
           glow: null as string | null,
         }
       : fill >= 0.5
         ? {
-            from: "#F59E0B",
-            to: "#D97706",
-            text: "text-amber-300",
-            ring: "border-amber-400/25",
+            from: "#2563EB",
+            to: "#1D4ED8",
+            text: "text-blue-300",
+            ring: "border-blue-400/25",
             glow: null as string | null,
           }
         : {
-            from: "#DC2626",
-            to: "#B91C1C",
-            text: "text-red-400",
-            ring: "border-red-500/25",
+            from: "#BE123C",
+            to: "#9F1239",
+            text: "text-rose-400",
+            ring: "border-rose-500/25",
             glow: null as string | null,
           };
 

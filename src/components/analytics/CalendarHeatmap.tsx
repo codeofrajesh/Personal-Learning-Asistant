@@ -33,6 +33,7 @@ import {
   calendarMonthsOfWindow,
   CALENDAR_WINDOWS,
   parseLocalDay,
+  DEFAULT_TARGET_MINS,
 } from "./analyticsUtils";
 import { cn } from "../../lib/utils";
 
@@ -131,17 +132,42 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
     return () => ctx.revert();
   }, [selectedYear, windowIndex]);
 
+  // Compute window study metrics to give motivating stats
+  const windowMetrics = useMemo(() => {
+    let studiedDays = 0;
+    let metDays = 0;
+    let totalMins = 0;
+    const effectiveTarget = target > 0 ? target : DEFAULT_TARGET_MINS;
+    for (const m of months) {
+      for (const { date } of m.days) {
+        if (date > today) continue;
+        const e = byDate.get(date);
+        if (e && e.work_mins > 0) {
+          studiedDays++;
+          totalMins += e.work_mins;
+          if (e.work_mins >= effectiveTarget) {
+            metDays++;
+          }
+        }
+      }
+    }
+    return { studiedDays, metDays, totalMins };
+  }, [months, byDate, today, target]);
+
   return (
     <div
-      className="rounded-[20px] border border-white/[0.06] bg-[#121215] p-5 backdrop-blur-xl"
-      style={{ boxShadow: "inset 0 1px 1px rgba(255,255,255,0.04)" }}
+      className="relative overflow-hidden rounded-[24px] border border-white/[0.08] p-6 backdrop-blur-2xl shadow-2xl"
+      style={{
+        background: "radial-gradient(ellipse at 50% -15%, rgba(37, 99, 235, 0.07) 0%, transparent 65%), #0d0d12",
+        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.06), 0 20px 40px -15px rgba(0,0,0,0.6)",
+      }}
     >
       {/* Header with navigation */}
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
-          <span className="flex items-center gap-1.5 text-[0.62rem] font-medium uppercase tracking-wide text-white/40">
-            <CalendarDays size={13} strokeWidth={2.25} className="text-lime" aria-hidden />
-            Consistency
+          <span className="flex items-center gap-1.5 text-[0.68rem] font-semibold uppercase tracking-wider text-white/50">
+            <CalendarDays size={14} strokeWidth={2.25} className="text-blue-400" aria-hidden />
+            Consistency Tracker
           </span>
 
           {/* Year pill */}
@@ -150,10 +176,10 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
               type="button"
               onClick={() => setYearPickerOpen((v) => !v)}
               className={cn(
-                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[0.68rem] font-semibold tabular-nums transition-colors",
+                "flex items-center gap-1 rounded-full border px-3 py-1 text-[0.7rem] font-semibold tabular-nums transition-colors",
                 yearPickerOpen
-                  ? "border-lime/40 bg-lime/10 text-lime"
-                  : "border-white/[0.08] bg-white/[0.03] text-content-secondary hover:bg-white/[0.06]",
+                  ? "border-blue-500/40 bg-blue-500/10 text-blue-300"
+                  : "border-white/[0.08] bg-white/[0.03] text-content-secondary hover:bg-white/[0.06] hover:text-white",
               )}
             >
               {selectedYear}
@@ -165,7 +191,7 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
               />
             </button>
             {yearPickerOpen && (
-              <div className="absolute left-0 top-full z-30 mt-1.5 min-w-[5.5rem] rounded-[14px] border border-white/[0.08] bg-[#1a1a1e]/95 p-1.5 shadow-xl backdrop-blur-xl">
+              <div className="absolute left-0 top-full z-30 mt-1.5 min-w-[5.5rem] rounded-[14px] border border-white/10 bg-[#16161c]/95 p-1.5 shadow-2xl backdrop-blur-xl">
                 {years.map((yr) => (
                   <button
                     key={yr}
@@ -180,8 +206,8 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                     className={cn(
                       "block w-full rounded-[10px] px-3 py-1.5 text-left text-[0.72rem] font-semibold tabular-nums transition-colors",
                       yr === selectedYear
-                        ? "bg-lime/15 text-lime"
-                        : "text-content-secondary hover:bg-white/[0.06]",
+                        ? "bg-blue-500/20 text-blue-300 font-bold"
+                        : "text-content-secondary hover:bg-white/[0.06] hover:text-white",
                     )}
                   >
                     {yr}
@@ -192,7 +218,7 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
           </div>
 
           {/* Month window navigation pill (4 months in one window, 4*3 = 12 months) */}
-          <div className="flex items-center rounded-full border border-white/[0.08] bg-white/[0.03] p-0.5 text-[0.62rem]">
+          <div className="flex items-center rounded-full border border-white/[0.08] bg-white/[0.025] p-0.5 text-[0.64rem]">
             {CALENDAR_WINDOWS.map((winLabel, idx) => {
               const isFuture = selectedYear === currentYear && idx > currentWindowIndex;
               const isSelected = windowIndex === idx;
@@ -203,12 +229,12 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
                   disabled={isFuture}
                   onClick={() => setWindowIndex(idx)}
                   className={cn(
-                    "rounded-full px-2.5 py-0.5 font-medium transition-all duration-200",
+                    "rounded-full px-3 py-1 font-medium transition-all duration-200",
                     isSelected
-                      ? "bg-lime/15 font-semibold text-lime shadow-[0_0_8px_-2px_rgba(190,255,61,0.3)]"
+                      ? "bg-white/12 font-semibold text-white shadow-sm border border-white/10"
                       : isFuture
                         ? "opacity-25 cursor-not-allowed text-white/30"
-                        : "text-white/40 hover:text-white/70 hover:bg-white/[0.04]",
+                        : "text-white/45 hover:text-white/80 hover:bg-white/[0.04]",
                   )}
                 >
                   {winLabel}
@@ -218,18 +244,22 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          {onPickDay && <span className="text-[0.6rem] text-white/30">Click two days to compare</span>}
+        <div className="flex items-center gap-3">
+          {onPickDay && (
+            <span className="text-[0.64rem] font-medium text-white/35">
+              Click two days to compare
+            </span>
+          )}
 
           {/* Prev / Next 4 months */}
-          <div className="flex items-center gap-0.5 rounded-full border border-white/[0.06] bg-white/[0.02] p-0.5">
+          <div className="flex items-center gap-1 rounded-full border border-white/[0.08] bg-white/[0.025] p-0.5">
             <button
               type="button"
               onClick={goPrev}
               disabled={cannotGoPrev}
               aria-label="Previous 4 months"
               title="Previous 4 months"
-              className="grid h-6 w-6 place-items-center rounded-full text-content-secondary transition-colors hover:bg-white/[0.06] disabled:opacity-25"
+              className="grid h-7 w-7 place-items-center rounded-full text-white/60 transition-colors hover:bg-white/[0.08] hover:text-white disabled:opacity-20"
             >
               <ChevronLeft size={14} aria-hidden />
             </button>
@@ -239,7 +269,7 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
               disabled={cannotGoNext}
               aria-label="Next 4 months"
               title="Next 4 months"
-              className="grid h-6 w-6 place-items-center rounded-full text-content-secondary transition-colors hover:bg-white/[0.06] disabled:opacity-25"
+              className="grid h-7 w-7 place-items-center rounded-full text-white/60 transition-colors hover:bg-white/[0.08] hover:text-white disabled:opacity-20"
             >
               <ChevronRight size={14} aria-hidden />
             </button>
@@ -249,71 +279,164 @@ export default function CalendarHeatmap({ daily, targetMins, onPickDay, selected
 
       {/* Month grids (4 months side-by-side) */}
       <div ref={gridRef} className="grid grid-cols-1 gap-x-6 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
-        {months.map((m) => (
-          <div key={`${m.year}-${m.monthIndex}`}>
-            <div className="mb-2 text-[0.72rem] font-semibold text-content-secondary">{m.label}</div>
-            <div className="grid grid-cols-7 gap-1">
-              {WEEKDAYS.map((w, i) => (
-                <div key={`h${i}`} className="pb-0.5 text-center text-[0.5rem] font-medium text-white/25">
-                  {w}
-                </div>
-              ))}
-              {Array.from({ length: m.leading }).map((_, i) => (
-                <div key={`pad${i}`} aria-hidden />
-              ))}
-              {m.days.map(({ date, dom }) => {
-                const entry = byDate.get(date);
-                if (!entry) {
-                  // Outside the fetched window or in the future — a quiet, non-interactive slot.
-                  return <div key={date} className="aspect-square rounded-[6px] border border-white/[0.03]" aria-hidden />;
-                }
-                const tone = performanceTone(entry.work_mins, target);
-                const selected = selectedDays?.includes(date) ?? false;
-                return (
-                  <button
-                    key={date}
-                    type="button"
-                    onClick={() => onPickDay?.(date)}
-                    disabled={!onPickDay}
-                    title={`${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · ${tone.label}`}
-                    className={cn(
-                      "grid aspect-square place-items-center rounded-[6px] border text-[0.62rem] font-semibold tabular-nums transition-transform duration-150",
-                      tone.cellText,
-                      onPickDay && "hover:scale-[1.12] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50",
-                      selected && "ring-2 ring-white/80",
-                    )}
-                    style={{
-                      background: tone.cellBg,
-                      borderColor: tone.cellBorder,
-                      boxShadow: tone.key !== "none" ? "inset 0 1px 0 rgba(255,255,255,0.18)" : undefined,
-                    }}
-                  >
-                    {dom}
-                  </button>
-                );
-              })}
+        {months.map((m) => {
+          const isCurrentMonth = m.year === currentYear && m.monthIndex === currentMonth;
+          return (
+            <div key={`${m.year}-${m.monthIndex}`} className="flex flex-col">
+              <div className="mb-3 flex items-center justify-between">
+                <span className="text-[0.75rem] font-semibold tracking-tight text-white/90">
+                  {m.label}
+                </span>
+                {isCurrentMonth && (
+                  <span className="rounded-full border border-blue-500/30 bg-blue-500/15 px-1.5 py-0.5 text-[0.55rem] font-semibold uppercase tracking-wider text-blue-300">
+                    Current
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-7 gap-1.5">
+                {WEEKDAYS.map((w, i) => (
+                  <div key={`h${i}`} className="pb-1 text-center text-[0.55rem] font-semibold tracking-wider text-white/30 select-none">
+                    {w}
+                  </div>
+                ))}
+                {Array.from({ length: m.leading }).map((_, i) => (
+                  <div key={`pad${i}`} aria-hidden />
+                ))}
+                {m.days.map(({ date, dom }) => {
+                  const entry = byDate.get(date);
+                  const isToday = date === today;
+                  const isFuture = date > today;
+                  const selected = selectedDays?.includes(date) ?? false;
+
+                  // Future day: intentional, quiet slot with visible date number
+                  if (isFuture) {
+                    return (
+                      <div
+                        key={date}
+                        title={`${fmtDateShort(date)} · Upcoming`}
+                        className="grid aspect-square place-items-center rounded-[7px] border border-white/[0.035] bg-white/[0.015] text-[0.62rem] font-normal text-white/20 select-none cursor-default"
+                      >
+                        {dom}
+                      </div>
+                    );
+                  }
+
+                  // Active study day: rich beveled gem tile
+                  if (entry && entry.work_mins > 0) {
+                    const tone = performanceTone(entry.work_mins, target);
+                    return (
+                      <button
+                        key={date}
+                        type="button"
+                        onClick={() => onPickDay?.(date)}
+                        disabled={!onPickDay}
+                        title={`${fmtDateShort(date)} · ${fmtHM(entry.work_mins)} · ${tone.label}`}
+                        className={cn(
+                          "relative grid aspect-square place-items-center rounded-[7px] border text-[0.64rem] font-semibold tabular-nums transition-all duration-150 active:scale-95",
+                          tone.cellText,
+                          onPickDay && "hover:scale-[1.10] hover:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60",
+                          selected && "ring-2 ring-white/90 ring-offset-1 ring-offset-[#0d0d12]",
+                          isToday && "ring-1.5 ring-blue-400/80 ring-offset-1 ring-offset-[#0d0d12]",
+                        )}
+                        style={{
+                          background: tone.cellBg,
+                          borderColor: tone.cellBorder,
+                          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.25)",
+                        }}
+                      >
+                        {dom}
+                      </button>
+                    );
+                  }
+
+                  // Rest day (tracked day with 0 mins or past untracked)
+                  return (
+                    <button
+                      key={date}
+                      type="button"
+                      onClick={() => onPickDay?.(date)}
+                      disabled={!onPickDay}
+                      title={`${fmtDateShort(date)} · Rest day`}
+                      className={cn(
+                        "grid aspect-square place-items-center rounded-[7px] border border-white/[0.05] bg-white/[0.03] text-[0.62rem] font-medium text-white/35 tabular-nums transition-colors duration-150",
+                        onPickDay && "hover:bg-white/[0.08] hover:text-white/80 hover:border-white/10 active:scale-95",
+                        selected && "ring-2 ring-white/80 ring-offset-1 ring-offset-[#0d0d12]",
+                        isToday && "ring-1.5 ring-blue-400/70 ring-offset-1 ring-offset-[#0d0d12] text-white/70 font-semibold",
+                      )}
+                    >
+                      {dom}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
-      {/* Legend */}
-      <div className="mt-5 flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t border-white/[0.05] pt-4">
-        {[
-          { c: "#DC2626", l: "Below target" },
-          { c: "#F59E0B", l: "Target met" },
-          { c: "#22C55E", l: "Over target" },
-          { c: "#27272A", l: "Rest day" },
-        ].map((x) => (
-          <span key={x.l} className="flex items-center gap-1.5 text-[0.62rem] font-medium text-white/45">
+      {/* Legend & stats bar */}
+      <div className="mt-6 flex flex-wrap items-center justify-between gap-y-3 border-t border-white/[0.06] pt-4.5">
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+          <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/50">
             <span
-              className="h-2.5 w-2.5 rounded-[4px] border border-white/10"
-              style={{ background: x.c }}
+              className="h-3 w-3 rounded-[4px] border border-white/20"
+              style={{
+                background: "linear-gradient(180deg, #BE123C 0%, #9F1239 100%)",
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.2)",
+              }}
               aria-hidden
             />
-            {x.l}
+            Below target
           </span>
-        ))}
+          <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/50">
+            <span
+              className="h-3 w-3 rounded-[4px] border border-white/20"
+              style={{
+                background: "linear-gradient(180deg, #2563EB 0%, #1D4ED8 100%)",
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.25)",
+              }}
+              aria-hidden
+            />
+            Target met
+          </span>
+          <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/50">
+            <span
+              className="h-3 w-3 rounded-[4px] border border-white/20"
+              style={{
+                background: "linear-gradient(180deg, #10B981 0%, #059669 100%)",
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.25)",
+              }}
+              aria-hidden
+            />
+            Over target
+          </span>
+          <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/50">
+            <span
+              className="h-3 w-3 rounded-[4px] border border-white/[0.06] bg-white/[0.035]"
+              aria-hidden
+            />
+            Rest day
+          </span>
+          <span className="flex items-center gap-2 text-[0.65rem] font-medium text-white/35">
+            <span
+              className="h-3 w-3 rounded-[4px] border border-white/[0.03] bg-white/[0.015]"
+              aria-hidden
+            />
+            Upcoming
+          </span>
+        </div>
+
+        {windowMetrics.studiedDays > 0 && (
+          <div className="flex items-center gap-3 text-[0.68rem] text-white/40 tabular-nums">
+            <span>
+              Total focus: <strong className="font-semibold text-white/80">{fmtHM(windowMetrics.totalMins)}</strong>
+            </span>
+            <span className="text-white/20">·</span>
+            <span>
+              Goal met: <strong className="font-semibold text-white/80">{windowMetrics.metDays}</strong> of <strong className="font-semibold text-white/80">{windowMetrics.studiedDays}</strong> study days
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
