@@ -140,6 +140,17 @@ pub fn run() {
             commands::settings::export_data_to_file,
             commands::settings::backup_database,
             commands::settings::import_data_from_file,
+            // Ambient Sound Hub (v12) — online search + offline caching + favorites
+            commands::ambient::ambient_search,
+            commands::ambient::cache_ambient_audio,
+            commands::ambient::delete_cached_ambient,
+            commands::ambient::list_ambient_favorites,
+            commands::ambient::add_ambient_favorite,
+            commands::ambient::remove_ambient_favorite,
+            // YouTube High-Quality Audio Streaming & Search (yt-dlp)
+            commands::youtube::youtube_search,
+            commands::youtube::get_youtube_audio_url,
+            commands::youtube::cache_youtube_audio,
             commands::tasks::list_tasks,
             commands::tasks::create_task,
             commands::tasks::update_task,

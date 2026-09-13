@@ -524,6 +524,37 @@ mod tests {
         .unwrap();
     }
 
+    /// v12: a fresh schema has the `ambient_favorites` table, and its UNIQUE(source,
+    /// external_id) makes starring the same sound twice idempotent rather than duplicating.
+    #[test]
+    fn schema_v12_has_ambient_favorites_with_unique_natural_key() {
+        let conn = test_conn();
+        assert!(
+            table_exists(&conn, "ambient_favorites").unwrap(),
+            "ambient_favorites must exist on a fresh install"
+        );
+        conn.execute(
+            "INSERT INTO ambient_favorites(source, external_id, name) VALUES('archive', 'rain-42', 'Rain')",
+            [],
+        )
+        .unwrap();
+        // Re-inserting the same (source, external_id) must conflict, not duplicate.
+        assert!(
+            conn.execute(
+                "INSERT INTO ambient_favorites(source, external_id, name) VALUES('archive', 'rain-42', 'Rain again')",
+                [],
+            )
+            .is_err(),
+            "the same sound must not be favorited twice"
+        );
+        // A different source with the same external_id is a distinct sound.
+        conn.execute(
+            "INSERT INTO ambient_favorites(source, external_id, name) VALUES('freesound', 'rain-42', 'Rain SFX')",
+            [],
+        )
+        .expect("same external_id under a different source is allowed");
+    }
+
     #[test]
     fn migrates_pre_v3_db_by_adding_session_type() {
         // Simulate a pre-v3 database: study_sessions WITHOUT session_type, user_version=2.

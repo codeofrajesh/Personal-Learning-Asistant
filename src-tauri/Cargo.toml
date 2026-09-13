@@ -75,6 +75,14 @@ base64 = "0.22"
 # `plugins/telegram/session.rs::FileSession`), which is what telegram.md §3.2 specified.
 grammers-session = { version = "0.10", default-features = false, features = ["serde"] }
 
+# HTTP client for the Ambient Sound Hub: server-side search (FreeSound / Internet Archive)
+# and offline caching downloads. Runs in Rust — NOT the webview — so the strict CSP stays
+# locked (connect-src has no `https:`) and the FreeSound API token never reaches the client.
+# `rustls-tls` avoids a system OpenSSL dependency; `stream` is used to write large audio
+# downloads to disk without buffering the whole file in memory. reqwest builds on tokio +
+# hyper, both already in the tree, so the marginal footprint is rustls + reqwest itself.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
 [profile.release]
 # Optimize for the small-binary / low-memory target (Section 1: 30-50MB idle).
 panic = "abort"

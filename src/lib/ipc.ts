@@ -10,6 +10,12 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { bumpPlanRevision } from "./planRevision";
 import type {
+  AmbientFavorite,
+  AmbientSearchResult,
+  YouTubeSearchResult,
+  YouTubeStreamInfo,
+} from "./ambient/types";
+import type {
   BlockInput,
   BlockStatus,
   ChapterView,
@@ -671,6 +677,63 @@ export const ipc = {
    */
   openInSystemPlayer(path: string): Promise<void> {
     return call<void>("open_in_system_player", { path });
+  },
+
+  // ── Ambient Sound Hub (v12) ─────────────────────────────────────────────────
+  //
+  // Online search + downloads run in Rust (the CSP blocks the webview from fetching https, and
+  // this keeps the FreeSound token server-side). `source` is 'freesound' | 'archive'.
+
+  /** Search an online source for ambient audio. */
+  ambientSearch(source: string, query: string, page = 1): Promise<AmbientSearchResult[]> {
+    return call<AmbientSearchResult[]>("ambient_search", { source, query, page });
+  },
+
+  /** Download a sound to the offline cache; resolves to the local file path (play via `assetUrl`). */
+  cacheAmbientAudio(
+    url: string,
+    name: string,
+    source: string,
+    externalId: string,
+  ): Promise<string> {
+    return call<string>("cache_ambient_audio", { url, name, source, externalId });
+  },
+
+  /** Delete a cached file and clear the favorite's cached path. */
+  deleteCachedAmbient(source: string, externalId: string, path: string): Promise<void> {
+    return call<void>("delete_cached_ambient", { source, externalId, path });
+  },
+
+  /** All starred sounds, newest first. */
+  listAmbientFavorites(): Promise<AmbientFavorite[]> {
+    return call<AmbientFavorite[]>("list_ambient_favorites");
+  },
+
+  /** Star a sound (idempotent on its natural key). `id`/`created_at` are server-owned. */
+  addAmbientFavorite(
+    favorite: Omit<AmbientFavorite, "id" | "created_at">,
+  ): Promise<number> {
+    return call<number>("add_ambient_favorite", { favorite });
+  },
+
+  /** Unstar a sound. */
+  removeAmbientFavorite(source: string, externalId: string): Promise<void> {
+    return call<void>("remove_ambient_favorite", { source, externalId });
+  },
+
+  /** Search YouTube for focus music, ambient soundscapes, or video URLs via yt-dlp. */
+  youtubeSearch(query: string, maxResults?: number): Promise<YouTubeSearchResult[]> {
+    return call<YouTubeSearchResult[]>("youtube_search", { query, maxResults });
+  },
+
+  /** Extract direct 160k Opus / AAC audio stream URL from YouTube via yt-dlp. */
+  getYoutubeAudioUrl(videoIdOrUrl: string): Promise<YouTubeStreamInfo> {
+    return call<YouTubeStreamInfo>("get_youtube_audio_url", { videoIdOrUrl });
+  },
+
+  /** Download YouTube audio to local offline storage (ambient_cache/). */
+  cacheYoutubeAudio(videoId: string, name: string): Promise<string> {
+    return call<string>("cache_youtube_audio", { videoId, name });
   },
 };
 

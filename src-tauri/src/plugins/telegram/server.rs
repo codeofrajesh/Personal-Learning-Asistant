@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use futures_util::StreamExt;
 
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
@@ -227,12 +228,15 @@ impl TgServer {
         // Owned solely by the serving task — the URL is the only handle callers need.
         let readers: ReaderMap =
             Arc::new(Mutex::new(HashMap::new()));
+        let yt_streams: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let ctx = Arc::new(ServeCtx {
             app,
             token: token.clone(),
             readers,
             semaphore: new_semaphore(),
+            yt_streams,
         });
 
         // Clone before the spawn: the loop moves the Arc into itself, and the Running struct
@@ -292,6 +296,27 @@ impl TgServer {
             }
         }
     }
+
+    /// Register a YouTube audio upstream stream URL and return the local proxy URL.
+    pub async fn register_yt_stream(
+        &self,
+        app: tauri::AppHandle,
+        stream_id: &str,
+        upstream_url: &str,
+    ) -> AppResult<String> {
+        let _ = self.ensure_started(app).await?;
+        let guard = self.inner.lock().await;
+        if let Some(running) = guard.as_ref() {
+            let mut map = running.ctx.yt_streams.lock().await;
+            map.insert(stream_id.to_string(), upstream_url.to_string());
+            Ok(format!(
+                "http://127.0.0.1:{}/yt/{}/{}",
+                running.port, running.token, stream_id
+            ))
+        } else {
+            Err(AppError::Other("Stream server not running".to_string()))
+        }
+    }
 }
 
 struct ServeCtx {
@@ -299,6 +324,7 @@ struct ServeCtx {
     token: String,
     readers: ReaderMap,
     semaphore: Arc<tokio::sync::Semaphore>,
+    yt_streams: Arc<Mutex<HashMap<String, String>>>,
 }
 
 fn base_url(port: u16, token: &str) -> String {
@@ -335,15 +361,30 @@ async fn route(
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    let path = req.uri().path();
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let (token, chat, msg) = match segments.as_slice() {
-        ["tg", token, chat, msg] => (*token, *chat, *msg),
-        _ => return Err(StatusCode::NOT_FOUND),
+    let (is_yt, token_str, stream_id_str, tg_parts) = {
+        let path = req.uri().path();
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.len() >= 3 && segments[0] == "yt" {
+            (true, segments[1].to_string(), segments[2].to_string(), None)
+        } else if let ["tg", token, chat, msg] = segments.as_slice() {
+            (false, String::new(), String::new(), Some((token.to_string(), chat.to_string(), msg.to_string())))
+        } else {
+            (false, String::new(), String::new(), None)
+        }
     };
 
-    // Constant-time-ish comparison isn't warranted (a local attacker has better options), but
-    // a mismatch must be indistinguishable from a bad path — hence 404, not 403.
+    if is_yt {
+        if token_str != ctx.token {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        return handle_yt(ctx, req, &stream_id_str).await;
+    }
+
+    let (token, chat, msg) = match tg_parts {
+        Some(parts) => parts,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
     if token != ctx.token {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -435,6 +476,85 @@ async fn route(
         .status(status)
         .body(stream_range(reader, start, want))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn handle_yt(
+    ctx: Arc<ServeCtx>,
+    req: Request<hyper::body::Incoming>,
+    stream_id: &str,
+) -> Result<Response<StreamedBody>, StatusCode> {
+    if req.method() == Method::OPTIONS {
+        let mut resp = Response::new(empty_body());
+        *resp.status_mut() = StatusCode::NO_CONTENT;
+        resp.headers_mut().insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+        resp.headers_mut().insert("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS".parse().unwrap());
+        resp.headers_mut().insert("Access-Control-Allow-Headers", "*".parse().unwrap());
+        return Ok(resp);
+    }
+
+    let upstream_url = {
+        let map = ctx.yt_streams.lock().await;
+        map.get(stream_id).cloned().ok_or(StatusCode::NOT_FOUND)?
+    };
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut req_builder = client.get(&upstream_url)
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+
+    if let Some(range) = req.headers().get(hyper::header::RANGE) {
+        if let Ok(val) = range.to_str() {
+            req_builder = req_builder.header(reqwest::header::RANGE, val);
+        }
+    }
+
+    let is_head = req.method() == Method::HEAD;
+
+    let upstream_resp = req_builder.send().await.map_err(|e| {
+        log::error!("yt stream proxy upstream request failed: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let status = StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        .header("Access-Control-Allow-Headers", "*")
+        .header(ACCEPT_RANGES, "bytes");
+
+    if let Some(ct) = upstream_resp.headers().get(reqwest::header::CONTENT_TYPE) {
+        if let Ok(v) = ct.to_str() {
+            builder = builder.header(CONTENT_TYPE, v);
+        }
+    } else {
+        builder = builder.header(CONTENT_TYPE, "audio/mp4");
+    }
+
+    if let Some(cl) = upstream_resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(v) = cl.to_str() {
+            builder = builder.header(CONTENT_LENGTH, v);
+        }
+    }
+
+    if let Some(cr) = upstream_resp.headers().get(reqwest::header::CONTENT_RANGE) {
+        if let Ok(v) = cr.to_str() {
+            builder = builder.header(CONTENT_RANGE, v);
+        }
+    }
+
+    if is_head {
+        return builder.body(empty_body()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let byte_stream = upstream_resp.bytes_stream().map(|item| {
+        item.map(Frame::data).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    });
+    let stream_body = StreamBody::new(byte_stream).boxed_unsync();
+    builder.body(stream_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Get or create the reader for a lesson.

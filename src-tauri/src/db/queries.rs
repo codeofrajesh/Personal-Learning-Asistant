@@ -2339,6 +2339,107 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
     Ok(())
 }
 
+// ── Ambient Sound Hub favorites (v12) ────────────────────────────────────────
+
+/// A starred ambient sound. Serialized to the frontend on read; deserialized from it on write
+/// (`id` / `created_at` are server-owned, so they carry `#[serde(default)]` and are ignored on
+/// insert). See `ambient_favorites` in schema.rs.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct AmbientFavorite {
+    #[serde(default)]
+    pub id: i64,
+    pub source: String,
+    pub external_id: String,
+    pub name: String,
+    pub stream_url: Option<String>,
+    pub cached_path: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub attribution: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// All favorites, newest first.
+pub fn list_ambient_favorites(conn: &Connection) -> AppResult<Vec<AmbientFavorite>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source, external_id, name, stream_url, cached_path, duration_secs,
+                attribution, created_at
+         FROM ambient_favorites
+         ORDER BY created_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(AmbientFavorite {
+            id: r.get(0)?,
+            source: r.get(1)?,
+            external_id: r.get(2)?,
+            name: r.get(3)?,
+            stream_url: r.get(4)?,
+            cached_path: r.get(5)?,
+            duration_secs: r.get(6)?,
+            attribution: r.get(7)?,
+            created_at: r.get(8)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Add (or idempotently update) a favorite. Keyed on `(source, external_id)` so starring the
+/// same sound twice updates the existing row rather than duplicating. A previously-cached path
+/// is preserved unless the caller supplies a fresh one. Returns the row id.
+pub fn add_ambient_favorite(conn: &Connection, fav: &AmbientFavorite) -> AppResult<i64> {
+    let id: i64 = conn.query_row(
+        "INSERT INTO ambient_favorites
+             (source, external_id, name, stream_url, cached_path, duration_secs, attribution)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(source, external_id) DO UPDATE SET
+             name          = excluded.name,
+             stream_url    = excluded.stream_url,
+             cached_path   = COALESCE(excluded.cached_path, ambient_favorites.cached_path),
+             duration_secs = excluded.duration_secs,
+             attribution   = excluded.attribution
+         RETURNING id",
+        rusqlite::params![
+            fav.source,
+            fav.external_id,
+            fav.name,
+            fav.stream_url,
+            fav.cached_path,
+            fav.duration_secs,
+            fav.attribution,
+        ],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+/// Remove a favorite by its natural key. No-op if it isn't starred.
+pub fn remove_ambient_favorite(conn: &Connection, source: &str, external_id: &str) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM ambient_favorites WHERE source = ?1 AND external_id = ?2",
+        [source, external_id],
+    )?;
+    Ok(())
+}
+
+/// Record the local file a favorite was downloaded to (called after `cache_ambient_audio`).
+/// A no-op if the sound isn't a favorite — caching without starring is allowed.
+pub fn set_ambient_cached_path(
+    conn: &Connection,
+    source: &str,
+    external_id: &str,
+    cached_path: Option<&str>,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE ambient_favorites SET cached_path = ?3 WHERE source = ?1 AND external_id = ?2",
+        rusqlite::params![source, external_id, cached_path],
+    )?;
+    Ok(())
+}
+
 /// A registered directory row, with its goal/subject names for the Manage Folders list.
 #[derive(Debug, serde::Serialize)]
 pub struct RegisteredDir {

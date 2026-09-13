@@ -20,6 +20,7 @@ import SearchModal from "../ui/SearchModal";
 import ToastHost from "../ui/ToastHost";
 import AddFolderModal from "../wizard/AddFolderModal";
 import MiniPlayer from "../player/MiniPlayer";
+import AmbientController from "../ambient/AmbientController";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { usePerf } from "../../lib/perfStore";
 import { useTaskReminders } from "../useTaskReminders";
@@ -214,6 +215,7 @@ export default function AppShell() {
       <SearchModal open={searchOpen} onClose={closeSearch} />
       <AddFolderModal />
       <MiniPlayer />
+      <AmbientController />
       <ToastHost />
     </div>
   );

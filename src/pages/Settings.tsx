@@ -36,6 +36,15 @@ import {
   type DashboardLayout,
 } from "../lib/dashboardLayout";
 import type { ImportSummary, RegisteredDir } from "../lib/types";
+import { formatRate } from "../lib/playbackRate";
+import {
+  SKIP_DEFAULTS,
+  SKIP_SPEED_OPTIONS,
+  MIN_SILENCE_OPTIONS,
+  THRESHOLD_MIN,
+  THRESHOLD_MAX,
+  type SkipSilenceSettings,
+} from "../components/player/useSkipSilence";
 import { pinnablePlugins } from "../lib/plugins/registry";
 import { usePins } from "../lib/plugins/pinStore";
 import { getPluginSettingsSections } from "../lib/plugins/settings";
@@ -271,6 +280,189 @@ function DefaultPlayer() {
   );
 }
 
+// ── Ambient & Skip Silence ─────────────────────────────────────────────────────
+
+// Mirror of the keys `useSkipSilence` reads on player mount; editing them here sets defaults.
+const SKIP_KEYS: Record<keyof SkipSilenceSettings, string> = {
+  enabled: "player.skip_silence_enabled",
+  mode: "player.skip_silence_mode",
+  thresholdDb: "player.skip_silence_threshold",
+  minSilenceSecs: "player.skip_silence_min",
+  skipSpeed: "player.skip_silence_speed",
+};
+const FREESOUND_TOKEN_KEY = "ambient.freesound_token";
+
+function AmbientSettings() {
+  const [token, setToken] = useState("");
+  const [showToken, setShowToken] = useState(false);
+  const [tokenNote, setTokenNote] = useState<string | null>(null);
+  const [skip, setSkip] = useState<SkipSilenceSettings>(SKIP_DEFAULTS);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!isTauri()) {
+      setLoaded(true);
+      return;
+    }
+    void (async () => {
+      const [tok, en, mode, thr, min, spd] = await Promise.all([
+        ipc.getSetting(FREESOUND_TOKEN_KEY),
+        ipc.getSetting(SKIP_KEYS.enabled),
+        ipc.getSetting(SKIP_KEYS.mode),
+        ipc.getSetting(SKIP_KEYS.thresholdDb),
+        ipc.getSetting(SKIP_KEYS.minSilenceSecs),
+        ipc.getSetting(SKIP_KEYS.skipSpeed),
+      ]);
+      if (tok) setToken(tok);
+      setSkip({
+        enabled: en === "true",
+        mode: mode === "instant" ? "instant" : "smooth",
+        thresholdDb: thr != null && Number.isFinite(Number(thr)) ? Number(thr) : SKIP_DEFAULTS.thresholdDb,
+        minSilenceSecs: min != null && Number.isFinite(Number(min)) ? Number(min) : SKIP_DEFAULTS.minSilenceSecs,
+        skipSpeed: spd != null && Number.isFinite(Number(spd)) ? Number(spd) : SKIP_DEFAULTS.skipSpeed,
+      });
+      setLoaded(true);
+    })();
+  }, []);
+
+  const saveToken = async () => {
+    try {
+      await ipc.setSetting(FREESOUND_TOKEN_KEY, token.trim());
+      setTokenNote("Saved.");
+    } catch (e) {
+      setTokenNote(errMsg(e));
+    }
+    setTimeout(() => setTokenNote(null), 2500);
+  };
+
+  const updateSkip = (patch: Partial<SkipSilenceSettings>) => {
+    const next = { ...skip, ...patch };
+    setSkip(next);
+    for (const k of Object.keys(patch) as (keyof SkipSilenceSettings)[]) {
+      void ipc.setSetting(SKIP_KEYS[k], String(next[k])).catch(() => {});
+    }
+  };
+
+  const pill = (active: boolean) =>
+    "flex-1 rounded-btn border px-2 py-1.5 text-xs tabular-nums transition-colors " +
+    (active
+      ? "border-lime/40 bg-lime/10 text-lime"
+      : "border-white/10 text-content-secondary hover:bg-white/[0.05]");
+
+  return (
+    <Section
+      title="Ambient & Skip Silence"
+      description="Defaults for the Focus Audio hub and the in-player Skip Silence pacing. Per-video controls also live in the player toolbar (⚡ and 🎧)."
+    >
+      {/* FreeSound token */}
+      <div className="mb-5">
+        <label className="mb-1.5 block text-xs font-medium text-content-secondary">
+          FreeSound API token
+        </label>
+        <div className="flex gap-2">
+          <div className="relative flex-1">
+            <input
+              type={showToken ? "text" : "password"}
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="Paste your FreeSound APIv2 token"
+              className="w-full rounded-btn border border-white/10 bg-white/[0.03] px-3 py-2 pr-9 text-sm text-content-primary placeholder:text-content-faint focus:border-lime/40 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => setShowToken((s) => !s)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-content-faint hover:text-content-secondary"
+              aria-label={showToken ? "Hide token" : "Show token"}
+            >
+              {showToken ? <EyeOff size={15} /> : <Eye size={15} />}
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={() => void saveToken()}
+            disabled={!loaded}
+            className="rounded-btn bg-lime px-4 py-2 text-sm font-semibold text-ink-900 transition-transform hover:scale-[1.02] disabled:opacity-50"
+          >
+            Save
+          </button>
+        </div>
+        <p className="mt-1.5 text-xs text-content-faint">
+          Free from freesound.org (Settings → API keys). Internet Archive and SomaFM need no key.
+        </p>
+        {tokenNote && <p className="mt-1 text-xs text-lime">{tokenNote}</p>}
+      </div>
+
+      {/* Skip Silence defaults */}
+      <div className="border-t border-white/[0.06] pt-4">
+        <label className="flex cursor-pointer items-center gap-3 rounded-btn bg-white/[0.03] px-3 py-2.5 text-sm transition-colors hover:bg-white/[0.05]">
+          <input
+            type="checkbox"
+            checked={skip.enabled}
+            disabled={!loaded}
+            onChange={(e) => updateSkip({ enabled: e.target.checked })}
+            className="h-4 w-4 accent-lime"
+          />
+          <span className={skip.enabled ? "text-content-primary" : "text-content-secondary"}>
+            Enable Skip Silence by default
+          </span>
+          <span className="ml-auto text-[0.7rem] text-content-faint">Ctrl+Shift+S in player</span>
+        </label>
+
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div>
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-content-faint">Mode</div>
+            <div className="flex gap-1">
+              {(["smooth", "instant"] as const).map((m) => (
+                <button key={m} type="button" onClick={() => updateSkip({ mode: m })} className={pill(skip.mode === m)}>
+                  {m === "smooth" ? "Smooth" : "Instant"}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="mb-1 flex justify-between text-[10px] font-medium uppercase tracking-wide text-content-faint">
+              <span>Sensitivity</span>
+              <span className="tabular-nums text-content-secondary">{skip.thresholdDb} dB</span>
+            </div>
+            <input
+              type="range"
+              min={THRESHOLD_MIN}
+              max={THRESHOLD_MAX}
+              step={1}
+              value={skip.thresholdDb}
+              onChange={(e) => updateSkip({ thresholdDb: Number(e.target.value) })}
+              className="h-1 w-full cursor-pointer appearance-none rounded-full bg-white/15 accent-lime"
+            />
+          </div>
+          <div>
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-content-faint">Min. silence</div>
+            <div className="flex gap-1">
+              {MIN_SILENCE_OPTIONS.map((s) => (
+                <button key={s} type="button" onClick={() => updateSkip({ minSilenceSecs: s })} className={pill(skip.minSilenceSecs === s)}>
+                  {s}s
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="mb-1 flex justify-between text-[10px] font-medium uppercase tracking-wide text-content-faint">
+              <span>Skip speed</span>
+              {skip.mode === "instant" && <span className="text-content-faint">Instant uses 4×</span>}
+            </div>
+            <div className={"flex gap-1 " + (skip.mode === "instant" ? "pointer-events-none opacity-40" : "")}>
+              {SKIP_SPEED_OPTIONS.map((s) => (
+                <button key={s} type="button" onClick={() => updateSkip({ skipSpeed: s })} className={pill(skip.skipSpeed === s)}>
+                  {formatRate(s)}×
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
 // ── Theme ────────────────────────────────────────────────────────────────────
 
 const THEME_KEY = "theme";
@@ -472,6 +664,8 @@ const SHORTCUTS: { keys: string; action: string; scope: string }[] = [
   { keys: "← / →", action: "Seek −10s / +10s", scope: "Player" },
   { keys: "↑ / ↓", action: "Volume up / down", scope: "Player" },
   { keys: "F", action: "Toggle fullscreen", scope: "Player" },
+  { keys: "Ctrl Shift S", action: "Toggle Skip Silence", scope: "Player" },
+  { keys: "[ / ]", action: "Slower / faster (0.1×)", scope: "Player" },
   { keys: "M", action: "Mark current material complete", scope: "Player" },
   { keys: "N / P", action: "Next / previous lesson", scope: "Player" },
 ];
@@ -1095,8 +1289,13 @@ const CATEGORIES: Category[] = [
     id: "playback",
     label: "Playback",
     icon: Play,
-    description: "The default in-app video engine.",
-    render: () => <DefaultPlayer />,
+    description: "The default in-app video engine, ambient audio, and skip-silence pacing.",
+    render: () => (
+      <>
+        <DefaultPlayer />
+        <AmbientSettings />
+      </>
+    ),
   },
   {
     id: "plugins",

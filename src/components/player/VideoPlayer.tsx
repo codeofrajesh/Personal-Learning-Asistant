@@ -23,6 +23,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { Zap } from "lucide-react";
 import { assetUrl, ipc } from "../../lib/ipc";
 import { formatDuration } from "../../lib/utils";
 import {
@@ -33,6 +34,9 @@ import {
   stepRate,
 } from "../../lib/playbackRate";
 import { useMediaProgress } from "./useMediaProgress";
+import { useSkipSilence } from "./useSkipSilence";
+import SkipSilenceMenu from "./SkipSilenceMenu";
+import { getAudioContext, resumeAudioContext } from "../../lib/ambient/audioContext";
 
 /** Quick-pick speeds. Granular values come from `[`/`]` — see `lib/playbackRate`. */
 const SPEEDS = SPEED_PRESETS;
@@ -65,6 +69,36 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
   // the frame where `videoRef` is null during a source swap, so speed persists across lessons.
   const rateRef = useRef(1);
   const [speedOpen, setSpeedOpen] = useState(false);
+  const [skipMenuOpen, setSkipMenuOpen] = useState(false);
+
+  // ── Skip Silence (HTML5 fallback) ───────────────────────────────────────────
+  // Detection uses a Web Audio analyser tapping the element's audio; the shared AudioContext is
+  // reused so we don't spin up a second one alongside the Ambient Hub. `enterSkip`/`exitSkip`
+  // move `playbackRate` (baseline stays in `rateRef`, which the control bar renders); watch-time
+  // is billed by wall-clock rAF deltas below, so a skip is never wrongly credited. This is the
+  // fallback engine, so the wiring is deliberately minimal.
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const audioSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const timeDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
+  const silenceSinceRef = useRef(0);
+  const skipToggleRef = useRef<(() => void) | null>(null);
+  const skipCfgRef = useRef({ enabled: false, thresholdDb: -35, minSilenceSecs: 0.5 });
+
+  const enterSkip = (targetSpeed: number) => {
+    const v = videoRef.current;
+    if (v) v.playbackRate = quantizeRate(targetSpeed);
+  };
+  const exitSkip = () => {
+    const v = videoRef.current;
+    if (v) v.playbackRate = quantizeRate(rateRef.current);
+  };
+  const skipSilence = useSkipSilence({ enterSkip, exitSkip });
+  skipToggleRef.current = skipSilence.toggleEnabled;
+  skipCfgRef.current = {
+    enabled: skipSilence.settings.enabled,
+    thresholdDb: skipSilence.settings.thresholdDb,
+    minSilenceSecs: skipSilence.settings.minSilenceSecs,
+  };
 
   // True when the file's container is one Chromium/WebView2 can't decode (MKV, AVI, …)
   // → the integrated player will show black; offer "Open in system player" instead.
@@ -109,6 +143,31 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
           const delta = (ts - lastTs) / 1000;
           accumulatedRef.current += delta;
         }
+
+        // Skip Silence detection: measure the audio's RMS level and drive the shared pacing
+        // policy. Only runs while enabled + playing; the analyser is a passive tap set up below.
+        const cfg = skipCfgRef.current;
+        const an = analyserRef.current;
+        const buf = timeDataRef.current;
+        if (cfg.enabled && an && buf && !v.paused && !v.seeking) {
+          an.getByteTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const x = (buf[i] - 128) / 128; // unsigned 8-bit PCM → [-1, 1]
+            sum += x * x;
+          }
+          const rms = Math.sqrt(sum / buf.length);
+          const db = rms > 0 ? 20 * Math.log10(rms) : -100;
+          if (db < cfg.thresholdDb) {
+            if (silenceSinceRef.current === 0) silenceSinceRef.current = ts;
+            else if (ts - silenceSinceRef.current >= cfg.minSilenceSecs * 1000) {
+              skipSilence.onSilenceStart();
+            }
+          } else {
+            silenceSinceRef.current = 0;
+            if (skipSilence.skipActiveRef.current) skipSilence.onSilenceEnd();
+          }
+        }
       }
       lastTs = ts;
       raf = requestAnimationFrame(tick);
@@ -116,6 +175,33 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, [accumulatedRef]);
+
+  // Set up the skip-silence analyser once, the first time the feature is enabled. Builds a single
+  // permanent chain (source → analyser → destination): `createMediaElementSource` reroutes the
+  // element's audio ENTIRELY into the graph, so tearing this down would mute playback — instead we
+  // keep it connected and simply stop reading the analyser when disabled. Created lazily so a user
+  // who never enables skip-silence keeps plain native element playback.
+  useEffect(() => {
+    if (!skipSilence.settings.enabled || !src) return;
+    const v = videoRef.current;
+    if (!v || audioSrcRef.current) return; // already wired for this element
+    try {
+      const ctx = getAudioContext();
+      void resumeAudioContext();
+      const source = ctx.createMediaElementSource(v);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      timeDataRef.current = new Uint8Array(analyser.fftSize);
+      source.connect(analyser);
+      analyser.connect(ctx.destination);
+      audioSrcRef.current = source;
+      analyserRef.current = analyser;
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("[VideoPlayer] skip-silence analyser setup failed:", e);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skipSilence.settings.enabled, src]);
 
   /**
    * Resume from the saved position, and re-apply the chosen speed, once metadata is available.
@@ -256,6 +342,13 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+      // Ctrl/Cmd+Shift+S toggles Skip Silence (before the single-key switch; routed via a ref so
+      // this once-bound listener stays current).
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "s" || e.key === "S")) {
+        e.preventDefault();
+        skipToggleRef.current?.();
+        return;
+      }
       switch (e.key) {
         case " ":
           e.preventDefault();
@@ -334,7 +427,12 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
               e.stopPropagation();
               togglePlay();
             }}
-            onPlay={() => setIsPlaying(true)}
+            onPlay={() => {
+              setIsPlaying(true);
+              // A play click is a user gesture — resume the shared context so the skip-silence
+              // analyser (if wired) isn't left suspended and muting the element.
+              void resumeAudioContext();
+            }}
             onPause={() => {
               setIsPlaying(false);
               flush();
@@ -368,6 +466,12 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
             >
               Open in system player ⤴
             </button>
+          </div>
+        )}
+        {/* Skip Silence HUD — non-interactive pill while auto-skipping. */}
+        {skipSilence.hud.active && (
+          <div className="pointer-events-none absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-black/70 px-3 py-1.5 text-xs font-medium text-lime backdrop-blur-sm">
+            <Zap size={13} className="animate-pulse" /> Skipping silence · {formatRate(skipSilence.hud.speed)}×
           </div>
         )}
       </div>
@@ -436,6 +540,24 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
           className="hidden h-1.5 w-20 cursor-pointer appearance-none rounded-full sm:block"
           aria-label="Volume"
         />
+
+        {/* Skip Silence — toggle + settings popover (mirrors the mpv control bar). */}
+        <div className="relative shrink-0">
+          <button
+            type="button"
+            onClick={() => setSkipMenuOpen((o) => !o)}
+            className={
+              "rounded-btn px-2 py-1 text-xs transition-colors " +
+              (skipSilence.settings.enabled ? "bg-lime/15 text-lime" : "text-content-secondary hover:text-content-primary")
+            }
+            aria-label="Skip silence settings"
+            aria-expanded={skipMenuOpen}
+            title="Skip silence ( Ctrl+Shift+S )"
+          >
+            <Zap size={14} className={skipSilence.hud.active ? "inline animate-pulse" : "inline"} />
+          </button>
+          {skipMenuOpen && <SkipSilenceMenu settings={skipSilence.settings} onChange={skipSilence.updateSettings} />}
+        </div>
 
         {/* Speed: presets + a granular 0.10× stepper, mirroring the mpv control bar so the two
             engines are indistinguishable to the student. `formatRate` keeps a granular value short

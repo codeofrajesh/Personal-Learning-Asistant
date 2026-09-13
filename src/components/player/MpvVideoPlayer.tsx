@@ -17,7 +17,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { AlertCircle, PictureInPicture2, WifiOff, RefreshCw } from "lucide-react";
+import { AlertCircle, PictureInPicture2, WifiOff, RefreshCw, Zap } from "lucide-react";
 import {
   command,
   init,
@@ -42,6 +42,9 @@ import {
 import { playerBridge } from "../../lib/playerBridge";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { formatDuration } from "../../lib/utils";
+import { useSkipSilence } from "./useSkipSilence";
+import SkipSilenceMenu from "./SkipSilenceMenu";
+import AmbientButton from "../ambient/AmbientButton";
 import {
   PlayIcon,
   PauseIcon,
@@ -233,6 +236,12 @@ const OBSERVED_PROPERTIES = [
   ["demuxer-cache-duration", "double", "none"],
   // Full cache metadata ({fw, bw, file-cache-bytes…}). Reserved for future buffering UX.
   ["demuxer-cache-state", "node", "none"],
+  // ── Skip Silence (2026) ──
+  // `af-metadata/<label>` exposes the metadata a labeled audio filter emits. With the labeled
+  // `silencedetect` filter attached (`@sd:lavfi=[silencedetect=…]`), this delivers
+  // `lavfi.silence_start` / `lavfi.silence_end` as they happen — the detection channel for the
+  // auto-pacing feature, decoded from the exact audio mpv is playing. Null when the filter is off.
+  ["af-metadata/sd", "node", "none"],
 ] as const satisfies MpvObservableProperty[];
 
 interface Props {
@@ -319,9 +328,36 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   // every `[`/`]` press would compute from 1x. Written by both `changeRate` and the mpv `speed`
   // observer, so it always reflects the real engine speed.
   const rateRef = useRef(globalMpvState.speed);
+  // ── Skip Silence ──
+  // The user's chosen speed, snapshotted when an auto-skip begins so we can restore it when
+  // speech resumes. The live mpv `speed` diverges from this only while a skip is active.
+  const baselineRateRef = useRef(globalMpvState.speed);
+  // Last silencedetect values we acted on, to dedupe repeated/echoed metadata frames.
+  const lastSilenceStartRef = useRef<string | null>(null);
+  const lastSilenceEndRef = useRef<string | null>(null);
+  // Latest `toggleEnabled`, for the once-bound keyboard listener (Ctrl+Shift+S).
+  const skipToggleRef = useRef<(() => void) | null>(null);
   const [speedOpen, setSpeedOpen] = useState(false);
+  const [skipMenuOpen, setSkipMenuOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // ── Skip Silence controller ────────────────────────────────────────────────
+  // The hook owns the pacing policy + HUD + settings; these two callbacks are the only
+  // engine-specific parts. `enterSkip` snapshots the user's baseline and pushes the skip speed;
+  // `exitSkip` restores the baseline. Both are stable (empty deps, ref-only reads) so the hook's
+  // returned handlers — which the once-bound property listener calls — never go stale.
+  const enterSkip = useCallback((targetSpeed: number) => {
+    baselineRateRef.current = rateRef.current;
+    void setProperty("speed", quantizeRate(targetSpeed)).catch(() => {});
+  }, []);
+  const exitSkip = useCallback(() => {
+    void setProperty("speed", quantizeRate(baselineRateRef.current)).catch(() => {});
+  }, []);
+  const skipSilence = useSkipSilence({ enterSkip, exitSkip });
+  // Expose the latest toggle to the once-bound keyboard listener.
+  skipToggleRef.current = skipSilence.toggleEnabled;
+  const skipActiveRef = skipSilence.skipActiveRef;
 
   // ── Smart Watchdog (2026) — engine crash vs. network buffering ─────────────
   //
@@ -755,6 +791,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
                 // at its pre-pause value and the first post-resume event would bill the whole
                 // pause as watched time. Zero it: the next event after resume seeds fresh.
                 lastWallTsRef.current = 0;
+                // A pause is a discontinuity for silence detection too — restore the user's
+                // baseline speed so resume never starts mid-skip; silencedetect re-fires if the
+                // quiet continues.
+                skipSilence.resetSkip();
               }
               break;
             case "time-pos": {
@@ -856,6 +896,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               // future script binding) must still render as a clean "1.2×" rather than a float
               // artefact. Keeps the ref and the state in lockstep for the keyboard path.
               const s = quantizeRate(data as number);
+              // While an auto-skip is driving the speed, DON'T reflect the transient skip speed in
+              // the control bar — the student's chosen speed is what the UI should keep showing.
+              // The baseline is restored (and re-echoed) when speech resumes.
+              if (skipActiveRef.current) break;
               rateRef.current = s;
               setRate(s);
               break;
@@ -887,6 +931,26 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               // reliable for drawing the buffer bar.
               break;
             }
+            case "af-metadata/sd": {
+              // Silence detection channel (Skip Silence). The labeled `silencedetect` filter emits
+              // `lavfi.silence_start` when the audio goes quiet and `lavfi.silence_end` when speech
+              // resumes. mpv surfaces the current frame's filter metadata here; between events it
+              // may be null/empty. We dedupe on the value string so an echoed frame can't
+              // double-trigger. `onSilenceStart/End` are no-ops when the feature is disabled.
+              const meta = data as Record<string, unknown> | null;
+              if (!meta) break;
+              const ss = meta["lavfi.silence_start"];
+              const se = meta["lavfi.silence_end"];
+              if (typeof ss === "string" && ss !== lastSilenceStartRef.current) {
+                lastSilenceStartRef.current = ss;
+                skipSilence.onSilenceStart();
+              }
+              if (typeof se === "string" && se !== lastSilenceEndRef.current) {
+                lastSilenceEndRef.current = se;
+                skipSilence.onSilenceEnd();
+              }
+              break;
+            }
           }
         };
 
@@ -916,6 +980,14 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       // already banked most of it.
       saveProgress(true);
       drainSession();
+
+      // Skip Silence: the mpv engine is a global singleton that outlives this component, so never
+      // leave it stuck at a skip speed or carrying our `silencedetect` filter for the next video.
+      if (skipActiveRef.current) {
+        skipActiveRef.current = false;
+        void setProperty("speed", quantizeRate(baselineRateRef.current)).catch(() => {});
+      }
+      void command("af", ["remove", "@sd"]).catch(() => {});
       
       // Clean up the event listener specifically for this component instance
       if (cleanupMpvListenerRef.current) {
@@ -1338,6 +1410,14 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     // observer will confirm the same value; because both sides quantize, it can't disagree.
     setRate(q);
     rateRef.current = q;
+    if (skipActiveRef.current) {
+      // An auto-skip currently owns the live engine speed. Treat a manual change as retargeting
+      // the BASELINE — update the label now, but don't touch mpv until speech resumes and the
+      // baseline is restored (otherwise the skip and the user would fight over `speed`).
+      baselineRateRef.current = q;
+      if (closeMenu) setSpeedOpen(false);
+      return;
+    }
     void setProperty("speed", q).catch(() => {});
     if (closeMenu) setSpeedOpen(false);
   };
@@ -1364,6 +1444,13 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      // Ctrl/Cmd+Shift+S toggles Skip Silence. Checked before the single-key switch (the key is
+      // "S" with Shift held) and routed through a ref so this once-bound listener never goes stale.
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "s" || e.key === "S")) {
+        e.preventDefault();
+        skipToggleRef.current?.();
+        return;
+      }
       switch (e.key) {
         case " ":
           e.preventDefault(); // prevent page scroll
@@ -1466,6 +1553,40 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     return () => window.clearInterval(id);
   }, [ready, saveProgress, drainSession]);
 
+  // ── Skip Silence: attach/detach the labeled silencedetect audio filter ──────
+  // Adds `@sd:lavfi=[silencedetect=n=<thr>dB:d=<min>]` when enabled (its metadata is read via the
+  // `af-metadata/sd` observer above) and removes it when disabled or when threshold/duration
+  // change (remove-then-add so new params take effect). `af add`/`remove` are label-scoped, so
+  // this never disturbs any other audio filter. Runs only once mpv is ready.
+  useEffect(() => {
+    if (!ready || !isTauri()) return;
+    const { enabled, thresholdDb, minSilenceSecs } = skipSilence.settings;
+    if (!enabled) {
+      void command("af", ["remove", "@sd"]).catch(() => {});
+      return;
+    }
+    void (async () => {
+      try {
+        await command("af", ["remove", "@sd"]);
+      } catch {
+        /* not attached yet */
+      }
+      try {
+        await command("af", [
+          "add",
+          `@sd:lavfi=[silencedetect=n=${thresholdDb}dB:d=${minSilenceSecs}]`,
+        ]);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error("[MpvVideoPlayer] failed to attach silencedetect filter:", e);
+      }
+    })();
+    return () => {
+      void command("af", ["remove", "@sd"]).catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, skipSilence.settings.enabled, skipSilence.settings.thresholdDb, skipSilence.settings.minSilenceSecs]);
+
   if (error) {
     return (
       <div className="grid h-full place-items-center bg-ink-900 p-card text-center text-sm text-orange">
@@ -1503,6 +1624,16 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       )}
       {watchdog.kind === "backend_fatal" && (cacheExhausted() || isTerminalFatal(watchdog.event.type)) && (
         <BackendFatalOverlay event={watchdog.event} onRetry={handleRetry} />
+      )}
+
+      {/* Skip Silence HUD — a small non-interactive pill shown while auto-skipping. Semi-opaque
+          (drawn by the webview over the transparent video region), so it reads as glass over the
+          lecture rather than blocking it. */}
+      {skipSilence.hud.active && (
+        <div className="pointer-events-none absolute left-1/2 top-4 z-40 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-black/70 px-3 py-1.5 text-xs font-medium text-lime shadow-lg backdrop-blur-sm">
+          <Zap size={13} className="animate-pulse" />
+          Skipping silence · {formatRate(skipSilence.hud.speed)}×
+        </div>
       )}
 
       {/* ── Loading ── */}
@@ -1605,6 +1736,9 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
             />
           </div>
 
+          {/* Focus audio (ambient sounds) — sits next to volume, opens upward over the video. */}
+          <AmbientButton variant="player" />
+
           {/* Time display */}
           <button
             type="button"
@@ -1619,6 +1753,27 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
 
           {/* Spacer */}
           <div className="flex-1" />
+
+          {/* Skip Silence — toggle + settings popover. Active state glows lime; the icon pulses
+              while a skip is in effect. The menu is opaque (transparent-window rule). */}
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              onClick={() => setSkipMenuOpen((o) => !o)}
+              className={
+                "flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20 " +
+                (skipSilence.settings.enabled
+                  ? "bg-lime/15 text-lime"
+                  : "text-content-secondary hover:bg-white/[0.1] hover:text-content-primary")
+              }
+              aria-label="Skip silence settings"
+              aria-expanded={skipMenuOpen}
+              title="Skip silence ( Ctrl+Shift+S )"
+            >
+              <Zap size={14} className={skipSilence.hud.active ? "animate-pulse" : ""} />
+            </button>
+            {skipMenuOpen && <SkipSilenceMenu settings={skipSilence.settings} onChange={skipSilence.updateSettings} />}
+          </div>
 
           {/* Speed selector — presets plus a granular 0.10× stepper.
               `formatRate` is what makes granular values presentable: the raw double would render

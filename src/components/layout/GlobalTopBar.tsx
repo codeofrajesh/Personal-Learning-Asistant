@@ -18,6 +18,7 @@
 
 import { HeaderTimeBox } from "./HeaderTimeBox";
 import { MenuIcon, SearchIcon } from "../ui/icons";
+import AmbientButton from "../ambient/AmbientButton";
 
 interface GlobalTopBarProps {
   /** Current sidebar collapse state (for the toggle's aria-pressed/label). */
@@ -52,9 +53,12 @@ export default function GlobalTopBar({
         </span>
       </div>
 
-      {/* 2 + 3 — Timer + search launcher */}
+      {/* 2 + 3 — Timer + focus audio + search launcher */}
       <div className="flex shrink-0 items-center gap-3">
         <HeaderTimeBox />
+        <div className="flex items-center gap-1.5 rounded-full border border-white/[0.05] bg-white/[0.02] p-1.5 shadow-2xl backdrop-blur-xl [box-shadow:0_16px_40px_-12px_rgba(0,0,0,0.55),inset_0_1px_1px_rgba(255,255,255,0.06)]">
+          <AmbientButton variant="topbar" />
+        </div>
         <div className="flex items-center gap-1.5 rounded-full border border-white/[0.05] bg-white/[0.02] p-1.5 shadow-2xl backdrop-blur-xl [box-shadow:0_16px_40px_-12px_rgba(0,0,0,0.55),inset_0_1px_1px_rgba(255,255,255,0.06)]">
           <button
             type="button"

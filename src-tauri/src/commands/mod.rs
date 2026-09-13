@@ -5,6 +5,7 @@
 //! roundtrip; feature commands live in their respective submodules and are added
 //! as those features are built (Section 12 structure).
 
+pub mod ambient;
 pub mod chapters;
 pub mod goals;
 pub mod library;
@@ -17,6 +18,7 @@ pub mod scanner;
 pub mod settings;
 pub mod subjects;
 pub mod tasks;
+pub mod youtube;
 
 use serde::Serialize;
 use tauri::State;

@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* data: blob:; media-src 'self' asset: http://asset.localhost http://localhost:* http://127.0.0.1:* blob:; frame-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob:; object-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob:; connect-src 'self' asset: http://asset.localhost http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; font-src 'self' data:;",
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* data: blob: https://*.ytimg.com https://*.ggpht.com; media-src 'self' asset: http://asset.localhost http://localhost:* http://127.0.0.1:* blob: https://freesound.org https://*.freesound.org https://cdn.freesound.org https://archive.org https://*.archive.org https://*.us.archive.org https://*.ca.archive.org https://*.ia.archive.org https://*.somafm.com http://*.somafm.com https://*.googlevideo.com https://*.youtube.com; frame-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob:; object-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob:; connect-src 'self' asset: http://asset.localhost http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; font-src 'self' data:;",
       "assetProtocol": {
         "enable": true,
         "scope": [
@@ -40,7 +40,8 @@
     "targets": "all",
     "externalBin": [
       "bin/ffmpeg",
-      "bin/ffprobe"
+      "bin/ffprobe",
+      "bin/yt-dlp"
     ],
     "resources": [
       "lib/**/*"

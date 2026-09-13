@@ -44,7 +44,13 @@
 ///     and the scanner's upsert keys on `file_path`). Progress, notes, bookmarks, tasks and
 ///     schedule attribution all key on `materials.id`, so they work unchanged for either
 ///     source.
-pub const SCHEMA_VERSION: i64 = 11;
+/// v12: the Ambient Sound Hub. Adds `ambient_favorites` — sounds the user starred, from any
+///     source ('freesound' | 'archive' | 'somafm' | 'procedural'). `cached_path` is set once a
+///     sound is downloaded for offline study (played back via the asset protocol). New table
+///     only — `CREATE TABLE IF NOT EXISTS` covers both fresh installs and migrations, so no
+///     guarded ALTERs (same pattern as exams v10). Ambient/skip-silence PREFERENCES live in the
+///     existing key/value `settings` table, not here.
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The complete v1 schema. Every statement is `IF NOT EXISTS` where SQLite allows,
 /// so re-application is a no-op.
@@ -349,6 +355,26 @@ CREATE TABLE IF NOT EXISTS exams (
 -- NOTE: the partial index on exams(exam_date) lives in `connection.rs::migrate`, not here —
 -- see the comment there. Every partial index in this project is kept in one place because a
 -- partial index referencing a recently-added column is exactly what broke the v8 migration.
+
+-- Ambient Sound Hub favorites (v12). A sound the user starred, from any source. For online
+-- sounds `stream_url` holds the remote URL; once downloaded for offline study, `cached_path`
+-- points at the local file (played back via the asset protocol). `attribution` carries the
+-- author/license text so Creative-Commons sources can be credited in the UI. Procedural
+-- (offline-synthesized) favorites have neither URL nor cache — they're regenerated on demand
+-- and identified by `external_id` (the generator key). UNIQUE(source, external_id) makes
+-- favoriting idempotent. Ambient PREFERENCES (volume, sleep defaults) live in `settings`.
+CREATE TABLE IF NOT EXISTS ambient_favorites (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source        TEXT NOT NULL,      -- 'freesound' | 'archive' | 'somafm' | 'procedural'
+    external_id   TEXT NOT NULL,      -- id / stream key / generator id (source-specific)
+    name          TEXT NOT NULL,
+    stream_url    TEXT,               -- remote URL for online sounds (NULL for procedural)
+    cached_path   TEXT,               -- local file once downloaded for offline (NULL = not cached)
+    duration_secs REAL,
+    attribution   TEXT,               -- author/license for CC compliance
+    created_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE(source, external_id)
+);
 
 -- Learned pace per course. `pace_ratio` is an EWMA of (wall minutes spent / content minutes
 -- consumed): 1.0 = real-time, 1.6 = this student needs 96 min of clock for 60 min of
