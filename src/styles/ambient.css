@@ -1444,3 +1444,666 @@
   font-size: 11px;
 }
 
+/* ──────────────────────────────────────────────────────────────────────────────
+   FLAGSHIP DYNAMIC ISLAND FLOATING PILL
+   ────────────────────────────────────────────────────────────────────────────── */
+
+.amb-island {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 65;
+  user-select: none;
+  overflow: hidden;
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+  box-sizing: border-box;
+}
+
+.amb-island--capsule {
+  background: rgba(9, 14, 26, 0.88);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow:
+    0 16px 40px -8px rgba(0, 0, 0, 0.85),
+    0 0 1px rgba(59, 130, 246, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  cursor: pointer;
+}
+
+.amb-island--capsule:hover {
+  border-color: rgba(59, 130, 246, 0.4);
+  box-shadow:
+    0 20px 48px -6px rgba(0, 0, 0, 0.9),
+    0 0 16px rgba(59, 130, 246, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.amb-island--expanded {
+  background: rgba(8, 13, 24, 0.94);
+  backdrop-filter: blur(30px);
+  -webkit-backdrop-filter: blur(30px);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  box-shadow:
+    0 24px 64px -10px rgba(0, 0, 0, 0.95),
+    0 0 24px rgba(59, 130, 246, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+/* ── Capsule Inner Content ── */
+.amb-island-capsule-content {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 12px 0 6px;
+  height: 100%;
+  position: relative;
+}
+
+.amb-island-art-disc {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  overflow: hidden;
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  background: #10162a;
+}
+
+.amb-island-vinyl {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.amb-island-vinyl--spinning {
+  animation: amb-vinyl-spin 8s linear infinite;
+}
+
+@keyframes amb-vinyl-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.amb-island-icon-placeholder {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.amb-island-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.amb-island-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #f1f5f9;
+  letter-spacing: -0.01em;
+  max-width: 140px;
+}
+
+.amb-mini-wave-bar {
+  display: inline-block;
+  width: 2px;
+  height: 4px;
+  border-radius: 1px;
+  background: #10b981;
+  animation: amb-mini-wave 0.8s ease-in-out infinite alternate;
+}
+
+.amb-mini-wave-bar--2 {
+  animation-delay: 0.25s;
+  height: 8px;
+}
+
+.amb-mini-wave-bar--3 {
+  animation-delay: 0.5s;
+  height: 6px;
+}
+
+@keyframes amb-mini-wave {
+  0% { height: 3px; }
+  100% { height: 9px; }
+}
+
+.amb-island-btn {
+  display: grid;
+  place-items: center;
+  border: none;
+  cursor: pointer;
+  border-radius: 50%;
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.08);
+  transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease;
+  flex-shrink: 0;
+}
+
+.amb-island-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+  color: #ffffff;
+  transform: scale(1.06);
+}
+
+.amb-island-btn--primary {
+  width: 26px;
+  height: 26px;
+  background: var(--amb-blue);
+  color: #ffffff;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.4);
+}
+
+.amb-island-btn--primary:hover {
+  background: #2563eb;
+  transform: scale(1.08);
+}
+
+.amb-island-expand-hint {
+  display: grid;
+  place-items: center;
+  padding-left: 2px;
+}
+
+.amb-island-progress-underline {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.amb-island-progress-underline-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa, #f59e0b);
+  border-radius: 0 1px 1px 0;
+}
+
+/* ── Expanded Inner Content ── */
+.amb-island-expanded-content {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 10px 14px;
+  height: 100%;
+}
+
+.amb-island-top-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.amb-island-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.amb-island-thumb {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  object-fit: cover;
+  flex-shrink: 0;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.amb-island-thumb-blank {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.amb-island-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.amb-island-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.amb-island-expanded-title {
+  font-size: 12px;
+  font-weight: 650;
+  color: #ffffff;
+  letter-spacing: -0.01em;
+}
+
+.amb-tag-micro {
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--amb-text-secondary);
+}
+
+.amb-tag-micro--yt {
+  background: rgba(239, 68, 68, 0.16);
+  color: #f87171;
+}
+
+.amb-island-channel {
+  font-size: 10px;
+  color: #94a3b8;
+  margin-top: 1px;
+}
+
+.amb-island-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.amb-island-btn--play {
+  width: 30px;
+  height: 30px;
+  background: var(--amb-blue);
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(59, 130, 246, 0.45);
+}
+
+.amb-island-btn--stop,
+.amb-island-btn--hub,
+.amb-island-btn--collapse {
+  width: 26px;
+  height: 26px;
+}
+
+/* ── Bottom Row (Scrubber & Volume) ── */
+.amb-island-bottom-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.amb-island-scrub-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  cursor: pointer;
+  padding: 3px 0;
+}
+
+.amb-island-scrub-track {
+  position: relative;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  transition: height 0.15s ease;
+}
+
+.amb-island-scrub-wrap:hover .amb-island-scrub-track {
+  height: 6px;
+}
+
+.amb-island-scrub-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa, #f59e0b);
+}
+
+.amb-island-scrub-thumb {
+  position: absolute;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ffffff;
+  transform: translate(-50%, -50%) scale(0);
+  transition: transform 0.15s ease;
+  box-shadow: 0 0 6px rgba(59, 130, 246, 0.8);
+}
+
+.amb-island-scrub-wrap:hover .amb-island-scrub-thumb {
+  transform: translate(-50%, -50%) scale(1);
+}
+
+.amb-island-scrub-times {
+  display: flex;
+  justify-content: space-between;
+  font-size: 8.5px;
+  color: #64748b;
+  margin-top: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.amb-island-live-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+}
+
+.amb-island-vol-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+
+.amb-island-vol-slider {
+  width: 50px;
+  height: 3px;
+  accent-color: var(--amb-blue);
+  cursor: pointer;
+}
+
+.amb-island-timer-badge {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 9px;
+  font-weight: 600;
+  color: #fbbf24;
+  padding-left: 4px;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   RGB LIGHTNING BREATHING RING & DANCING AUDIO WAVES (Top-Bar Dynamic Island)
+   ────────────────────────────────────────────────────────────────────────────── */
+
+@keyframes amb-rgb-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Dancing breathing glow aura: rhythmically expands slightly and reduces back */
+@keyframes amb-rgb-aurora-breathe {
+  0% {
+    transform: scale(0.95);
+    opacity: 0.5;
+    filter: blur(2px) drop-shadow(0 0 3px rgba(0, 242, 254, 0.75)) drop-shadow(0 0 6px rgba(236, 72, 153, 0.6));
+  }
+  100% {
+    transform: scale(1.16);
+    opacity: 0.95;
+    filter: blur(3.5px) drop-shadow(0 0 8px rgba(34, 211, 238, 0.95)) drop-shadow(0 0 16px rgba(244, 63, 94, 0.9));
+  }
+}
+
+.amb-rgb-ring-wrap {
+  position: relative;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* 1. Outer breathing dancing neon aura */
+.amb-rgb-aurora {
+  position: absolute;
+  inset: -1.5px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    #ff0055 0deg,
+    #ff5500 45deg,
+    #ffea00 90deg,
+    #00ff66 140deg,
+    #00ffff 185deg,
+    #0066ff 235deg,
+    #a855f7 285deg,
+    #ff0077 330deg,
+    #ff0055 360deg
+  );
+  animation: amb-rgb-aurora-breathe 1.8s ease-in-out infinite alternate;
+  pointer-events: none;
+  will-change: transform, opacity, filter;
+}
+
+/* 2. Ultra-thin 1.5px crisp rainbow border (spinning 360deg continuously) */
+.amb-rgb-spinner {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    #ff0055 0deg,
+    #ff5500 45deg,
+    #ffea00 90deg,
+    #00ff66 140deg,
+    #00ffff 185deg,
+    #0066ff 235deg,
+    #a855f7 285deg,
+    #ff0077 330deg,
+    #ff0055 360deg
+  );
+  animation: amb-rgb-spin 2s linear infinite;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.amb-rgb-aurora--paused {
+  opacity: 0 !important;
+  animation: none !important;
+  filter: none !important;
+}
+
+.amb-rgb-spinner--paused {
+  background: rgba(255, 255, 255, 0.16) !important;
+  animation: none !important;
+  opacity: 0.4 !important;
+}
+
+/* ── Live Dancing Audio Waves Visualizer (GSAP-Driven & GPU-Composited) ── */
+.amb-wave-container {
+  display: flex;
+  align-items: flex-end;
+  gap: 3.5px;
+  height: 20px;
+  padding: 0 1px;
+  flex-shrink: 0;
+}
+
+.amb-wave-bar {
+  display: block;
+  width: 3.5px;
+  height: 20px;
+  border-radius: 999px;
+  background: linear-gradient(to top, #00f2fe 0%, #3b82f6 100%);
+  box-shadow: 0 0 7px rgba(0, 242, 254, 0.55);
+  transform-origin: 50% 100%;
+  will-change: transform;
+}
+
+@keyframes amb-wave-dance-1 {
+  0%, 100% { transform: scaleY(0.2); }
+  50% { transform: scaleY(0.95); }
+}
+@keyframes amb-wave-dance-2 {
+  0%, 100% { transform: scaleY(0.85); }
+  50% { transform: scaleY(0.25); }
+}
+@keyframes amb-wave-dance-3 {
+  0%, 100% { transform: scaleY(0.35); }
+  50% { transform: scaleY(1); }
+}
+@keyframes amb-wave-dance-4 {
+  0%, 100% { transform: scaleY(0.7); }
+  50% { transform: scaleY(0.2); }
+}
+
+.amb-wave-bar--1.amb-wave-bar--playing {
+  animation: amb-wave-dance-1 0.72s ease-in-out infinite alternate;
+}
+.amb-wave-bar--2.amb-wave-bar--playing {
+  animation: amb-wave-dance-2 0.55s ease-in-out infinite alternate;
+}
+.amb-wave-bar--3.amb-wave-bar--playing {
+  animation: amb-wave-dance-3 0.84s ease-in-out infinite alternate;
+}
+.amb-wave-bar--4.amb-wave-bar--playing {
+  animation: amb-wave-dance-4 0.62s ease-in-out infinite alternate;
+}
+
+.amb-wave-bar--paused {
+  transform: scaleY(0.22);
+  opacity: 0.35;
+  background: #ffffff;
+  box-shadow: none;
+  animation: none;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   UNIVERSAL RIGHT SLIDE-OVER STUDY DRAWER (Samsung / Realme Floating Aesthetics)
+   ────────────────────────────────────────────────────────────────────────────── */
+
+.amb-drawer-panel {
+  background: radial-gradient(ellipse at 50% -15%, rgba(37, 99, 235, 0.12) 0%, transparent 65%), #0c0d14;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 25px 60px -15px rgba(0, 0, 0, 0.8),
+    0 0 35px rgba(37, 99, 235, 0.12);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  z-index: 86;
+  overflow: hidden;
+}
+
+.amb-drawer-backdrop {
+  z-index: 85;
+}
+
+/* Custom range sliders in drawer */
+.amb-drawer-panel input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.08);
+  height: 5px;
+  border-radius: 999px;
+}
+
+.amb-drawer-panel input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.7);
+  cursor: pointer;
+  transition: transform 0.12s ease;
+}
+
+.amb-drawer-panel input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   PERFORMANCE TIER OPTIMIZATIONS (High / Balanced / Lite)
+   ────────────────────────────────────────────────────────────────────────────── */
+
+/* High Tier: Rich depth, glowing borders, active ambient dynamics */
+[data-perf="high"] .amb-island--capsule {
+  box-shadow:
+    0 16px 40px -8px rgba(0, 0, 0, 0.85),
+    0 0 20px rgba(59, 130, 246, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+[data-perf="high"] .amb-drawer-panel {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 25px 60px -15px rgba(0, 0, 0, 0.9),
+    0 0 40px rgba(59, 130, 246, 0.18);
+}
+
+/* Balanced Tier: Moderate blur, cleaner shadows */
+[data-perf="balanced"] .amb-island {
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+[data-perf="balanced"] .amb-drawer-panel {
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+/* Lite Tier: 0% GPU Blur, solid high-contrast surfaces for 4GB RAM PCs */
+[data-perf="lite"] .amb-island {
+  background: #090e1b !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: 1px solid #1e293b !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.8) !important;
+}
+
+[data-perf="lite"] .amb-drawer-panel {
+  background: #0c0d14 !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: 1px solid #1e293b !important;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.85) !important;
+}
+
+[data-perf="lite"] .amb-drawer-backdrop {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+

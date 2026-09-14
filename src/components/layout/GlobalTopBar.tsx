@@ -18,7 +18,7 @@
 
 import { HeaderTimeBox } from "./HeaderTimeBox";
 import { MenuIcon, SearchIcon } from "../ui/icons";
-import AmbientButton from "../ambient/AmbientButton";
+import AmbientDynamicIsland from "../ambient/AmbientDynamicIsland";
 
 interface GlobalTopBarProps {
   /** Current sidebar collapse state (for the toggle's aria-pressed/label). */
@@ -36,29 +36,34 @@ export default function GlobalTopBar({
 }: GlobalTopBarProps) {
   return (
     <header className="relative z-40 flex h-16 shrink-0 items-center justify-between gap-3 bg-transparent px-4 pt-3">
-      {/* 1 — Left pill: sidebar toggle + app title */}
-      <div className="flex min-w-0 items-center gap-1.5 rounded-full border border-white/[0.05] bg-white/[0.02] py-1.5 pl-1.5 pr-4 shadow-2xl backdrop-blur-xl [box-shadow:0_16px_40px_-12px_rgba(0,0,0,0.55),inset_0_1px_1px_rgba(255,255,255,0.06)]">
-        <button
-          type="button"
-          onClick={onToggleSidebar}
-          aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-          aria-pressed={!sidebarCollapsed}
-          title="Toggle sidebar (Ctrl+B)"
-          className="grid h-9 w-9 place-items-center rounded-full text-content-secondary transition-colors hover:bg-white/[0.06] hover:text-content-primary"
-        >
-          <MenuIcon />
-        </button>
-        <span className="truncate text-sm font-medium text-content-secondary max-[1100px]:hidden">
-          Personal Learning Environment
-        </span>
+      {/* 1 — Left section: sidebar toggle + app title + Dynamic Island directly adjacent */}
+      <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex min-w-0 shrink-0 items-center gap-1.5 rounded-full border border-white/[0.05] bg-white/[0.02] py-1.5 pl-1.5 pr-4 shadow-2xl backdrop-blur-xl [box-shadow:0_16px_40px_-12px_rgba(0,0,0,0.55),inset_0_1px_1px_rgba(255,255,255,0.06)]">
+          <button
+            type="button"
+            onClick={onToggleSidebar}
+            aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            aria-pressed={!sidebarCollapsed}
+            title="Toggle sidebar (Ctrl+B)"
+            className="grid h-9 w-9 place-items-center rounded-full text-content-secondary transition-colors hover:bg-white/[0.06] hover:text-content-primary"
+          >
+            <MenuIcon />
+          </button>
+          <span className="truncate text-sm font-medium text-content-secondary max-[1100px]:hidden">
+            Personal Learning Environment
+          </span>
+        </div>
+
+        {/* Dynamic Island sits right next to PLE text container */}
+        <AmbientDynamicIsland />
       </div>
 
-      {/* 2 + 3 — Timer + focus audio + search launcher */}
-      <div className="flex shrink-0 items-center gap-3">
+      {/* Flexible spacer pushing Timer and Search to the right */}
+      <div className="flex-1" />
+
+      {/* 2 — Right section: Focus Timer + Search Launcher */}
+      <div className="flex shrink-0 items-center gap-2.5">
         <HeaderTimeBox />
-        <div className="flex items-center gap-1.5 rounded-full border border-white/[0.05] bg-white/[0.02] p-1.5 shadow-2xl backdrop-blur-xl [box-shadow:0_16px_40px_-12px_rgba(0,0,0,0.55),inset_0_1px_1px_rgba(255,255,255,0.06)]">
-          <AmbientButton variant="topbar" />
-        </div>
         <div className="flex items-center gap-1.5 rounded-full border border-white/[0.05] bg-white/[0.02] p-1.5 shadow-2xl backdrop-blur-xl [box-shadow:0_16px_40px_-12px_rgba(0,0,0,0.55),inset_0_1px_1px_rgba(255,255,255,0.06)]">
           <button
             type="button"

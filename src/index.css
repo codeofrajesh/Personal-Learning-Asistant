@@ -280,10 +280,10 @@ html[data-perf="lite"] .perf-card { content-visibility: auto; contain-intrinsic-
    Zero transition + animation time → cards/rows appear instantly, no scroll/entrance animation.
    Zero hover magnification → no hover:scale repaint churn while scrolling.
    EXEMPTION: Flame animations ([data-flame], .flame-spark, .industry-flame)
-   remain fully active and animated in all modes! */
-html[data-perf="lite"] *:not([data-flame]):not([data-flame] *):not(.flame-spark):not(.industry-flame),
-html[data-perf="lite"] *:not([data-flame]):not([data-flame] *):not(.flame-spark):not(.industry-flame)::before,
-html[data-perf="lite"] *:not([data-flame]):not([data-flame] *):not(.flame-spark):not(.industry-flame)::after {
+   and ambient loaders (.amb-spinner, .amb-shimmer) remain fully active! */
+html[data-perf="lite"] *:not([data-flame]):not([data-flame] *):not(.flame-spark):not(.industry-flame):not(.amb-spinner):not(.amb-spinner *):not(.amb-shimmer):not(.amb-shimmer *):not(.amb-rgb-spinner):not(.amb-rgb-aurora):not(.amb-wave-bar),
+html[data-perf="lite"] *:not([data-flame]):not([data-flame] *):not(.flame-spark):not(.industry-flame):not(.amb-spinner):not(.amb-spinner *):not(.amb-shimmer):not(.amb-shimmer *):not(.amb-rgb-spinner):not(.amb-rgb-aurora):not(.amb-wave-bar)::before,
+html[data-perf="lite"] *:not([data-flame]):not([data-flame] *):not(.flame-spark):not(.industry-flame):not(.amb-spinner):not(.amb-spinner *):not(.amb-shimmer):not(.amb-shimmer *):not(.amb-rgb-spinner):not(.amb-rgb-aurora):not(.amb-wave-bar)::after {
   transition-duration: 0.001ms !important;
   transition-delay: 0s !important;
   animation-duration: 0.001ms !important;
@@ -297,9 +297,9 @@ html[data-perf="lite"] *:not([data-flame]):not([data-flame] *):focus-visible {
   transform: none !important;
 }
 
-/* Reduced motion: disable all non-essential animation/transition. */
+/* Reduced motion: disable all non-essential animation/transition (exempt live media player visualizers and loaders). */
 @media (prefers-reduced-motion: reduce) {
-  *,
+  *:not(.amb-wave-bar):not(.amb-rgb-spinner):not(.amb-rgb-aurora):not(.amb-spinner):not(.amb-spinner *):not(.amb-shimmer):not(.amb-shimmer *),
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
@@ -308,3 +308,36 @@ html[data-perf="lite"] *:not([data-flame]):not([data-flame] *):focus-visible {
     scroll-behavior: auto !important;
   }
 }
+
+/* ── Ambient Skeleton Shimmer (YouTube-Grade Light Sweep) ─────────────────── */
+@keyframes amb-shimmer-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.amb-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.amb-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.03) 25%,
+    rgba(255, 255, 255, 0.09) 50%,
+    rgba(255, 255, 255, 0.03) 75%,
+    transparent 100%
+  );
+  animation: amb-shimmer-sweep 1.5s infinite ease-in-out;
+  pointer-events: none;
+}
+

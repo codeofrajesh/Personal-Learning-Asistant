@@ -15,15 +15,159 @@
 import { create } from "zustand";
 import { ipc, isTauri } from "../ipc";
 import { ambientEngine } from "./ambientEngine";
-import type { AmbientFavorite, AmbientSound } from "./types";
+import type {
+  AmbientFavorite,
+  AmbientSound,
+  AmbientPlaylist,
+  AmbientPlaylistItem,
+  AudioToneProfile,
+  BinauralBeatKind,
+} from "./types";
 
 /** Over the final stretch the volume eases to zero so the user isn't jolted awake by a hard cut. */
 const FADE_SECS = 180;
 
 const LS_VOLUME = "ple.ambient.volume";
 const LS_KEEP = "ple.ambient.keepPlaying";
+const LS_PLAYLISTS = "ple.ambient.playlists";
+const LS_PROFILE = "ple.ambient.toneProfile";
+const LS_BINAURAL_KIND = "ple.ambient.binauralKind";
+const LS_BINAURAL_VOL = "ple.ambient.binauralVol";
+const LS_AUTODUCK = "ple.ambient.autoDuck";
+
 const SETTING_VOLUME = "ambient.volume";
 const SETTING_KEEP = "ambient.keep_playing";
+
+const STARTER_PLAYLISTS: AmbientPlaylist[] = [
+  {
+    id: "pl-deep-focus",
+    name: "Deep Focus Flow",
+    emoji: "⚡",
+    gradient: "from-blue-600 via-indigo-600 to-cyan-500",
+    description: "Lofi beats, rain acoustics, and neural alpha frequencies for unbroken deep work.",
+    created_at: new Date().toISOString(),
+    items: [
+      {
+        id: "item-df-1",
+        added_at: new Date().toISOString(),
+        sound: {
+          source: "youtube",
+          id: "jfKfPfyJRdk",
+          name: "lofi hip hop radio 📚 - beats to relax/study to",
+          thumbnail_url: "https://i.ytimg.com/vi/jfKfPfyJRdk/hq720.jpg",
+          channel: "Lofi Girl",
+          duration_secs: null,
+        },
+      },
+      {
+        id: "item-df-2",
+        added_at: new Date().toISOString(),
+        sound: {
+          source: "procedural",
+          id: "rain",
+          name: "Heavy Rain & Distant Thunder",
+          thumbnail_url: null,
+          channel: "Synthesizer",
+          duration_secs: null,
+        },
+      },
+      {
+        id: "item-df-3",
+        added_at: new Date().toISOString(),
+        sound: {
+          source: "procedural",
+          id: "alpha10",
+          name: "10 Hz Alpha Wave Binaural Tone",
+          thumbnail_url: null,
+          channel: "Synthesizer",
+          duration_secs: null,
+        },
+      },
+    ],
+  },
+  {
+    id: "pl-night-code",
+    name: "Late Night Code",
+    emoji: "🌌",
+    gradient: "from-purple-600 via-violet-600 to-indigo-700",
+    description: "Deep space ambient drones & hypnotic synthscapes for nighttime programming.",
+    created_at: new Date().toISOString(),
+    items: [
+      {
+        id: "item-nc-1",
+        added_at: new Date().toISOString(),
+        sound: {
+          source: "somafm",
+          id: "dronezone",
+          name: "Drone Zone",
+          url: "https://ice1.somafm.com/dronezone-128-mp3",
+          thumbnail_url: null,
+          channel: "SomaFM 24/7",
+          duration_secs: null,
+        },
+      },
+      {
+        id: "item-nc-2",
+        added_at: new Date().toISOString(),
+        sound: {
+          source: "procedural",
+          id: "brown",
+          name: "Deep Brown Noise",
+          thumbnail_url: null,
+          channel: "Synthesizer",
+          duration_secs: null,
+        },
+      },
+      {
+        id: "item-nc-3",
+        added_at: new Date().toISOString(),
+        sound: {
+          source: "somafm",
+          id: "spacestation",
+          name: "Space Station Soma",
+          url: "https://ice1.somafm.com/spacestation-128-mp3",
+          thumbnail_url: null,
+          channel: "SomaFM 24/7",
+          duration_secs: null,
+        },
+      },
+    ],
+  },
+  {
+    id: "pl-exam-sprint",
+    name: "Exam Sprint",
+    emoji: "🔥",
+    gradient: "from-amber-600 via-orange-600 to-rose-600",
+    description: "High-energy gamma waves and immersive ocean surges for maximum retention.",
+    created_at: new Date().toISOString(),
+    items: [
+      {
+        id: "item-es-1",
+        added_at: new Date().toISOString(),
+        sound: {
+          source: "procedural",
+          id: "gamma40",
+          name: "40 Hz Gamma Neuro-Sync",
+          thumbnail_url: null,
+          channel: "Synthesizer",
+          duration_secs: null,
+        },
+      },
+      {
+        id: "item-es-2",
+        added_at: new Date().toISOString(),
+        sound: {
+          source: "procedural",
+          id: "waves",
+          name: "Deep Ocean Surf",
+          thumbnail_url: null,
+          channel: "Synthesizer",
+          duration_secs: null,
+        },
+      },
+    ],
+  },
+];
 
 interface AmbientState {
   activeSound: AmbientSound | null;
@@ -48,6 +192,30 @@ interface AmbientState {
   favorites: AmbientFavorite[];
   hydrated: boolean;
 
+  // ── Study Playlists & Queue ──
+  playlists: AmbientPlaylist[];
+  activePlaylistId: string | null;
+  activePlaylistIndex: number;
+
+  createPlaylist: (name: string, emoji?: string, gradient?: string, description?: string) => string;
+  deletePlaylist: (id: string) => void;
+  addToPlaylist: (playlistId: string, sound: AmbientSound) => void;
+  removeFromPlaylist: (playlistId: string, itemId: string) => void;
+  playPlaylist: (playlistId: string, startIndex?: number) => void;
+  playNextInPlaylist: () => void;
+  playPreviousInPlaylist: () => void;
+
+  // ── Studio Sound Profiles & Brainwave Entrainment ──
+  toneProfile: AudioToneProfile;
+  binauralKind: BinauralBeatKind;
+  binauralVolume: number;
+  autoDuckOnLecture: boolean;
+
+  setToneProfile: (profile: AudioToneProfile) => void;
+  setBinauralBeat: (kind: BinauralBeatKind, volume?: number) => void;
+  setBinauralVolume: (vol: number) => void;
+  setAutoDuck: (enabled: boolean) => void;
+
   play: (sound: AmbientSound) => void;
   togglePlay: () => void;
   seek: (secs: number) => void;
@@ -63,6 +231,15 @@ interface AmbientState {
   cacheFavorite: (fav: AmbientFavorite) => Promise<void>;
   deleteCache: (fav: AmbientFavorite) => Promise<void>;
   initSync: () => Promise<void>;
+
+  isDrawerOpen: boolean;
+  openDrawer: () => void;
+  closeDrawer: () => void;
+  toggleDrawer: () => void;
+
+  pillExpanded: boolean;
+  setPillExpanded: (expanded: boolean) => void;
+  togglePillExpanded: () => void;
 }
 
 function readNumber(key: string, fallback: number): number {
@@ -74,6 +251,7 @@ function readNumber(key: string, fallback: number): number {
     return fallback;
   }
 }
+
 function readBool(key: string, fallback: boolean): boolean {
   try {
     const raw = localStorage.getItem(key);
@@ -81,6 +259,22 @@ function readBool(key: string, fallback: boolean): boolean {
   } catch {
     return fallback;
   }
+}
+
+function readJson<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(key: string, val: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(val));
+  } catch { /* ignore */ }
 }
 
 export const useAmbientStore = create<AmbientState>((set, get) => ({
@@ -97,6 +291,141 @@ export const useAmbientStore = create<AmbientState>((set, get) => ({
   fadeStarted: false,
   favorites: [],
   hydrated: false,
+
+  // ── Study Playlists & Queue ──
+  playlists: readJson<AmbientPlaylist[]>(LS_PLAYLISTS, STARTER_PLAYLISTS),
+  activePlaylistId: null,
+  activePlaylistIndex: 0,
+
+  createPlaylist: (name, emoji = "🎵", gradient = "from-blue-600 via-indigo-600 to-cyan-500", description = "") => {
+    const newPl: AmbientPlaylist = {
+      id: `pl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: name.trim() || "Untitled Playlist",
+      emoji,
+      gradient,
+      description,
+      items: [],
+      created_at: new Date().toISOString(),
+    };
+    const updated = [newPl, ...get().playlists];
+    writeJson(LS_PLAYLISTS, updated);
+    set({ playlists: updated });
+    return newPl.id;
+  },
+
+  deletePlaylist: (id) => {
+    const updated = get().playlists.filter((p) => p.id !== id);
+    writeJson(LS_PLAYLISTS, updated);
+    const patch: Partial<AmbientState> = { playlists: updated };
+    if (get().activePlaylistId === id) {
+      patch.activePlaylistId = null;
+      patch.activePlaylistIndex = 0;
+    }
+    set(patch);
+  },
+
+  addToPlaylist: (playlistId, sound) => {
+    const playlists = get().playlists.map((pl) => {
+      if (pl.id !== playlistId) return pl;
+      if (pl.items.some((item) => item.sound.id === sound.id)) return pl;
+      const newItem: AmbientPlaylistItem = {
+        id: `item-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        sound,
+        added_at: new Date().toISOString(),
+      };
+      return { ...pl, items: [...pl.items, newItem] };
+    });
+    writeJson(LS_PLAYLISTS, playlists);
+    set({ playlists });
+  },
+
+  removeFromPlaylist: (playlistId, itemId) => {
+    const playlists = get().playlists.map((pl) => {
+      if (pl.id !== playlistId) return pl;
+      return { ...pl, items: pl.items.filter((it) => it.id !== itemId) };
+    });
+    writeJson(LS_PLAYLISTS, playlists);
+    set({ playlists });
+  },
+
+  playPlaylist: (playlistId, startIndex = 0) => {
+    const pl = get().playlists.find((p) => p.id === playlistId);
+    if (!pl || pl.items.length === 0) return;
+    const safeIdx = Math.max(0, Math.min(pl.items.length - 1, startIndex));
+    const targetItem = pl.items[safeIdx];
+    if (!targetItem) return;
+
+    set({ activePlaylistId: playlistId, activePlaylistIndex: safeIdx });
+    get().play({
+      ...targetItem.sound,
+      playlist_id: playlistId,
+    });
+  },
+
+  playNextInPlaylist: () => {
+    const { activePlaylistId, activePlaylistIndex, playlists } = get();
+    if (!activePlaylistId) return;
+    const pl = playlists.find((p) => p.id === activePlaylistId);
+    if (!pl || pl.items.length === 0) return;
+
+    const nextIdx = (activePlaylistIndex + 1) % pl.items.length;
+    const nextItem = pl.items[nextIdx];
+    if (!nextItem) return;
+
+    set({ activePlaylistIndex: nextIdx });
+    get().play({
+      ...nextItem.sound,
+      playlist_id: activePlaylistId,
+    });
+  },
+
+  playPreviousInPlaylist: () => {
+    const { activePlaylistId, activePlaylistIndex, playlists } = get();
+    if (!activePlaylistId) return;
+    const pl = playlists.find((p) => p.id === activePlaylistId);
+    if (!pl || pl.items.length === 0) return;
+
+    const prevIdx = (activePlaylistIndex - 1 + pl.items.length) % pl.items.length;
+    const prevItem = pl.items[prevIdx];
+    if (!prevItem) return;
+
+    set({ activePlaylistIndex: prevIdx });
+    get().play({
+      ...prevItem.sound,
+      playlist_id: activePlaylistId,
+    });
+  },
+
+  // ── Studio Sound Profiles & Brainwave Entrainment ──
+  toneProfile: (localStorage.getItem(LS_PROFILE) as AudioToneProfile) || "flat",
+  binauralKind: (localStorage.getItem(LS_BINAURAL_KIND) as BinauralBeatKind) || "off",
+  binauralVolume: readNumber(LS_BINAURAL_VOL, 0.35),
+  autoDuckOnLecture: readBool(LS_AUTODUCK, true),
+
+  setToneProfile: (profile) => {
+    localStorage.setItem(LS_PROFILE, profile);
+    ambientEngine.setToneProfile(profile);
+    set({ toneProfile: profile });
+  },
+
+  setBinauralBeat: (kind, volume) => {
+    const vol = volume != null ? volume : get().binauralVolume;
+    localStorage.setItem(LS_BINAURAL_KIND, kind);
+    ambientEngine.setBinauralBeat(kind, vol);
+    set({ binauralKind: kind, binauralVolume: vol });
+  },
+
+  setBinauralVolume: (vol) => {
+    const clamped = Math.max(0, Math.min(1, vol));
+    localStorage.setItem(LS_BINAURAL_VOL, String(clamped));
+    ambientEngine.setBinauralVolume(clamped);
+    set({ binauralVolume: clamped });
+  },
+
+  setAutoDuck: (enabled) => {
+    localStorage.setItem(LS_AUTODUCK, String(enabled));
+    set({ autoDuckOnLecture: enabled });
+  },
 
   play: async (sound) => {
     ambientEngine.setVolume(get().volume);
@@ -276,8 +605,24 @@ export const useAmbientStore = create<AmbientState>((set, get) => ({
       }
       await get().loadFavorites();
     }
+
+    // Apply studio audio tone profile & binaural beats if active
+    ambientEngine.setToneProfile(get().toneProfile);
+    if (get().binauralKind !== "off") {
+      ambientEngine.setBinauralBeat(get().binauralKind, get().binauralVolume);
+    }
+
     set({ hydrated: true });
   },
+
+  isDrawerOpen: false,
+  openDrawer: () => set({ isDrawerOpen: true }),
+  closeDrawer: () => set({ isDrawerOpen: false }),
+  toggleDrawer: () => set((s) => ({ isDrawerOpen: !s.isDrawerOpen })),
+
+  pillExpanded: false,
+  setPillExpanded: (expanded: boolean) => set({ pillExpanded: expanded }),
+  togglePillExpanded: () => set((s) => ({ pillExpanded: !s.pillExpanded })),
 }));
 
 // ── Engine → store event bridge ─────────────────────────────────────────────
@@ -317,8 +662,10 @@ ambientEngine.subscribe((event) => {
       break;
 
     case "ended":
-      // If the clip ended naturally (finite clip, not looped), stop.
-      if (state.activeSound && state.activeSound.loop === false) {
+      // If we are currently in an active playlist, advance to the next track!
+      if (state.activePlaylistId) {
+        state.playNextInPlaylist();
+      } else if (state.activeSound && state.activeSound.loop === false) {
         state.stop();
       }
       break;

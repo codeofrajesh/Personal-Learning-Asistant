@@ -82,4 +82,30 @@ export interface AmbientSound {
   thumbnail_url?: string | null;
   channel?: string | null;
   duration_secs?: number | null;
+  playlist_id?: string | null;
 }
+
+/** Individual item in a user's study playlist. */
+export interface AmbientPlaylistItem {
+  id: string;
+  sound: AmbientSound;
+  added_at: string;
+}
+
+/** User-curated or starter study playlist. */
+export interface AmbientPlaylist {
+  id: string;
+  name: string;
+  emoji: string;
+  gradient: string; // Tailwind gradient classes e.g. "from-blue-600 via-indigo-600 to-cyan-500"
+  description?: string;
+  items: AmbientPlaylistItem[];
+  created_at: string;
+}
+
+/** Professional Studio EQ Tone profiles for study acoustic optimization. */
+export type AudioToneProfile = "flat" | "warm" | "vocal" | "bass" | "shield";
+
+/** Isochronic / Binaural Brainwave entrainment frequencies. */
+export type BinauralBeatKind = "off" | "alpha" | "beta" | "theta" | "gamma";
+

@@ -416,7 +416,7 @@ export default function AmbientPopover({
                     </span>
                   ) : activeSound.source === "youtube" ? (
                     <span className="amb-tag amb-tag--youtube">
-                      <Youtube size={10} /> 160k Stereo Opus
+                      <Youtube size={10} /> Raw Master Stereo
                     </span>
                   ) : activeSound.source === "procedural" ? (
                     <span className="amb-tag amb-tag--offline">

@@ -20,7 +20,7 @@
 import { assetUrl, ipc, isTauri } from "../ipc";
 import { getAudioContext, resumeAudioContext } from "./audioContext";
 import { startProcedural, type ProceduralHandle } from "./procedural";
-import type { AmbientSound, ProceduralKind } from "./types";
+import type { AmbientSound, ProceduralKind, AudioToneProfile, BinauralBeatKind } from "./types";
 
 // ── State change events ────────────────────────────────────────────────────
 
@@ -46,7 +46,9 @@ let masterGain: GainNode | null = null;
 let warmthFilter: BiquadFilterNode | null = null;
 let presenceFilter: BiquadFilterNode | null = null;
 let masterCompressor: DynamicsCompressorNode | null = null;
-let audioEl: HTMLAudioElement | null = null;
+let rawAudioEl: HTMLAudioElement | null = null;
+let filteredAudioEl: HTMLAudioElement | null = null;
+let activeEl: HTMLAudioElement | null = null;
 let proceduralHandle: ProceduralHandle | null = null;
 let current: AmbientSound | null = null;
 let volume = 0.1;
@@ -214,29 +216,45 @@ function ensureElementGraph(el: HTMLAudioElement) {
   }
 }
 
-function ensureAudioEl(): HTMLAudioElement {
-  if (!audioEl) {
-    audioEl = new Audio();
-    // Enable CORS so Web Audio can apply the Stereo Spatializer & Master EQ
-    audioEl.crossOrigin = "anonymous";
-    // Prevent leaking localhost referrer → 403 on SomaFM / CDNs.
-    (audioEl as unknown as { referrerPolicy: string }).referrerPolicy = "no-referrer";
-    audioEl.setAttribute("referrerpolicy", "no-referrer");
-    audioEl.preload = "auto";
-    audioEl.volume = volume;
-    attachElListeners(audioEl);
-
-    // Register with Media Session API so earbuds / OS controls work.
-    if ("mediaSession" in navigator) {
-      navigator.mediaSession.setActionHandler("play", () => {
-        if (audioEl && audioEl.paused) void audioEl.play().catch(() => {});
-      });
-      navigator.mediaSession.setActionHandler("pause", () => {
-        audioEl?.pause();
-      });
-    }
+function setupMediaSession() {
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.setActionHandler("play", () => {
+      if (activeEl && activeEl.paused) void activeEl.play().catch(() => {});
+    });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      activeEl?.pause();
+    });
   }
-  return audioEl;
+}
+
+/** Pure raw HTMLAudioElement: Direct stereo stream with NO Web Audio filters or artificial spatializers */
+function ensureRawAudioEl(): HTMLAudioElement {
+  if (!rawAudioEl) {
+    rawAudioEl = new Audio();
+    (rawAudioEl as unknown as { referrerPolicy: string }).referrerPolicy = "no-referrer";
+    rawAudioEl.setAttribute("referrerpolicy", "no-referrer");
+    rawAudioEl.preload = "auto";
+    rawAudioEl.volume = volume;
+    attachElListeners(rawAudioEl);
+    setupMediaSession();
+  }
+  return rawAudioEl;
+}
+
+/** Filtered HTMLAudioElement: Connected to Haas stereo spatializer and warmth EQ for mono/field sounds */
+function ensureFilteredAudioEl(): HTMLAudioElement {
+  if (!filteredAudioEl) {
+    filteredAudioEl = new Audio();
+    filteredAudioEl.crossOrigin = "anonymous";
+    (filteredAudioEl as unknown as { referrerPolicy: string }).referrerPolicy = "no-referrer";
+    filteredAudioEl.setAttribute("referrerpolicy", "no-referrer");
+    filteredAudioEl.preload = "auto";
+    filteredAudioEl.volume = volume;
+    attachElListeners(filteredAudioEl);
+    ensureElementGraph(filteredAudioEl);
+    setupMediaSession();
+  }
+  return filteredAudioEl;
 }
 
 function stopProcedural() {
@@ -246,11 +264,16 @@ function stopProcedural() {
   }
 }
 
-function stopElement() {
-  if (audioEl) {
-    audioEl.pause();
-    audioEl.removeAttribute("src");
-    audioEl.load();
+function stopElements() {
+  if (rawAudioEl) {
+    rawAudioEl.pause();
+    rawAudioEl.removeAttribute("src");
+    rawAudioEl.load();
+  }
+  if (filteredAudioEl) {
+    filteredAudioEl.pause();
+    filteredAudioEl.removeAttribute("src");
+    filteredAudioEl.load();
   }
 }
 
@@ -264,7 +287,7 @@ function clearElFade() {
 /** JS volume ramp for the `<audio>` element (its volume isn't an AudioParam). */
 function rampElementVolume(target: number, seconds: number) {
   clearElFade();
-  const el = audioEl;
+  const el = activeEl;
   if (!el) return;
   const start = el.volume;
   const steps = Math.max(1, Math.round(seconds * 20));
@@ -293,8 +316,9 @@ export const ambientEngine = {
     const ctx = getAudioContext();
 
     if (sound.source === "procedural") {
-      stopElement();
+      stopElements();
       stopProcedural();
+      activeEl = null;
       clearElFade();
       gain.gain.cancelScheduledValues(ctx.currentTime);
       gain.gain.setValueAtTime(0.0001, ctx.currentTime);
@@ -306,9 +330,20 @@ export const ambientEngine = {
       emit({ type: "ready", isBuffering: false });
     } else {
       stopProcedural();
-      const el = ensureAudioEl();
-      ensureElementGraph(el);
       clearElFade();
+
+      // YouTube provides studio-mastered stereo — bypass filters & spatializers to preserve 100% raw fidelity
+      const isRaw = sound.source === "youtube";
+      const el = isRaw ? ensureRawAudioEl() : ensureFilteredAudioEl();
+
+      // Pause the other element if active
+      if (isRaw && filteredAudioEl) {
+        filteredAudioEl.pause();
+      } else if (!isRaw && rawAudioEl) {
+        rawAudioEl.pause();
+      }
+      activeEl = el;
+
       el.loop = sound.loop !== false;
       el.volume = volume;
 
@@ -354,7 +389,7 @@ export const ambientEngine = {
 
   pause() {
     stopProcedural();
-    if (audioEl) audioEl.pause();
+    if (activeEl) activeEl.pause();
     clearElFade();
   },
 
@@ -364,9 +399,10 @@ export const ambientEngine = {
 
   stop() {
     stopProcedural();
-    stopElement();
+    stopElements();
     clearElFade();
     current = null;
+    activeEl = null;
     emit({ type: "ended" });
   },
 
@@ -377,10 +413,9 @@ export const ambientEngine = {
       masterGain.gain.cancelScheduledValues(ctx.currentTime);
       masterGain.gain.setValueAtTime(volume, ctx.currentTime);
     }
-    if (audioEl) {
-      clearElFade();
-      audioEl.volume = volume;
-    }
+    clearElFade();
+    if (rawAudioEl) rawAudioEl.volume = volume;
+    if (filteredAudioEl) filteredAudioEl.volume = volume;
   },
 
   fadeTo(target: number, seconds: number) {
@@ -400,9 +435,9 @@ export const ambientEngine = {
   },
 
   seek(seconds: number) {
-    if (audioEl && Number.isFinite(seconds)) {
+    if (activeEl && Number.isFinite(seconds)) {
       try {
-        audioEl.currentTime = Math.max(0, seconds);
+        activeEl.currentTime = Math.max(0, seconds);
       } catch (err) {
         console.warn("[ambientEngine] seek failed:", err);
       }
@@ -411,10 +446,169 @@ export const ambientEngine = {
 
   /** Get current audio element time info (for initial state on mount). */
   getTimeInfo(): { currentTime: number; duration: number } {
-    if (!audioEl) return { currentTime: 0, duration: 0 };
+    if (!activeEl) return { currentTime: 0, duration: 0 };
     return {
-      currentTime: audioEl.currentTime || 0,
-      duration: Number.isFinite(audioEl.duration) ? audioEl.duration : 0,
+      currentTime: activeEl.currentTime || 0,
+      duration: Number.isFinite(activeEl.duration) ? activeEl.duration : 0,
     };
   },
+
+  /** Apply Studio EQ Tone Profiles (flat, warm, vocal, bass, shield). */
+  setToneProfile(profile: AudioToneProfile) {
+    applyToneProfile(profile);
+  },
+
+  /** Control real-time Binaural Beats Brainwave Generator (off, alpha, beta, theta, gamma). */
+  setBinauralBeat(kind: BinauralBeatKind, vol?: number) {
+    startBinaural(kind, vol);
+  },
+
+  /** Set Binaural Beats volume. */
+  setBinauralVolume(vol: number) {
+    setBinauralVol(vol);
+  },
+
+  /** Smoothly duck or restore ambient audio volume during lectures. */
+  setDucked(duck: boolean) {
+    setDucking(duck);
+  },
+
+  getToneProfile(): AudioToneProfile {
+    return currentProfile;
+  },
+
+  getIsDucked(): boolean {
+    return isDucked;
+  },
+
+  getBinauralKind(): BinauralBeatKind {
+    return currentBinauralKind;
+  },
 };
+
+// ── Studio EQ Tone Profiles & Brainwave Entrainment Nodes ─────────────────
+
+let currentProfile: AudioToneProfile = "flat";
+let isDucked = false;
+
+function applyToneProfile(profile: AudioToneProfile) {
+  currentProfile = profile;
+  ensureGraph();
+  if (!warmthFilter || !presenceFilter) return;
+  const ctx = getAudioContext();
+  const now = ctx.currentTime;
+
+  warmthFilter.gain.cancelScheduledValues(now);
+  presenceFilter.gain.cancelScheduledValues(now);
+
+  switch (profile) {
+    case "flat":
+      warmthFilter.gain.linearRampToValueAtTime(0, now + 0.15);
+      presenceFilter.gain.linearRampToValueAtTime(0, now + 0.15);
+      break;
+    case "warm":
+      warmthFilter.gain.linearRampToValueAtTime(3.8, now + 0.15);
+      presenceFilter.gain.linearRampToValueAtTime(-2.4, now + 0.15);
+      break;
+    case "vocal":
+      warmthFilter.gain.linearRampToValueAtTime(-2.2, now + 0.15);
+      presenceFilter.gain.linearRampToValueAtTime(3.2, now + 0.15);
+      break;
+    case "bass":
+      warmthFilter.gain.linearRampToValueAtTime(6.2, now + 0.15);
+      presenceFilter.gain.linearRampToValueAtTime(-1.0, now + 0.15);
+      break;
+    case "shield":
+      warmthFilter.gain.linearRampToValueAtTime(-3.5, now + 0.15);
+      presenceFilter.gain.linearRampToValueAtTime(-4.2, now + 0.15);
+      break;
+  }
+}
+
+function setDucking(duck: boolean) {
+  isDucked = duck;
+  const effectiveVol = duck ? volume * 0.3 : volume;
+  if (masterGain) {
+    const ctx = getAudioContext();
+    const now = ctx.currentTime;
+    masterGain.gain.cancelScheduledValues(now);
+    masterGain.gain.linearRampToValueAtTime(effectiveVol, now + 0.3);
+  }
+  if (rawAudioEl) rampElementVolume(effectiveVol, 0.3);
+  if (filteredAudioEl) rampElementVolume(effectiveVol, 0.3);
+}
+
+// ── Pure Binaural Beats Stereo Carrier Oscillators ─────────────────────────
+
+let binauralGain: GainNode | null = null;
+let binauralOscL: OscillatorNode | null = null;
+let binauralOscR: OscillatorNode | null = null;
+let currentBinauralKind: BinauralBeatKind = "off";
+let binauralVolume = 0.3;
+
+function stopBinaural() {
+  if (binauralOscL) {
+    try {
+      binauralOscL.stop();
+      binauralOscL.disconnect();
+    } catch { /* ignore */ }
+    binauralOscL = null;
+  }
+  if (binauralOscR) {
+    try {
+      binauralOscR.stop();
+      binauralOscR.disconnect();
+    } catch { /* ignore */ }
+    binauralOscR = null;
+  }
+}
+
+function setBinauralVol(vol: number) {
+  binauralVolume = Math.max(0, Math.min(1, vol));
+  if (binauralGain) {
+    const ctx = getAudioContext();
+    binauralGain.gain.cancelScheduledValues(ctx.currentTime);
+    binauralGain.gain.setValueAtTime(binauralVolume * 0.15, ctx.currentTime);
+  }
+}
+
+function startBinaural(kind: BinauralBeatKind, vol?: number) {
+  stopBinaural();
+  currentBinauralKind = kind;
+  if (vol != null) binauralVolume = Math.max(0, Math.min(1, vol));
+
+  if (kind === "off" || binauralVolume <= 0) return;
+
+  const ctx = getAudioContext();
+  resumeAudioContext();
+
+  const baseFreq = 216; // Harmonic Pythagorean pitch
+  let beatHz = 10;
+  if (kind === "alpha") beatHz = 10; // 10Hz: Deep calm study & recall
+  else if (kind === "beta") beatHz = 18; // 18Hz: Active problem solving, math/code
+  else if (kind === "theta") beatHz = 6; // 6Hz: Creative flow & deep insight
+  else if (kind === "gamma") beatHz = 40; // 40Hz: Hyper-focus & maximum memory
+
+  const merger = ctx.createChannelMerger(2);
+  if (!binauralGain) {
+    binauralGain = ctx.createGain();
+    binauralGain.connect(ctx.destination);
+  }
+  binauralGain.gain.setValueAtTime(binauralVolume * 0.15, ctx.currentTime);
+
+  binauralOscL = ctx.createOscillator();
+  binauralOscL.type = "sine";
+  binauralOscL.frequency.setValueAtTime(baseFreq - beatHz / 2, ctx.currentTime);
+  binauralOscL.connect(merger, 0, 0);
+
+  binauralOscR = ctx.createOscillator();
+  binauralOscR.type = "sine";
+  binauralOscR.frequency.setValueAtTime(baseFreq + beatHz / 2, ctx.currentTime);
+  binauralOscR.connect(merger, 0, 1);
+
+  merger.connect(binauralGain);
+
+  binauralOscL.start();
+  binauralOscR.start();
+}
+

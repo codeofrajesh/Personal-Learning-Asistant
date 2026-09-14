@@ -161,7 +161,7 @@ pub async fn get_youtube_audio_url(
     let cmd = yt_dlp.args([
         "-g",
         "-f",
-        "bestaudio[ext=m4a]/bestaudio/best",
+        "bestaudio/bestaudio[ext=m4a]/best",
         "--dump-single-json",
         "--no-warnings",
         "--no-check-certificates",

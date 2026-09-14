@@ -21,6 +21,8 @@ import ToastHost from "../ui/ToastHost";
 import AddFolderModal from "../wizard/AddFolderModal";
 import MiniPlayer from "../player/MiniPlayer";
 import AmbientController from "../ambient/AmbientController";
+import AmbientDrawer from "../ambient/AmbientDrawer";
+import { useAmbientStore } from "../../lib/ambient/useAmbientStore";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { usePerf } from "../../lib/perfStore";
 import { useTaskReminders } from "../useTaskReminders";
@@ -102,6 +104,9 @@ export default function AppShell() {
       } else if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         toggleSearch();
+      } else if ((e.altKey && e.key.toLowerCase() === "m") || (mod && e.shiftKey && e.key.toLowerCase() === "a")) {
+        e.preventDefault();
+        useAmbientStore.getState().toggleDrawer();
       }
     }
     window.addEventListener("keydown", onKey);
@@ -216,6 +221,7 @@ export default function AppShell() {
       <AddFolderModal />
       <MiniPlayer />
       <AmbientController />
+      <AmbientDrawer />
       <ToastHost />
     </div>
   );
