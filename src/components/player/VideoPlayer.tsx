@@ -34,7 +34,12 @@ import {
   stepRate,
 } from "../../lib/playbackRate";
 import { useMediaProgress } from "./useMediaProgress";
-import { useSkipSilence } from "./useSkipSilence";
+import { useSkipSilence, type SkipExitMeta } from "./useSkipSilence";
+import {
+  calculateBacktrackDelta,
+  calculateHysteresisThreshold,
+  calculateDecelMicroSteps,
+} from "../../lib/player/skipSilenceMath";
 import SkipSilenceMenu from "./SkipSilenceMenu";
 import { getAudioContext, resumeAudioContext } from "../../lib/ambient/audioContext";
 
@@ -79,6 +84,7 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
   // fallback engine, so the wiring is deliberately minimal.
   const analyserRef = useRef<AnalyserNode | null>(null);
   const audioSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const declickGainRef = useRef<GainNode | null>(null);
   const timeDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const silenceSinceRef = useRef(0);
   const skipToggleRef = useRef<(() => void) | null>(null);
@@ -88,9 +94,41 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
     const v = videoRef.current;
     if (v) v.playbackRate = quantizeRate(targetSpeed);
   };
-  const exitSkip = () => {
+  const exitSkip = (meta?: SkipExitMeta) => {
     const v = videoRef.current;
-    if (v) v.playbackRate = quantizeRate(rateRef.current);
+    if (!v) return;
+    const baseline = quantizeRate(rateRef.current);
+    const skipSpeed = meta?.skipSpeed ?? 4.0;
+
+    // ── Exact Mathematical Backtrack ──
+    const delta = calculateBacktrackDelta(skipSpeed, baseline);
+    if (delta > 0.015 && v.currentTime > delta) {
+      v.currentTime = Math.max(0, v.currentTime - delta);
+    }
+
+    // ── Anti-Pop De-clicking Micro-Ramp & Micro-Duck ──
+    const steps = calculateDecelMicroSteps(skipSpeed, baseline);
+    if (steps.length === 2) {
+      v.playbackRate = steps[0];
+      if (declickGainRef.current) {
+        try {
+          const ctx = getAudioContext();
+          const g = declickGainRef.current.gain;
+          const now = ctx.currentTime;
+          g.cancelScheduledValues(now);
+          g.setValueAtTime(1.0, now);
+          g.linearRampToValueAtTime(0.4, now + 0.008);
+          g.linearRampToValueAtTime(1.0, now + 0.024);
+        } catch {
+          /* ignore audio context state */
+        }
+      }
+      window.setTimeout(() => {
+        if (videoRef.current) videoRef.current.playbackRate = steps[1];
+      }, 20);
+    } else {
+      v.playbackRate = steps[0];
+    }
   };
   const skipSilence = useSkipSilence({ enterSkip, exitSkip });
   skipToggleRef.current = skipSilence.toggleEnabled;
@@ -158,14 +196,16 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
           }
           const rms = Math.sqrt(sum / buf.length);
           const db = rms > 0 ? 20 * Math.log10(rms) : -100;
-          if (db < cfg.thresholdDb) {
+          const isSkipping = skipSilence.skipActiveRef.current;
+          const activeThreshold = calculateHysteresisThreshold(cfg.thresholdDb, isSkipping);
+          if (db < activeThreshold) {
             if (silenceSinceRef.current === 0) silenceSinceRef.current = ts;
             else if (ts - silenceSinceRef.current >= cfg.minSilenceSecs * 1000) {
               skipSilence.onSilenceStart();
             }
           } else {
             silenceSinceRef.current = 0;
-            if (skipSilence.skipActiveRef.current) skipSilence.onSilenceEnd();
+            if (isSkipping) skipSilence.onSilenceEnd();
           }
         }
       }
@@ -177,7 +217,7 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
   }, [accumulatedRef]);
 
   // Set up the skip-silence analyser once, the first time the feature is enabled. Builds a single
-  // permanent chain (source → analyser → destination): `createMediaElementSource` reroutes the
+  // permanent chain (source → analyser → gain → destination): `createMediaElementSource` reroutes the
   // element's audio ENTIRELY into the graph, so tearing this down would mute playback — instead we
   // keep it connected and simply stop reading the analyser when disabled. Created lazily so a user
   // who never enables skip-silence keeps plain native element playback.
@@ -192,10 +232,14 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
       timeDataRef.current = new Uint8Array(analyser.fftSize);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(1.0, ctx.currentTime);
       source.connect(analyser);
-      analyser.connect(ctx.destination);
+      analyser.connect(gain);
+      gain.connect(ctx.destination);
       audioSrcRef.current = source;
       analyserRef.current = analyser;
+      declickGainRef.current = gain;
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error("[VideoPlayer] skip-silence analyser setup failed:", e);

@@ -42,7 +42,8 @@ import {
 import { playerBridge } from "../../lib/playerBridge";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { formatDuration } from "../../lib/utils";
-import { useSkipSilence } from "./useSkipSilence";
+import { useSkipSilence, type SkipExitMeta } from "./useSkipSilence";
+import { calculateBacktrackDelta, calculateDecelMicroSteps } from "../../lib/player/skipSilenceMath";
 import SkipSilenceMenu from "./SkipSilenceMenu";
 import AmbientButton from "../ambient/AmbientButton";
 import {
@@ -351,8 +352,51 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
     baselineRateRef.current = rateRef.current;
     void setProperty("speed", quantizeRate(targetSpeed)).catch(() => {});
   }, []);
-  const exitSkip = useCallback(() => {
-    void setProperty("speed", quantizeRate(baselineRateRef.current)).catch(() => {});
+  const exitSkip = useCallback((meta?: SkipExitMeta) => {
+    const baseline = quantizeRate(baselineRateRef.current);
+    const skipSpeed = meta?.skipSpeed ?? 4.0;
+    const speechStart = meta?.speechStartTime;
+
+    // ── Exact Mathematical Backtrack ──
+    // When speech resumes, determine target position to rewind so the first word is never mangled:
+    let targetPos: number | null = null;
+    const curPos = timePosRef.current;
+
+    if (typeof speechStart === "number" && Number.isFinite(speechStart)) {
+      // Direct timestamp from FFmpeg silencedetect: rewind to 40ms before speech started (breath attack margin)
+      const candidate = Math.max(0, speechStart - 0.040);
+      const delta = curPos - candidate;
+      // Only backtrack if overrun actually happened and is within a sane limit (<= 400ms)
+      if (delta > 0.015 && delta <= 0.400) {
+        targetPos = candidate;
+      }
+    } else {
+      // Fallback mathematical formula based on speed disparity:
+      const delta = calculateBacktrackDelta(skipSpeed, baseline);
+      if (delta > 0.015 && curPos > delta) {
+        targetPos = Math.max(0, curPos - delta);
+      }
+    }
+
+    if (targetPos !== null) {
+      timePosRef.current = targetPos;
+      lastTimePosRef.current = targetPos; // don't bill backtrack as watch time
+      lastWallTsRef.current = 0;
+      void command("seek", [targetPos, "absolute+exact"]).catch(() => {});
+    }
+
+    // ── Anti-Pop De-clicking Micro-Ramp ──
+    // Moving from 4.0x to 1.5x in 0ms forces scaletempo2 pitch filters to crash phase grains,
+    // producing a static pop/crackle. We ramp through an intermediate velocity over 22ms.
+    const steps = calculateDecelMicroSteps(skipSpeed, baseline);
+    if (steps.length === 2) {
+      void setProperty("speed", steps[0]).catch(() => {});
+      window.setTimeout(() => {
+        void setProperty("speed", steps[1]).catch(() => {});
+      }, 22);
+    } else {
+      void setProperty("speed", steps[0]).catch(() => {});
+    }
   }, []);
   const skipSilence = useSkipSilence({ enterSkip, exitSkip });
   // Expose the latest toggle to the once-bound keyboard listener.
@@ -947,7 +991,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               }
               if (typeof se === "string" && se !== lastSilenceEndRef.current) {
                 lastSilenceEndRef.current = se;
-                skipSilence.onSilenceEnd();
+                skipSilence.onSilenceEnd(se);
               }
               break;
             }

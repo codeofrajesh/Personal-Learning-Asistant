@@ -104,11 +104,18 @@ function coerce(key: keyof SkipSilenceSettings, raw: string): Partial<SkipSilenc
   }
 }
 
+export interface SkipExitMeta {
+  /** Timestamp in stream seconds where speech resumed (e.g. from MPV's lavfi.silence_end). */
+  speechStartTime?: number;
+  /** Active skip speed that was in effect before exiting (e.g. 4.0). */
+  skipSpeed: number;
+}
+
 export interface SkipController {
   /** Set the engine's live speed to `targetSpeed` (the player snapshots the user's baseline). */
   enterSkip: (targetSpeed: number) => void;
-  /** Restore the engine to the user's baseline speed. */
-  exitSkip: () => void;
+  /** Restore the engine to the user's baseline speed, with optional speech onset and skip rate metadata. */
+  exitSkip: (meta?: SkipExitMeta) => void;
 }
 
 export interface UseSkipSilence {
@@ -122,10 +129,10 @@ export interface UseSkipSilence {
   hud: { active: boolean; speed: number };
   /** Called by the player when the audio has gone quiet past the threshold. */
   onSilenceStart: () => void;
-  /** Called by the player when speech resumes. */
-  onSilenceEnd: () => void;
+  /** Called by the player when speech resumes. Optionally takes speech onset timestamp in seconds. */
+  onSilenceEnd: (speechStartTime?: number | string) => void;
   /** End any active skip immediately (pause, seek, disable, unmount). */
-  resetSkip: () => void;
+  resetSkip: (speechStartTime?: number | string) => void;
 }
 
 /**
@@ -141,6 +148,7 @@ export function useSkipSilence(controller: SkipController): UseSkipSilence {
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   const skipActiveRef = useRef(false);
+  const currentSkipSpeedRef = useRef(1);
 
   // Hydrate from the DB (source of truth) once, correcting the localStorage snapshot.
   useEffect(() => {
@@ -174,11 +182,22 @@ export function useSkipSilence(controller: SkipController): UseSkipSilence {
     }
   }, []);
 
-  const resetSkip = useCallback(() => {
+  const resetSkip = useCallback((speechStartTime?: number | string) => {
     if (!skipActiveRef.current) return;
     skipActiveRef.current = false;
+    const speed = currentSkipSpeedRef.current;
     setHud({ active: false, speed: 1 });
-    controllerRef.current.exitSkip();
+    let parsedStart: number | undefined;
+    if (typeof speechStartTime === "number" && Number.isFinite(speechStartTime)) {
+      parsedStart = speechStartTime;
+    } else if (typeof speechStartTime === "string") {
+      const n = parseFloat(speechStartTime);
+      if (Number.isFinite(n)) parsedStart = n;
+    }
+    controllerRef.current.exitSkip({
+      speechStartTime: parsedStart,
+      skipSpeed: speed,
+    });
   }, []);
 
   const updateSettings = useCallback(
@@ -206,12 +225,13 @@ export function useSkipSilence(controller: SkipController): UseSkipSilence {
     if (!s.enabled || skipActiveRef.current) return;
     const target = quantizeRate(s.mode === "instant" ? INSTANT_SPEED : s.skipSpeed);
     skipActiveRef.current = true; // set BEFORE the engine call so the speed echo is guarded
+    currentSkipSpeedRef.current = target;
     setHud({ active: true, speed: target });
     controllerRef.current.enterSkip(target);
   }, []);
 
-  const onSilenceEnd = useCallback(() => {
-    resetSkip();
+  const onSilenceEnd = useCallback((speechStartTime?: number | string) => {
+    resetSkip(speechStartTime);
   }, [resetSkip]);
 
   return {
