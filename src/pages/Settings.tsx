@@ -449,9 +449,9 @@ function AmbientSettings() {
               <span>Skip speed</span>
               {skip.mode === "instant" && <span className="text-content-faint">Instant uses 4×</span>}
             </div>
-            <div className={"flex gap-1 " + (skip.mode === "instant" ? "pointer-events-none opacity-40" : "")}>
+            <div className={"grid grid-cols-6 gap-1 " + (skip.mode === "instant" ? "pointer-events-none opacity-40" : "")}>
               {SKIP_SPEED_OPTIONS.map((s) => (
-                <button key={s} type="button" onClick={() => updateSkip({ skipSpeed: s })} className={pill(skip.skipSpeed === s)}>
+                <button key={s} type="button" onClick={() => updateSkip({ skipSpeed: s })} className={pill(skip.skipSpeed === s) + " !px-1 text-center"}>
                   {formatRate(s)}×
                 </button>
               ))}

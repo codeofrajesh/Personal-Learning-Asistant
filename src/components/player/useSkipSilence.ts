@@ -25,7 +25,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ipc, isTauri } from "../../lib/ipc";
-import { MAX_RATE, quantizeRate } from "../../lib/playbackRate";
+import { quantizeRate } from "../../lib/playbackRate";
+import {
+  calculateProgressiveSkipRate,
+  TURBO_SKIP_RATE,
+  TURBO_THRESHOLD_MS,
+} from "../../lib/player/skipSilenceMath";
 
 export type SkipSilenceMode = "smooth" | "instant";
 
@@ -52,15 +57,14 @@ export const SKIP_DEFAULTS: SkipSilenceSettings = {
   skipSpeed: 3.0,
 };
 
-export const SKIP_SPEED_OPTIONS = [2.5, 3.0, 3.5] as const;
-export const MIN_SILENCE_OPTIONS = [0.5, 1.0, 1.5] as const;
+export const SKIP_SPEED_OPTIONS = [2.5, 3.0, 3.5, 4.0, 5.0, 6.0] as const;
+export const MIN_SILENCE_OPTIONS = [0.3, 0.5, 1.0, 1.5] as const;
 /** Threshold slider bounds (dBFS). */
 export const THRESHOLD_MIN = -40;
 export const THRESHOLD_MAX = -25;
 
-/** Instant mode uses the hard speed ceiling so silence is traversed as fast as is safe without
- *  overshooting the start of speech (event round-trip latency × speed). */
-const INSTANT_SPEED = MAX_RATE; // 4×
+/** Instant mode uses the 4× speed ceiling so silence is traversed quickly without overshooting. */
+const INSTANT_SPEED = 4;
 
 const LS_KEY = "ple.player.skipSilence";
 const SETTING_KEYS: Record<keyof SkipSilenceSettings, string> = {
@@ -109,13 +113,31 @@ export interface SkipExitMeta {
   speechStartTime?: number;
   /** Active skip speed that was in effect before exiting (e.g. 4.0). */
   skipSpeed: number;
+  /** True when exiting from turbo sprint (Stage 4). The player uses this to trigger
+   *  seek-back + volume restore instead of the normal micro-ramp decel. */
+  wasTurbo?: boolean;
 }
 
 export interface SkipController {
   /** Set the engine's live speed to `targetSpeed` (the player snapshots the user's baseline). */
   enterSkip: (targetSpeed: number) => void;
+  /** Engage turbo sprint: speed 8× + volume to 10%. MPV-only; HTML5 should not provide this. */
+  enterTurbo?: (turboSpeed: number) => void;
   /** Restore the engine to the user's baseline speed, with optional speech onset and skip rate metadata. */
   exitSkip: (meta?: SkipExitMeta) => void;
+  /** Returns the player's current baseline listening rate (e.g. 1.5). */
+  getBaselineRate?: () => number;
+}
+
+export interface SkipHud {
+  /** Whether any skip (normal or turbo) is currently active. */
+  active: boolean;
+  /** Current skip speed being applied. */
+  speed: number;
+  /** Whether turbo sprint (Stage 4) is active. */
+  turbo: boolean;
+  /** Wall-clock seconds elapsed since this silence began (updated every 1s during turbo). */
+  elapsedSilenceSecs: number;
 }
 
 export interface UseSkipSilence {
@@ -126,7 +148,7 @@ export interface UseSkipSilence {
    *  the control bar showing the user's baseline instead of the transient skip speed. */
   skipActiveRef: React.MutableRefObject<boolean>;
   /** Rendered indicator state. */
-  hud: { active: boolean; speed: number };
+  hud: SkipHud;
   /** Called by the player when the audio has gone quiet past the threshold. */
   onSilenceStart: () => void;
   /** Called by the player when speech resumes. Optionally takes speech onset timestamp in seconds. */
@@ -140,7 +162,7 @@ export interface UseSkipSilence {
  */
 export function useSkipSilence(controller: SkipController): UseSkipSilence {
   const [settings, setSettings] = useState<SkipSilenceSettings>(readLocal);
-  const [hud, setHud] = useState({ active: false, speed: 1 });
+  const [hud, setHud] = useState<SkipHud>({ active: false, speed: 1, turbo: false, elapsedSilenceSecs: 0 });
 
   // Live mirrors for the once-bound player listener (see file header).
   const settingsRef = useRef(settings);
@@ -148,7 +170,27 @@ export function useSkipSilence(controller: SkipController): UseSkipSilence {
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   const skipActiveRef = useRef(false);
+  const exitingRef = useRef(false); // Guards against re-entry during 30ms decel window
   const currentSkipSpeedRef = useRef(1);
+  const rampTimersRef = useRef<number[]>([]);
+  /** True while turbo sprint (Stage 4) is active — read by resetSkip to pass wasTurbo to exitSkip. */
+  const turboActiveRef = useRef(false);
+  /** Wall-clock timestamp (performance.now) when the current silence began. For elapsed counter. */
+  const silenceWallStartRef = useRef(0);
+  /** Interval ID for the elapsed silence counter during turbo. */
+  const elapsedIntervalRef = useRef<number | null>(null);
+
+  // Cleanup pending ramp timers + elapsed interval on unmount
+  useEffect(() => {
+    return () => {
+      rampTimersRef.current.forEach((id) => window.clearTimeout(id));
+      rampTimersRef.current = [];
+      if (elapsedIntervalRef.current != null) {
+        window.clearInterval(elapsedIntervalRef.current);
+        elapsedIntervalRef.current = null;
+      }
+    };
+  }, []);
 
   // Hydrate from the DB (source of truth) once, correcting the localStorage snapshot.
   useEffect(() => {
@@ -182,11 +224,41 @@ export function useSkipSilence(controller: SkipController): UseSkipSilence {
     }
   }, []);
 
+  /** Stop the turbo elapsed-time counter interval. */
+  const stopElapsedCounter = useCallback(() => {
+    if (elapsedIntervalRef.current != null) {
+      window.clearInterval(elapsedIntervalRef.current);
+      elapsedIntervalRef.current = null;
+    }
+  }, []);
+
+  /** Start a 1-second interval that updates the HUD's elapsed silence counter during turbo. */
+  const startElapsedCounter = useCallback(() => {
+    stopElapsedCounter();
+    elapsedIntervalRef.current = window.setInterval(() => {
+      if (!turboActiveRef.current || !skipActiveRef.current) {
+        stopElapsedCounter();
+        return;
+      }
+      const elapsed = Math.floor((performance.now() - silenceWallStartRef.current) / 1000);
+      setHud((prev) => ({ ...prev, elapsedSilenceSecs: elapsed }));
+    }, 1000);
+  }, [stopElapsedCounter]);
+
   const resetSkip = useCallback((speechStartTime?: number | string) => {
-    if (!skipActiveRef.current) return;
-    skipActiveRef.current = false;
+    rampTimersRef.current.forEach((id) => window.clearTimeout(id));
+    rampTimersRef.current = [];
+    stopElapsedCounter();
+
+    if (!skipActiveRef.current || exitingRef.current) return;
+    // Mark as exiting to prevent re-entry during the decel window.
+    // The rAF loop (HTML5) or MPV metadata handler may call onSilenceEnd again while
+    // skipActiveRef is still true during the 30ms decel — this flag blocks that.
+    exitingRef.current = true;
     const speed = currentSkipSpeedRef.current;
-    setHud({ active: false, speed: 1 });
+    const wasTurbo = turboActiveRef.current;
+    turboActiveRef.current = false;
+    setHud({ active: false, speed: 1, turbo: false, elapsedSilenceSecs: 0 });
     let parsedStart: number | undefined;
     if (typeof speechStartTime === "number" && Number.isFinite(speechStartTime)) {
       parsedStart = speechStartTime;
@@ -197,8 +269,16 @@ export function useSkipSilence(controller: SkipController): UseSkipSilence {
     controllerRef.current.exitSkip({
       speechStartTime: parsedStart,
       skipSpeed: speed,
+      wasTurbo,
     });
-  }, []);
+    // Clear both flags AFTER the decel micro-ramp has fully completed (~22ms).
+    // Turbo exits use seek instead of micro-ramp, but 30ms is safe for both paths.
+    // This ensures the MPV speed property handler ignores ALL transient decel values.
+    window.setTimeout(() => {
+      skipActiveRef.current = false;
+      exitingRef.current = false;
+    }, 30);
+  }, [stopElapsedCounter]);
 
   const updateSettings = useCallback(
     (patch: Partial<SkipSilenceSettings>) => {
@@ -221,14 +301,74 @@ export function useSkipSilence(controller: SkipController): UseSkipSilence {
   }, [updateSettings]);
 
   const onSilenceStart = useCallback(() => {
+    rampTimersRef.current.forEach((id) => window.clearTimeout(id));
+    rampTimersRef.current = [];
+
     const s = settingsRef.current;
     if (!s.enabled || skipActiveRef.current) return;
-    const target = quantizeRate(s.mode === "instant" ? INSTANT_SPEED : s.skipSpeed);
-    skipActiveRef.current = true; // set BEFORE the engine call so the speed echo is guarded
-    currentSkipSpeedRef.current = target;
-    setHud({ active: true, speed: target });
-    controllerRef.current.enterSkip(target);
-  }, []);
+    skipActiveRef.current = true;
+    silenceWallStartRef.current = performance.now();
+
+    const baseRate = controllerRef.current.getBaselineRate?.() ?? 1.0;
+    const finalTarget = quantizeRate(s.mode === "instant" ? INSTANT_SPEED : s.skipSpeed);
+
+    if (s.mode === "instant") {
+      // ── Instant Mode: Jump straight to 4× without progressive ramp-up delay ──
+      currentSkipSpeedRef.current = finalTarget;
+      setHud({ active: true, speed: finalTarget, turbo: false, elapsedSilenceSecs: 0 });
+      controllerRef.current.enterSkip(finalTarget);
+    } else {
+      // ── Smooth Mode: Progressive Acceleration Curve (Stages 1 → 2 → 3) ──
+      // Instead of violently jumping from 1.5x to 4.0x on a brief 0.5s pause, we accelerate
+      // progressively across 3 smooth stages:
+      // Stage 1 (0ms - 220ms): Gentle acceleration (e.g. 1.35x baseline, max 2.2x).
+      //   If the teacher speaks quickly, disparity is tiny, eliminating stutter and clipped words.
+      // Stage 2 (+220ms): Moderate acceleration (e.g. 1.85x baseline, max 2.85x).
+      // Stage 3 (+550ms): Full configured skip rate (e.g. 3.5x - 4.0x) for extended silences.
+      const stage1 = quantizeRate(calculateProgressiveSkipRate(baseRate, finalTarget, 0.05));
+      currentSkipSpeedRef.current = stage1;
+      setHud({ active: true, speed: stage1, turbo: false, elapsedSilenceSecs: 0 });
+      controllerRef.current.enterSkip(stage1);
+
+      const t1 = window.setTimeout(() => {
+        if (!skipActiveRef.current) return;
+        const stage2 = quantizeRate(calculateProgressiveSkipRate(baseRate, finalTarget, 0.35));
+        currentSkipSpeedRef.current = stage2;
+        setHud({ active: true, speed: stage2, turbo: false, elapsedSilenceSecs: 0 });
+        controllerRef.current.enterSkip(stage2);
+      }, 220);
+
+      const t2 = window.setTimeout(() => {
+        if (!skipActiveRef.current) return;
+        currentSkipSpeedRef.current = finalTarget;
+        setHud({ active: true, speed: finalTarget, turbo: false, elapsedSilenceSecs: 0 });
+        controllerRef.current.enterSkip(finalTarget);
+      }, 550);
+
+      rampTimersRef.current.push(t1, t2);
+    }
+
+    // ── Stage 4: Turbo Sprint (MPV only) ──
+    // After 3 full seconds of sustained silence, this is a blackboard/slide/water break.
+    // Jump to 8× with audio ducked to 10% (faint chalk sounds). When speech resumes,
+    // the exitSkip path performs a precision seek-back landing using lavfi.silence_end.
+    // Only fires if the controller provides `enterTurbo` (MPV path); HTML5 skips this.
+    const t3 = window.setTimeout(() => {
+      if (!skipActiveRef.current || turboActiveRef.current) return;
+      const ctrl = controllerRef.current;
+      if (!ctrl.enterTurbo) return; // HTML5 path — no turbo support
+
+      turboActiveRef.current = true;
+      currentSkipSpeedRef.current = TURBO_SKIP_RATE;
+      const elapsed = Math.floor((performance.now() - silenceWallStartRef.current) / 1000);
+      setHud({ active: true, speed: TURBO_SKIP_RATE, turbo: true, elapsedSilenceSecs: elapsed });
+      ctrl.enterTurbo(TURBO_SKIP_RATE);
+      // Start the elapsed counter so the HUD ticks every second
+      startElapsedCounter();
+    }, TURBO_THRESHOLD_MS);
+
+    rampTimersRef.current.push(t3);
+  }, [startElapsedCounter]);
 
   const onSilenceEnd = useCallback((speechStartTime?: number | string) => {
     resetSkip(speechStartTime);

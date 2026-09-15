@@ -25,8 +25,10 @@
 
 /** Hard floor. Below ~0.25 mpv's audio filter chain stops being intelligible. */
 export const MIN_RATE = 0.25;
-/** Hard ceiling. Past 4x, audio is unusable and frame dropping makes the video pointless. */
-export const MAX_RATE = 4;
+/** Hard ceiling for engine playback rate (MPV & Web Audio support up to 16x). */
+export const MAX_RATE = 16;
+/** Hard ceiling for manual speed stepping ([ / ] shortcuts). */
+export const MAX_MANUAL_RATE = 4;
 /** The granular step the user asked for: `[` / `]` move by exactly this much. */
 export const RATE_STEP = 0.1;
 
@@ -40,9 +42,9 @@ export const SPEED_PRESETS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
  * float error (0.7000000000000001) is removed. Non-finite input falls back to 1: a `NaN` rate would
  * silently freeze mpv's clock, which reads to the student as a frozen video.
  */
-export function quantizeRate(rate: number): number {
+export function quantizeRate(rate: number, max = MAX_RATE): number {
   if (!Number.isFinite(rate)) return 1;
-  const clamped = Math.min(MAX_RATE, Math.max(MIN_RATE, rate));
+  const clamped = Math.min(max, Math.max(MIN_RATE, rate));
   return Math.round(clamped * 100) / 100;
 }
 
@@ -59,7 +61,7 @@ export function stepRate(current: number, dir: 1 | -1): number {
   // Round *away* from the current value in the direction of travel, so a press always moves and an
   // off-grid start snaps onto the grid instead of inheriting its remainder.
   const nextTenths = dir > 0 ? Math.floor(tenths + 1e-6) + 1 : Math.ceil(tenths - 1e-6) - 1;
-  return quantizeRate(nextTenths / 10);
+  return quantizeRate(nextTenths / 10, MAX_MANUAL_RATE);
 }
 
 /**

@@ -43,7 +43,11 @@ import { playerBridge } from "../../lib/playerBridge";
 import { useMiniPlayer } from "../../lib/miniPlayerStore";
 import { formatDuration } from "../../lib/utils";
 import { useSkipSilence, type SkipExitMeta } from "./useSkipSilence";
-import { calculateBacktrackDelta, calculateDecelMicroSteps } from "../../lib/player/skipSilenceMath";
+import {
+  calculateDecelMicroSteps,
+  calculateTurboLandingTarget,
+  TURBO_VOLUME,
+} from "../../lib/player/skipSilenceMath";
 import SkipSilenceMenu from "./SkipSilenceMenu";
 import AmbientButton from "../ambient/AmbientButton";
 import {
@@ -322,6 +326,9 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   // always been written straight to a DOM ref from the property observer, per the §15 perf rule.
   // Keeping the state would mean a re-render on every file load for a value nothing renders.
   const [volume, setVolume] = useState(globalMpvState.volume);
+  const volumeRef = useRef(globalMpvState.volume);
+  const baselineVolumeRef = useRef<number | null>(null);
+  const turboVolumeDuckedRef = useRef(false);
   const [isMuted, setIsMuted] = useState(globalMpvState.mute);
   const [rate, setRate] = useState(globalMpvState.speed);
   // Ref mirror of `rate`, for the same reason `isPlayingRef` exists: the keyboard listener is bound
@@ -343,62 +350,125 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // ── Skip Silence controller ────────────────────────────────────────────────
-  // The hook owns the pacing policy + HUD + settings; these two callbacks are the only
-  // engine-specific parts. `enterSkip` snapshots the user's baseline and pushes the skip speed;
-  // `exitSkip` restores the baseline. Both are stable (empty deps, ref-only reads) so the hook's
+  // ── Skip Silence controller ───────────────────────────────────────────────
+  // Stable enter/exit hooks passed to `useSkipSilence`. Refs inside ensure that the
   // returned handlers — which the once-bound property listener calls — never go stale.
+  // Tracks how many times enterSkip has been called within the current silence period.
+  // Only the first call (count === 0) snapshots the user's listening rate as baseline.
+  const skipEnterCountRef = useRef(0);
   const enterSkip = useCallback((targetSpeed: number) => {
-    baselineRateRef.current = rateRef.current;
+    // Only snapshot the user's listening rate on the FIRST call of a silence period.
+    // Progressive ramp calls enterSkip multiple times (stages 1→2→3); those must NOT
+    // overwrite the saved baseline with intermediate skip speeds.
+    if (skipEnterCountRef.current === 0) {
+      baselineRateRef.current = rateRef.current;
+    }
+    skipEnterCountRef.current += 1;
     void setProperty("speed", quantizeRate(targetSpeed)).catch(() => {});
   }, []);
+  const enterTurbo = useCallback((turboSpeed: number) => {
+    if (skipEnterCountRef.current === 0) {
+      baselineRateRef.current = rateRef.current;
+    }
+    skipEnterCountRef.current += 1;
+    // Snapshot user's baseline volume before ducking to 10%
+    if (baselineVolumeRef.current == null) {
+      baselineVolumeRef.current = volumeRef.current;
+    }
+    turboVolumeDuckedRef.current = true;
+    void setProperty("speed", quantizeRate(turboSpeed)).catch(() => {});
+    void setProperty("volume", TURBO_VOLUME).catch(() => {});
+  }, []);
   const exitSkip = useCallback((meta?: SkipExitMeta) => {
+    skipEnterCountRef.current = 0; // Reset for next silence period
     const baseline = quantizeRate(baselineRateRef.current);
-    const skipSpeed = meta?.skipSpeed ?? 4.0;
-    const speechStart = meta?.speechStartTime;
+    const skipSpeed = meta?.skipSpeed ?? rateRef.current;
 
-    // ── Exact Mathematical Backtrack ──
-    // When speech resumes, determine target position to rewind so the first word is never mangled:
-    let targetPos: number | null = null;
-    const curPos = timePosRef.current;
+    if (meta?.wasTurbo) {
+      // ── Turbo Exit: Instant Speed Restore + Ducked Seek + Silence-Grounded Un-Duck ──
+      // 1. Immediately restore speed to student's baseline rate.
+      void setProperty("speed", baseline).catch(() => {});
 
-    if (typeof speechStart === "number" && Number.isFinite(speechStart)) {
-      // Direct timestamp from FFmpeg silencedetect: rewind to 40ms before speech started (breath attack margin)
-      const candidate = Math.max(0, speechStart - 0.040);
-      const delta = curPos - candidate;
-      // Only backtrack if overrun actually happened and is within a sane limit (<= 400ms)
-      if (delta > 0.015 && delta <= 0.400) {
-        targetPos = candidate;
+      const restoreVol = baselineVolumeRef.current;
+      baselineVolumeRef.current = null;
+
+      // 2. Precision seek-back landing into pure room silence
+      let didSeek = false;
+      if (meta.speechStartTime != null) {
+        const landingTarget = calculateTurboLandingTarget(
+          timePosRef.current,
+          meta.speechStartTime,
+        );
+        if (landingTarget != null) {
+          didSeek = true;
+          const d = durationRef.current;
+          timePosRef.current = landingTarget;
+          lastTimePosRef.current = landingTarget; // skipped span must not be billed as watched
+          lastWallTsRef.current = 0; // reset wall-clock baseline
+
+          // Perform seek while audio is STILL ducked (TURBO_VOLUME = 10%) so demuxer
+          // buffer flushing and decoder reset never emit audible pops or clipped transients.
+          void command("seek", [landingTarget, "absolute+exact"])
+            .then(() => {
+              // Wait 25ms after the seek lands in the 240ms room silence window:
+              // this gives scaletempo2 time to build its correlation frame in pure silence
+              // before volume un-ducks, ensuring initial consonants ('v', 'th', etc.) are pristine.
+              window.setTimeout(() => {
+                if (restoreVol != null) {
+                  void setProperty("volume", restoreVol).catch(() => {});
+                }
+                turboVolumeDuckedRef.current = false;
+              }, 25);
+            })
+            .catch(() => {
+              if (restoreVol != null) {
+                void setProperty("volume", restoreVol).catch(() => {});
+              }
+              turboVolumeDuckedRef.current = false;
+            });
+
+          if (seekFillRef.current && d > 0) {
+            seekFillRef.current.style.width = `${(landingTarget / d) * 100}%`;
+          }
+        }
+      }
+
+      // If overrun was negligible and no seek was needed, restore baseline volume directly
+      if (!didSeek) {
+        if (restoreVol != null) {
+          void setProperty("volume", restoreVol).catch(() => {});
+        }
+        window.setTimeout(() => {
+          turboVolumeDuckedRef.current = false;
+        }, 30);
       }
     } else {
-      // Fallback mathematical formula based on speed disparity:
-      const delta = calculateBacktrackDelta(skipSpeed, baseline);
-      if (delta > 0.015 && curPos > delta) {
-        targetPos = Math.max(0, curPos - delta);
+      // ── Continuous Playback (Never Seek on Resume for normal skips) ──
+      // Hard seeking backwards on speech resumption flushes MPV's demuxer and audio queues,
+      // causing visible frame stutter and audio choking on frequent pauses. Instead, playback
+      // stays 100% continuous, and the progressive acceleration ramp ensures that short pauses
+      // never overspeed into speech onset.
+
+      // ── Anti-Pop De-clicking Micro-Ramp ──
+      // Moving down smoothly in two micro-steps over 22ms gives scaletempo2 pitch filters time
+      // to adapt phase grains without static pops or radio crackle.
+      const steps = calculateDecelMicroSteps(skipSpeed, baseline);
+      if (steps.length === 2) {
+        void setProperty("speed", steps[0]).catch(() => {});
+        window.setTimeout(() => {
+          void setProperty("speed", steps[1]).catch(() => {});
+        }, 22);
+      } else {
+        void setProperty("speed", steps[0]).catch(() => {});
       }
-    }
-
-    if (targetPos !== null) {
-      timePosRef.current = targetPos;
-      lastTimePosRef.current = targetPos; // don't bill backtrack as watch time
-      lastWallTsRef.current = 0;
-      void command("seek", [targetPos, "absolute+exact"]).catch(() => {});
-    }
-
-    // ── Anti-Pop De-clicking Micro-Ramp ──
-    // Moving from 4.0x to 1.5x in 0ms forces scaletempo2 pitch filters to crash phase grains,
-    // producing a static pop/crackle. We ramp through an intermediate velocity over 22ms.
-    const steps = calculateDecelMicroSteps(skipSpeed, baseline);
-    if (steps.length === 2) {
-      void setProperty("speed", steps[0]).catch(() => {});
-      window.setTimeout(() => {
-        void setProperty("speed", steps[1]).catch(() => {});
-      }, 22);
-    } else {
-      void setProperty("speed", steps[0]).catch(() => {});
     }
   }, []);
-  const skipSilence = useSkipSilence({ enterSkip, exitSkip });
+  const skipSilence = useSkipSilence({
+    enterSkip,
+    enterTurbo,
+    exitSkip,
+    getBaselineRate: () => quantizeRate(rateRef.current),
+  });
   // Expose the latest toggle to the once-bound keyboard listener.
   skipToggleRef.current = skipSilence.toggleEnabled;
   const skipActiveRef = skipSilence.skipActiveRef;
@@ -926,10 +996,14 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
               updateBufferBar();
               break;
             }
-            case "volume":
-              localStorage.setItem("mpv-volume", String(data));
-              setVolume(data as number);
+            case "volume": {
+              if (turboVolumeDuckedRef.current) break;
+              const v = data as number;
+              volumeRef.current = v;
+              localStorage.setItem("mpv-volume", String(v));
+              setVolume(v);
               break;
+            }
             case "mute":
               localStorage.setItem("mpv-mute", String(data));
               setIsMuted(!!data);
@@ -1030,6 +1104,10 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
       if (skipActiveRef.current) {
         skipActiveRef.current = false;
         void setProperty("speed", quantizeRate(baselineRateRef.current)).catch(() => {});
+      }
+      if (baselineVolumeRef.current != null) {
+        void setProperty("volume", baselineVolumeRef.current).catch(() => {});
+        baselineVolumeRef.current = null;
       }
       void command("af", ["remove", "@sd"]).catch(() => {});
       
@@ -1432,6 +1510,7 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
   };
   const changeVolume = (e: React.ChangeEvent<HTMLInputElement>) => {
     const v = Number(e.target.value);
+    volumeRef.current = v;
     setVolume(v);
     void setProperty("volume", v).catch(() => {});
     if (isMuted && v > 0) {
@@ -1674,9 +1753,26 @@ export default function MpvVideoPlayer({ path, materialId, startPosition, fileNa
           (drawn by the webview over the transparent video region), so it reads as glass over the
           lecture rather than blocking it. */}
       {skipSilence.hud.active && (
-        <div className="pointer-events-none absolute left-1/2 top-4 z-40 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-black/70 px-3 py-1.5 text-xs font-medium text-lime shadow-lg backdrop-blur-sm">
-          <Zap size={13} className="animate-pulse" />
-          Skipping silence · {formatRate(skipSilence.hud.speed)}×
+        <div
+          className={`pointer-events-none absolute left-1/2 top-4 z-40 flex -translate-x-1/2 items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium shadow-lg backdrop-blur-sm transition-all ${
+            skipSilence.hud.turbo
+              ? "border border-amber-500/30 bg-black/85 text-amber-400"
+              : "bg-black/70 text-lime"
+          }`}
+        >
+          {skipSilence.hud.turbo ? (
+            <>
+              <span className="text-xs">⏩</span>
+              <span>
+                Skipping… {skipSilence.hud.elapsedSilenceSecs > 0 ? `${skipSilence.hud.elapsedSilenceSecs}s · ` : ""}{formatRate(skipSilence.hud.speed)}×
+              </span>
+            </>
+          ) : (
+            <>
+              <Zap size={13} className="animate-pulse" />
+              <span>Skipping silence · {formatRate(skipSilence.hud.speed)}×</span>
+            </>
+          )}
         </div>
       )}
 

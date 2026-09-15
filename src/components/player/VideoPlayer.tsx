@@ -36,7 +36,6 @@ import {
 import { useMediaProgress } from "./useMediaProgress";
 import { useSkipSilence, type SkipExitMeta } from "./useSkipSilence";
 import {
-  calculateBacktrackDelta,
   calculateHysteresisThreshold,
   calculateDecelMicroSteps,
 } from "../../lib/player/skipSilenceMath";
@@ -100,11 +99,9 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
     const baseline = quantizeRate(rateRef.current);
     const skipSpeed = meta?.skipSpeed ?? 4.0;
 
-    // ── Exact Mathematical Backtrack ──
-    const delta = calculateBacktrackDelta(skipSpeed, baseline);
-    if (delta > 0.015 && v.currentTime > delta) {
-      v.currentTime = Math.max(0, v.currentTime - delta);
-    }
+    // ── Continuous Playback (Never Seek on Resume) ──
+    // Setting v.currentTime initiates an HTML5 media pipeline seek which flushes audio buffers
+    // and causes stutter. The progressive acceleration curve prevents overrunning speech onset.
 
     // ── Anti-Pop De-clicking Micro-Ramp & Micro-Duck ──
     const steps = calculateDecelMicroSteps(skipSpeed, baseline);
@@ -130,7 +127,11 @@ export default function VideoPlayer({ path, materialId, startPosition }: Props) 
       v.playbackRate = steps[0];
     }
   };
-  const skipSilence = useSkipSilence({ enterSkip, exitSkip });
+  const skipSilence = useSkipSilence({
+    enterSkip,
+    exitSkip,
+    getBaselineRate: () => quantizeRate(rateRef.current),
+  });
   skipToggleRef.current = skipSilence.toggleEnabled;
   skipCfgRef.current = {
     enabled: skipSilence.settings.enabled,
