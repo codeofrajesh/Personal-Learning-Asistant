@@ -49,8 +49,11 @@ export default function GlobalTopBar({
           >
             <MenuIcon />
           </button>
-          <span className="truncate text-sm font-medium text-content-secondary max-[1100px]:hidden">
+          <span className="truncate text-sm font-medium text-content-secondary hidden 2xl:inline">
             Personal Learning Environment
+          </span>
+          <span className="truncate text-xs font-semibold tracking-wide text-content-secondary hidden sm:inline 2xl:hidden">
+            PLE
           </span>
         </div>
 

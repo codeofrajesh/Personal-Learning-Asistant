@@ -91,19 +91,19 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
   return (
     <aside
       className={cn(
-        "flex flex-col gap-2 transition-[width] duration-300 ease-smooth",
+        "flex flex-col gap-1.5 xl:gap-2 transition-[width] duration-300 ease-smooth overflow-hidden",
         collapsed ? "w-[96px]" : "w-72",
         floating
           ? // Floating glass panel: detached with margin, heavily rounded, frosted,
             // 1px inner border + inner sheen + heavy tinted shadow (ui-ux-pro-max).
-            "m-4 h-[calc(100vh-2rem)] rounded-[32px] border border-white/[0.05] bg-white/[0.02] p-4 shadow-2xl backdrop-blur-xl [box-shadow:0_24px_60px_-12px_rgba(0,0,0,0.6),inset_0_1px_1px_rgba(255,255,255,0.06)]"
+            "m-2.5 xl:m-4 h-[calc(100vh-1.25rem)] xl:h-[calc(100vh-2rem)] rounded-[26px] xl:rounded-[32px] border border-white/[0.05] bg-white/[0.02] p-3 xl:p-4 shadow-2xl backdrop-blur-xl [box-shadow:0_24px_60px_-12px_rgba(0,0,0,0.6),inset_0_1px_1px_rgba(255,255,255,0.06)]"
           : // Flush column (player route): opaque so the transparent mpv window
             // doesn't show the desktop through the sidebar.
-            "h-full rounded-none border-y-0 border-l-0 border-r border-glass-border bg-ink-900 p-4"
+            "h-full rounded-none border-y-0 border-l-0 border-r border-glass-border bg-ink-900 p-3 xl:p-4"
       )}
     >
       {/* Brand */}
-      <div className={cn("flex items-center gap-2.5 px-2 py-3", collapsed && "justify-center")}>
+      <div className={cn("flex items-center gap-2.5 px-2 py-2 xl:py-3 shrink-0", collapsed && "justify-center")}>
         <span className="grid h-9 w-9 shrink-0 place-items-center rounded-btn bg-lime/15 text-lime shadow-glow-lime">
           <GraduationIcon />
         </span>
@@ -121,7 +121,7 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
         onClick={onOpenSearch}
         aria-label="Search materials (Ctrl+K)"
         className={cn(
-          "group flex items-center gap-2.5 rounded-btn border border-glass-border bg-white/[0.02] px-2.5 py-2 text-sm text-content-secondary transition-colors hover:bg-white/[0.05] hover:text-content-primary",
+          "group flex items-center gap-2.5 rounded-btn border border-glass-border bg-white/[0.02] px-2.5 py-1.5 xl:py-2 text-sm text-content-secondary transition-colors hover:bg-white/[0.05] hover:text-content-primary shrink-0",
           collapsed && "justify-center px-0"
         )}
       >
@@ -137,8 +137,8 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
       </button>
 
       {/* Primary nav */}
-      <nav aria-label="Primary" className="mt-4">
-        <ul ref={listRef} onKeyDown={onKeyDown} className="flex flex-col gap-4">
+      <nav aria-label="Primary" className="mt-2 xl:mt-4 flex-1 min-h-0 overflow-y-auto no-scrollbar">
+        <ul ref={listRef} onKeyDown={onKeyDown} className="flex flex-col gap-1.5 xl:gap-3">
           {navItems.map((item) => {
             const { to, label, icon: Icon } = item;
             const active = isItemActive(item);
@@ -150,7 +150,7 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
                   aria-label={collapsed ? label : undefined}
                   aria-current={active ? "page" : undefined}
                   className={cn(
-                    "group relative flex items-center gap-4 rounded-2xl px-4 py-3 text-[15px] font-medium transition-all duration-200",
+                    "group relative flex items-center gap-3.5 xl:gap-4 rounded-xl xl:rounded-2xl px-3 xl:px-4 py-2 xl:py-2.5 text-[14px] xl:text-[15px] font-medium transition-all duration-200",
                     collapsed && "justify-center px-0",
                     active
                       ? // Subtle glass pill (not a heavy solid fill): translucent white
@@ -168,7 +168,7 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
                   )}
                   <Icon
                     className={cn(
-                      "shrink-0 w-7 h-7 transition-colors duration-200",
+                      "shrink-0 w-6 h-6 xl:w-7 xl:h-7 transition-colors duration-200",
                       active
                         ? "text-lime [filter:drop-shadow(0_0_6px_rgba(170,255,0,0.55))]"
                         : "text-current"
@@ -191,14 +191,14 @@ export default function Sidebar({ collapsed, onOpenSearch, floating = true }: Si
           Pinned to the bottom (`mt-auto`) and BELOW the nav on purpose: it is ambient feedback,
           not a destination, so it must never push navigation off-centre or compete with it for
           the eye. It adapts to `collapsed` itself — see StudyMeter and StreakBadge. */}
-      <div className="mt-auto flex flex-col gap-1.5">
+      <div className="mt-auto shrink-0 flex flex-col gap-1.5 pt-1">
         {streak > 0 && (
           <StreakBadge streak={streak} variant="sidebar" collapsed={collapsed} />
         )}
         <StudyMeter collapsed={collapsed} />
-        <div className="px-2 pb-1 pt-2">
+        <div className="px-2 pb-0.5 pt-1">
           {!collapsed && (
-            <div className="text-[11px] text-content-faint">v0.1.0 · local-first</div>
+            <div className="text-[10px] xl:text-[11px] text-content-faint">v0.1.0 · local-first</div>
           )}
         </div>
       </div>

@@ -194,7 +194,7 @@ export default function StudyMeter({ collapsed }: Props) {
   return (
     <div
       className={cn(
-        "mt-3 rounded-[18px] border bg-white/[0.02] p-3 backdrop-blur-xl transition-[border-color,box-shadow] duration-500",
+        "rounded-[16px] xl:rounded-[18px] border bg-white/[0.02] p-2.5 xl:p-3 backdrop-blur-xl transition-[border-color,box-shadow] duration-500",
         view.tone.ring,
       )}
       style={{
@@ -207,7 +207,7 @@ export default function StudyMeter({ collapsed }: Props) {
       }}
       aria-label={sentence}
     >
-      <div className="mb-2 flex items-baseline justify-between gap-2">
+      <div className="mb-1.5 flex items-baseline justify-between gap-2">
         <div className="flex items-center gap-1.5">
           <Flame
             size={12}
@@ -228,7 +228,7 @@ export default function StudyMeter({ collapsed }: Props) {
 
       <div className="flex items-baseline gap-1.5">
         <span
-          className={cn("text-xl font-semibold leading-none tabular-nums", view.tone.text)}
+          className={cn("text-lg xl:text-xl font-semibold leading-none tabular-nums", view.tone.text)}
         >
           {fmtMins(view.studied)}
         </span>

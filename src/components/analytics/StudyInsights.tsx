@@ -121,10 +121,10 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
   return (
     <div
       ref={rootRef}
-      className={cn("grid gap-4 sm:grid-cols-3", className)}
+      className={cn("grid gap-3 sm:grid-cols-3", className)}
     >
       {/* ── CARD 1: STREAKS ────────────────────────────────────────── */}
-      <div className="flex min-h-[148px] flex-col justify-between rounded-[16px] border border-white/[0.08] bg-white/[0.025] p-4 transition-all duration-200 hover:border-white/[0.14] hover:bg-white/[0.04]">
+      <div className="flex min-h-[148px] flex-col justify-between rounded-[16px] border border-white/[0.08] bg-white/[0.025] p-3.5 xl:p-4 transition-all duration-200 hover:border-white/[0.14] hover:bg-white/[0.04] overflow-hidden">
         <div>
           {/* Top Bar: Icon + Title + Status Pill */}
           <div className="flex items-center justify-between">
@@ -249,7 +249,7 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
       </div>
 
       {/* ── CARD 2: WEEKLY RHYTHM ───────────────────────────────────── */}
-      <div className="flex min-h-[148px] flex-col justify-between rounded-[16px] border border-white/[0.08] bg-white/[0.025] p-4 transition-all duration-200 hover:border-white/[0.14] hover:bg-white/[0.04]">
+      <div className="flex min-h-[148px] flex-col justify-between rounded-[16px] border border-white/[0.08] bg-white/[0.025] p-3.5 xl:p-4 transition-all duration-200 hover:border-white/[0.14] hover:bg-white/[0.04] overflow-hidden">
         <div>
           {/* Top Bar */}
           <div className="flex items-center justify-between">
@@ -355,31 +355,36 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
       </div>
 
       {/* ── CARD 3: 30-DAY CONSISTENCY & GOALS ───────────────────────── */}
-      <div className="flex min-h-[148px] flex-col justify-between rounded-[16px] border border-white/[0.08] bg-white/[0.025] p-4 transition-all duration-200 hover:border-white/[0.14] hover:bg-white/[0.04]">
+      <div className="flex min-h-[148px] flex-col justify-between rounded-[16px] border border-white/[0.08] bg-white/[0.025] p-3.5 xl:p-4 transition-all duration-200 hover:border-white/[0.14] hover:bg-white/[0.04] overflow-hidden">
         <div>
           {/* Top Bar */}
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className="grid h-7 w-7 place-items-center rounded-lg bg-emerald-500/15 text-emerald-400">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <div className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-emerald-500/15 text-emerald-400">
                 <Target size={15} strokeWidth={2.2} aria-hidden />
               </div>
-              <span className="text-[0.72rem] font-semibold uppercase tracking-wider text-white/50">
-                30-Day Consistency
+              <span className="text-[0.72rem] font-semibold uppercase tracking-wider text-white/50 truncate">
+                Consistency
               </span>
             </div>
 
-            <div className="flex items-center gap-1.5">
-              <span className="rounded-full border border-white/10 bg-white/[0.05] px-2 py-0.5 text-[0.62rem] font-semibold text-white/70">
-                {last30.length > 0 ? fmtDateRange(last30[0].date, last30[last30.length - 1].date) : "30 Days"}
-              </span>
-              <span className="rounded-full bg-white/[0.05] px-2 py-0.5 text-[0.62rem] font-medium text-white/50">
-                {consistencyPct >= 70 ? "Consistent" : consistencyPct >= 40 ? "Building" : "Developing"}
-              </span>
-            </div>
+            <span
+              className={cn(
+                "shrink-0 rounded-full px-2 py-0.5 text-[0.62rem] font-semibold border tabular-nums",
+                consistencyPct >= 70
+                  ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400"
+                  : consistencyPct >= 40
+                  ? "border-blue-500/35 bg-blue-500/10 text-blue-400"
+                  : "border-amber-500/35 bg-amber-500/10 text-amber-400"
+              )}
+              title={last30.length > 0 ? `30-Day Window: ${fmtDateRange(last30[0].date, last30[last30.length - 1].date)}` : "30-Day Window"}
+            >
+              {consistencyPct >= 70 ? "Consistent" : consistencyPct >= 40 ? "Building" : "Developing"}
+            </span>
           </div>
 
           {/* Hero: Gauge Ring + Big Percentage */}
-          <div className="mt-3 flex items-center gap-3">
+          <div className="mt-3 flex items-center gap-2.5 xl:gap-3">
             <div className="relative h-10 w-10 shrink-0">
               <svg viewBox="0 0 38 38" className="h-full w-full -rotate-90">
                 <circle
@@ -409,17 +414,17 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
               </div>
             </div>
 
-            <div className="min-w-0">
-              <div className="flex items-baseline gap-1.5">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-baseline gap-1.5 flex-wrap">
                 <span className="text-2xl font-black tabular-nums text-content-primary">
                   {consistencyPct}%
                 </span>
-                <span className="text-xs font-semibold text-white/60">study frequency</span>
+                <span className="text-xs font-semibold text-white/60 truncate">study frequency</span>
               </div>
               <div className="flex items-center gap-1.5 text-[0.7rem] text-white/50">
                 <CheckCircle2 size={12} className="shrink-0 text-emerald-400" aria-hidden />
-                <span className="truncate">
-                  {active} active of {last30.length} days ({Math.max(0, last30.length - active)} rest)
+                <span className="truncate" title={`${active} active of ${last30.length} days (${Math.max(0, last30.length - active)} rest)`}>
+                  {active} of {last30.length} days active
                 </span>
               </div>
             </div>
@@ -427,16 +432,16 @@ export default function StudyInsights({ daily, targetMins, className }: Props) {
         </div>
 
         {/* Bottom Details: Target Goal Met Days */}
-        <div className="mt-3 flex items-center justify-between border-t border-white/[0.06] pt-2.5">
-          <div className="flex items-center gap-1.5">
+        <div className="mt-3 flex items-center justify-between gap-1 border-t border-white/[0.06] pt-2.5">
+          <div className="flex items-center gap-1.5 min-w-0">
             <Award size={13} className="text-emerald-400 shrink-0" aria-hidden />
-            <span className="text-[0.68rem] font-medium text-white/50">Target Crushed:</span>
-            <span className="text-[0.72rem] font-bold tabular-nums text-white">
+            <span className="text-[0.68rem] font-medium text-white/50 truncate">Target Met:</span>
+            <span className="text-[0.72rem] font-bold tabular-nums text-white shrink-0">
               {metTargetCount ?? 0} {metTargetCount === 1 ? "day" : "days"}
             </span>
           </div>
-          <span className="text-[0.66rem] font-medium tabular-nums text-emerald-400/90">
-            {targetMins && targetMins > 0 ? `≥ ${fmtHM(targetMins)}/day` : "No goal set"}
+          <span className="text-[0.66rem] font-medium tabular-nums text-emerald-400/90 shrink-0 ml-1">
+            {targetMins && targetMins > 0 ? `≥ ${fmtHM(targetMins)}/d` : "No goal"}
           </span>
         </div>
       </div>
